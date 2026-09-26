@@ -58,6 +58,40 @@
   - 별도 프로세스로 띄운 작업 창이 요청 언어로 답하는지
 - 목록을 그릴 때 행마다 문장을 찾지 않도록 반복문 밖에서 한 번만 찾습니다(5,000개 첫 표시: 이번 실행들 133~187ms, 이전 기록 201ms).
 
+## 사용성 개선 (2026-09-27)
+
+사용자가 Codex 대화를 백업하다 목록이 계속 실패한 일을 계기로 GUI 동작을 전수 조사했습니다.
+
+- **원인**: 작업 PC의 ctxhop 오류 기록·로그·`config.json`을 읽기만 해서 확인했습니다. 상위 폴더(`D:\codex`, `Documents\Codex`)와 하위 폴더가 서로 다른 공통 이름으로 등록된 뒤부터 그 안의 목록 불러오기와 재등록이 모두 `current directory has conflicting project bindings`로 실패했습니다.
+  - 격리 폴더에서 `ctxhop 0.2.0-gui.1`로 같은 순서를 재현했습니다.
+  - 상위 등록을 `project unbind`로 해제하면 다시 목록이 나오는 것을 확인했습니다.
+  - 해제로 바뀌는 파일은 `config.json`뿐입니다(저장소와 registry는 그대로).
+- **암호**: 격리 폴더에서 `0.2.0`·`0.2.0-gui.1`로 설정한 PC는 목록(`list`)과 Codex bundle 올리기·목록·내려받기에서 암호를 묻지 않았습니다(입력을 닫은 채 성공). 설정 중 암호 불일치나 복구 키 확인 실수는 아무것도 남기지 않아 다시 설정하면 성공합니다. 실제 문제는 실패 이유가 GUI에 보이지 않는 것이었습니다.
+- **바꾼 것**:
+  - 상위·하위 폴더를 다른 공통 이름으로 등록하면 ctxhop 호출 전에 막습니다(`Assert-NoBindingOverlap`). 같은 폴더를 다른 이름으로 다시 등록하는 경우는 ctxhop이 직접 거부합니다.
+  - **등록 해제** 버튼(`project unbind`)을 추가했고, 등록·해제 뒤 등록된 프로젝트 목록을 다시 읽습니다. ctxhop은 `--path`의 폴더를 직접 확인하므로, 지워진 폴더는 그 공통 이름의 등록이 이 경로 하나뿐일 때만 이름(`--identity`)으로 해제합니다.
+  - 등록이 하나도 없어 `config.json`에 `bindings`가 없는 PC에서도 첫 등록이 됩니다(독립 감사 F1).
+  - ctxhop 명령이 실패하면 그날 ctxhop 로그에서 같은 명령의 실패 줄을 찾아 이유를 오류에 붙입니다(`Get-CtxFailureReason`). 작업 시작 시각 이후 줄만 보고, 따옴표 없이 적힌 값도 읽습니다. 다른 ctxhop이 로그를 연 채여도 공유 읽기로 읽고, 못 읽으면 종료 코드만 보입니다(F6).
+  - **작업 취소**를 목록 외 작업으로 넓혔습니다. GUI가 띄운 작업 창의 프로세스 트리만 끝내며 이름으로 프로세스를 찾지 않습니다. 복원과 대화 열기는 취소할 수 없습니다.
+    - 프로세스 표를 한 번만 읽어 부모부터 끝냅니다. Windows는 부모가 끝나도 `ParentProcessId`를 그대로 두고 PID를 재사용하므로, 부모보다 먼저 생긴 "자식"은 다른 프로그램으로 보고 건드리지 않습니다(F2·F4).
+    - 취소 확인 창이 떠 있는 동안 작업이 끝났으면 아무것도 끝내지 않습니다(F5).
+  - 설정 탭에 **암호 변경**·**복구 키로 암호 초기화**(`passphrase change`·`reset`, 보이는 작업 창)를 추가했습니다.
+  - 창 크기 조절(최소 1096×675)을 추가했습니다. 화면 작업 영역보다 크면 시작할 때 줄이고, 설정 탭은 스크롤합니다. 탭 페이지는 핸들이 생겨야 실제 크기가 되므로 Anchor 전에 핸들을 만듭니다.
+  - Codex 복원 확인 창: 크기 조절, 행 높이 자동, 백업 ID 별도 열, 항목 수를 표시합니다.
+  - 목록: 날짜를 이 PC 시간(`yyyy-MM-dd HH:mm`)으로 표시하고, 세션 UUID가 잘리지 않게 했습니다. 여러 개를 고르면 "N개 선택"으로 표시합니다.
+  - 버튼 툴팁을 추가했습니다. 꺼진 버튼은 툴팁이 뜨지 않으므로 탭과 창 위에서 대신 띄웁니다(F9).
+  - 안내 문구: 실행 중인 프로그램 이름·PID, 보이는 창·숨은 창별 처리 중 문구, 설정 동기화 `[Y/n]` 기본값 Y 경고와 되돌리는 방법(실제 설정 폴더 경로로 안내), README의 "Claude 복원이 중단됐을 때" 절차.
+- `Worker.ps1`, 백엔드, `bin\*.exe`는 바꾸지 않았습니다. `ClaudeWorker.ps1`의 백업·복원 판단과 복구 기록 동작은 그대로입니다.
+- 시험이 다시 그리는 `gui-settings-preview.png`, `gui-desktop-conflicts-preview.png`를 새 화면으로 갱신했습니다.
+- **제한**:
+  - 실패 이유는 ctxhop 로그 형식(`time=… level=ERROR msg=command_finished command=… error="…"`)에 기대고, 자정을 넘긴 작업은 종료 코드만 보입니다.
+  - 확인 창의 백업 ID·UUID·경로처럼 공백 없는 긴 값은 칸 안에서 잘립니다. 행을 고르면 아래 상세 칸, 칸에 마우스를 올리면 툴팁에 전체가 나옵니다.
+  - 실제 125/150% 배율 화면은 확인하지 않았습니다.
+  - 같은 순간 다른 ctxhop(예: hook의 `push`)이 같은 명령으로 실패하면 그 이유가 붙을 수 있습니다(F6).
+  - 겹침 검사는 입력한 경로 기준입니다. ctxhop은 Git 최상위 폴더를 등록하므로, 그 아래 다른 중첩 저장소 등록과의 겹침은 GUI가 놓치고 ctxhop이 거부합니다. 데이터는 바뀌지 않습니다(F7).
+  - 취소한 Codex 백업의 평문 사본은 `staging`에 남고, 공유 저장소에는 목록에 보이지 않는 chunk만 남을 수 있습니다(F8). Claude `push`를 중간에 끊었을 때의 원자성은 확인하지 않았습니다.
+- **독립 감사**: 첫 감사는 FAIL(F1 빈 `bindings`에서 등록 실패, F2 PID 재사용으로 다른 프로그램 종료 가능)이었습니다. F1~F6·F9를 고치고 F7·F8은 위 제한으로 적었습니다.
+
 ## 실행한 검사 (Windows PowerShell 5.1, Python 3.12.14 Codex 번들, 엔진 `0.158.0-alpha.2.1`)
 
 | 검사 | 결과 | 원시 로그 |
@@ -72,6 +106,10 @@
 PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -File`로 실행했고 5개 모두 종료 코드 0이었습니다(각 로그 끝에 `EXIT CODE` 기록, README의 `RemoteSigned`로는 다시 실행하지 않음).
 
 언어 선택 뒤 같은 명령으로 6개를 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1219, `Test-DesktopWorker` 61, `Test-DesktopGUI` 25, `Test-ClaudeGUI` 93(5,000개 첫 표시 143ms), `Test-ClaudeWorker` 640 assertions, `Test-DesktopIntegration` 32. 이 실행의 원시 로그는 작업 PC의 임시 폴더에만 있습니다.
+
+사용성 개선 뒤 같은 명령으로 6개를 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1337, `Test-DesktopWorker` 61, `Test-DesktopGUI` 26, `Test-ClaudeGUI` 113(5,000개 첫 표시 153ms), `Test-ClaudeWorker` 40 groups·655 assertions, `Test-DesktopIntegration` 32. 원시 로그는 작업 PC의 임시 폴더에만 있습니다.
+
+감사 지적을 고친 뒤 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1342, `Test-DesktopWorker` 61, `Test-DesktopGUI` 27, `Test-ClaudeGUI` 115, `Test-ClaudeWorker` 41 groups·672 assertions, `Test-DesktopIntegration` 32.
 
 - 전송(`bin\ctxhop.exe`)은 PowerShell 테스트에서 mock이고, 성공 경로의 mock은 bundle 메타데이터 규칙(정확한 7개 필드, BOM 없음, NUL·줄바꿈 없음)을 확인합니다.
 - `backend\test_guard_shim.py`는 시험 전용이며 앱 종료 검사와 엔진 버전 조회만 바꿉니다(엔진은 환경변수 값). Worker·GUI는 이 파일을 호출하지 않습니다. `Test-DesktopIntegration.ps1`의 성공 경로를 다른 PC에서도 다시 돌릴 수 있도록 패키지에 남겨 두었습니다.
@@ -88,10 +126,10 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 | `backend\schema.json` (백엔드 고정) | `D24ACAC2105569B5B9CFDABC5259DB8217B9A9F175D7D2B57A09A2D4F76FA0A2` |
 | `bin\ctxhop.exe` (bundle 전송, Worker 고정, 변경 없음) | `9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006` |
 | `bin\ctxhop-claude.exe` (`0.2.0-gui.1`, 변경 없음) | `A1702CE1839AF90C0DDB87E7C07F1BE7899BE8EBDD9117FE680D2EC9739C233D` |
-| `ClaudeWorker.ps1` (안정판 `D08E9A15…`에서 문장을 `Strings.ps1`로 옮기고 `Strings.ps1` 불러오기·`Set-Language` 줄 추가) | `059448A8C945A586459085EAFB88F163AF90FD8A7CEC955B9F550C5DEB94D28A` |
+| `ClaudeWorker.ps1` (안정판 `D08E9A15…`에서 문장을 `Strings.ps1`로 옮기고 언어 적용·실패 이유·겹친 등록 차단·등록 해제·암호 변경/초기화 추가) | `97405AABD4B533974D070CA6F7A69B1C1CE537F094489D4924FC32F1F8977823` |
 | `Worker.ps1` (결과 파일 경로 보관 수정, 언어 선택) | `C8AA63D2F8F853A77B5AD48F6E74468E777FA3EDF76C8DF5AC0539F81FE59EA8` |
-| `GUI.ps1` (언어 선택) | `9FE39D5E0935D98B4EAC1D39FFAFF5B9D5E990A77C8714AEC214829382F3D827` |
-| `Strings.ps1` (한국어·영어 문장 표) | `2B4621B2631AFDEACCF6EDC4DA3F768BD07304E2E5BCA42BDE3A466BFF217A08` |
+| `GUI.ps1` (언어 선택, 사용성 개선) | `DFD43E49D2436D25C1B682D3BAA0DC2DCD5C9A8F1DE0217F423103BCEE827B5E` |
+| `Strings.ps1` (한국어·영어 문장 표) | `E04493D126B9EEBEE2A8A4B56C6A42B814E01766DB70FFCD634483382A4BE75A` |
 
 `transport-source\`와 `bin\ctxhop.exe`는 노트북 세션 결과를 그대로 옮겼습니다. 이 PC에는 Go가 없어 Go 시험을 다시 실행하지 않았고, 기록된 결과(`transport-source\verification-results\`: 전체 suite 통과, race는 gcc 부재로 미실행)를 근거로 둡니다.
 

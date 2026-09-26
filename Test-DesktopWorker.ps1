@@ -128,7 +128,7 @@ try {
     Assert ($failure.Exception.Data['backendResult'].journal -eq 'fixture/recovery/pending.json') 'failure must preserve backend recovery journal data'
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
     # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판과 바이트 동일해야 한다.
-    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '059448A8C945A586459085EAFB88F163AF90FD8A7CEC955B9F550C5DEB94D28A') 'Claude worker copy must match the audited string-table version'
+    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '97405AABD4B533974D070CA6F7A69B1C1CE537F094489D4924FC32F1F8977823') 'Claude worker copy must match the audited usability version'
     Throws {Assert-FrozenFile (Join-Path $testDirectory 'nonexistent.py') ''} '준비되지'
     Throws {Assert-BundleId '../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'} '잘못된'
     Throws {Assert-BundleId 'peer-a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'} '잘못된'

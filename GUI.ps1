@@ -108,7 +108,10 @@ function Apply-Filter {
         $local = if ($item.local) {$yes} else {$no}
         $backup = if ($item.blockedReason) {$blocked} elseif ($item.remoteId -and $item.agent -eq 'codex-desktop') {$shared} elseif ($item.recordCount -gt 0) {$yes} else {$none}
         $context=if ($item.agent -eq 'codex-desktop') {"$($item.sourceCwd) · $($item.historyMode)" + $(if ($item.archived) {$archived} else {''})} else {''}
-        $index = $grid.Rows.Add($title,$label,[string]$item.updatedAt,$local,$backup,[string]$item.nativeId,$context)
+        # Codex 백업은 UTC ISO 문자열이라 이 PC 시간으로 짧게 보여 준다. 정렬은 원래 값으로 한다.
+        $updated=[datetime]::MinValue
+        $shown=if ([datetime]::TryParse([string]$item.updatedAt,[ref]$updated)) {$updated.ToString('yyyy-MM-dd HH:mm')} else {[string]$item.updatedAt}
+        $index = $grid.Rows.Add($title,$label,$shown,$local,$backup,[string]$item.nativeId,$context)
         $grid.Rows[$index].Tag = $item
     }
     $grid.ResumeLayout()
@@ -129,7 +132,9 @@ function Update-Selection {
     $desktop=$agent.SelectedIndex -eq 1
     $script:SessionButtons[1].Enabled=($null -ne $selected -and -not $script:Pending -and $(if ($desktop) {@($grid.SelectedRows | Where-Object { -not $_.Tag.local -and $_.Tag.remoteId -and -not $_.Tag.blockedReason }).Count -eq $grid.SelectedRows.Count} else {$selected.recordCount -gt 0}))
     $script:SessionButtons[2].Enabled=($null -ne $selected -and $selected.local -and -not $desktop -and -not $script:Pending)
-    if ($selected) { $selectionLabel.Text=(T 'GuiSelectionInfo' $selected.title $selected.nativeId) + $(if ($selected.blockedReason) {(T 'GuiSelectionBlocked' $selected.blockedReason)} else {''}) } else { $selectionLabel.Text=(T 'GuiNoSelectionHint') }
+    $selectionLabel.Text=if ($grid.SelectedRows.Count -gt 1) { T 'GuiSelectionMany' $grid.SelectedRows.Count }
+        elseif ($selected) { (T 'GuiSelectionInfo' ((@($selected.title,$selected.nativeId) | Where-Object { $_ }) -join ' · ')) + $(if ($selected.blockedReason) {(T 'GuiSelectionBlocked' $selected.blockedReason)} else {''}) }
+        else { (T 'GuiNoSelectionHint') + $(if ($desktop) {T 'GuiMultiSelectHint'} else {''}) }
 }
 function Start-Job([hashtable]$Job) {
     if ($script:Pending) { throw (T 'GuiWaitForJob') }
@@ -142,16 +147,17 @@ function Start-Job([hashtable]$Job) {
     $Job | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $request -Encoding UTF8
     # Windows 파일명에는 따옴표를 넣을 수 없으므로 각 검증된 절대경로만 인수로 인용한다.
     $arguments = '-NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File "{0}" -RequestFile "{1}" -ResultFile "{2}"' -f (Join-Path $PSScriptRoot 'Worker.ps1'),$request,$result
-    $windowStyle=if ($Job.agent -eq 'codex-desktop' -and $Job.action -notin @('Setup','Invite')) {'Hidden'} else {'Normal'}
-    # Claude and explicitly selected setup/invite operations retain their interactive native input window.
+    $windowStyle=if ($Job.agent -eq 'codex-desktop' -and $Job.action -notin @('Setup','Invite','PassphraseChange','PassphraseReset')) {'Hidden'} else {'Normal'}
+    # Claude and explicitly selected setup/invite/password operations retain their interactive native input window.
     $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -PassThru -WindowStyle $windowStyle
     $script:Pending = @{process=$process; job=$Job; request=$request; result=$result}
     foreach ($button in $script:Buttons) { $button.Enabled=$false }
-    $cancelButton.Enabled=($Job.action -eq 'List')
+    # 복원은 중간에 끊으면 복구 기록이 남고, 열기는 사용자가 대화를 끝내야 하므로 취소하지 않는다.
+    $cancelButton.Enabled=($Job.action -notin @('Restore','Open'))
     $agent.Enabled=$false; $project.ReadOnly=$true; $identity.ReadOnly=$true
     $projectPicker.Enabled=$false; $desktopHome.ReadOnly=$true
     $progress.Style='Marquee'
-    $status.Text=(T 'GuiStatusProcessing')
+    $status.Text=if ($windowStyle -eq 'Hidden') {T 'GuiStatusProcessingHidden'} else {T 'GuiStatusProcessingWindow'}
     $log.AppendText("`r`n$(T 'GuiLogJobStarted' $Job.action $Job.agent)`r`n")
 }
 function Finish-Job {
@@ -164,7 +170,7 @@ function Finish-Job {
     $progress.Style='Blocks'
     Update-Selection
     try {
-        if ($pending.cancelled) { $status.Text=(T 'GuiListCancelled'); return }
+        if ($pending.cancelled) { $script:DesktopPreviewQueue=@(); $status.Text=if ($pending.job.action -eq 'List') {T 'GuiListCancelled'} else {T 'GuiJobCancelled'}; return }
         if (-not (Test-Path -LiteralPath $pending.result)) { throw (T 'GuiWorkerAborted') }
         $result = Get-Content -LiteralPath $pending.result -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($pending.job.agent -eq 'codex-desktop' -and $pending.job.action -eq 'Preview') {
@@ -182,6 +188,8 @@ function Finish-Job {
         $log.AppendText("$($result.data.message)`r`n")
         switch ($pending.job.action) {
             List { Fill-Sessions @($result.data.sessions); if ($result.data.excluded -gt 0) { $status.Text += (T 'GuiExcludedSuffix' $result.data.excluded) } }
+            Bind { Load-Bindings }
+            Unbind { Load-Bindings }
             Status {
                 $log.AppendText("$(T 'GuiStatusLog' $result.data.device $result.data.store $result.data.syncConfig)`r`n")
             }
@@ -240,33 +248,34 @@ function Get-DesktopDecisions([object]$Table) {
 function New-DesktopReviewDialog([object[]]$Reviews) {
     $dialog=[Windows.Forms.Form]::new(); $dialog.Text=(T 'GuiReviewTitle'); $dialog.ClientSize=[Drawing.Size]::new(1180,480)
     $dialog.StartPosition='CenterParent'; $dialog.Font=[Drawing.Font]::new('맑은 고딕',10); $dialog.MinimumSize=[Drawing.Size]::new(1196,519)
-    $dialog.FormBorderStyle='FixedDialog'; $dialog.MaximizeBox=$false; $dialog.MinimizeBox=$false
-    $null=New-Control Label 16 12 1148 42 (T 'GuiReviewIntro') $dialog
-    $table=New-Control DataGridView 16 58 1148 295 '' $dialog
+    $dialog.FormBorderStyle='Sizable'; $dialog.MinimizeBox=$false
+    $intro=New-Control Label 16 12 1148 42 (T 'GuiReviewIntro' @($Reviews).Count) $dialog; $intro.Anchor='Top,Left,Right'
+    $table=New-Control DataGridView 16 58 1148 295 '' $dialog; $table.Anchor='Top,Bottom,Left,Right'
     $table.AllowUserToAddRows=$false; $table.AllowUserToDeleteRows=$false; $table.RowHeadersVisible=$false; $table.AutoGenerateColumns=$false; $table.AutoSizeColumnsMode='Fill'
-    $table.DefaultCellStyle.WrapMode='True'
-    foreach ($column in @(@('title',(T 'GuiColTitleBackup'),170),@('id','UUID',150),@('source',(T 'GuiColSourceFolder'),155),@('target',(T 'GuiColTargetFolder'),155),@('state',(T 'GuiColInspection'),105),@('reason',(T 'GuiColReason'),170))) {
+    # 행 높이를 내용에 맞춰 긴 제목·경로도 잘리지 않게 한다.
+    $table.DefaultCellStyle.WrapMode='True'; $table.AutoSizeRowsMode='AllCells'
+    foreach ($column in @(@('title',(T 'GuiColConversation'),150),@('backup',(T 'GuiColBackupId'),150),@('id','UUID',150),@('source',(T 'GuiColSourceFolder'),150),@('target',(T 'GuiColTargetFolder'),150),@('state',(T 'GuiColInspection'),100),@('reason',(T 'GuiColReason'),150))) {
         $c=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $c.Name=$column[0]; $c.HeaderText=$column[1]; $c.FillWeight=$column[2]; $c.ReadOnly=$true; $table.Columns.Add($c)|Out-Null
     }
     $choiceColumn=[Windows.Forms.DataGridViewComboBoxColumn]::new(); $choiceColumn.Name='choice'; $choiceColumn.HeaderText=(T 'GuiColChoice'); $choiceColumn.FillWeight=150; $choiceColumn.Items.AddRange(@((T 'GuiChoiceSkip'),(T 'GuiChoiceKeepLocal'),(T 'GuiChoiceRestore'))); $table.Columns.Add($choiceColumn)|Out-Null
     $stateLabels=@{new=(T 'GuiStateNew');equal=(T 'GuiStateEqual');incoming_newer=(T 'GuiStateIncomingNewer');local_newer=(T 'GuiStateLocalNewer');conflict=(T 'GuiStateConflict');blocked=(T 'GuiStateBlocked')}
     foreach ($review in $Reviews) {
         $p=$review.preview; $j=$review.job
-        $index=$table.Rows.Add(($j.title+"`r`n"+$j.remoteId),$j.nativeId,$j.sourceCwd,$j.projectPath,$stateLabels[$p.status],[string]$p.reason,(T 'GuiChoiceSkip'))
-        $row=$table.Rows[$index]; $row.Tag=$review; $row.Height=52
+        $index=$table.Rows.Add($j.title,$j.remoteId,$j.nativeId,$j.sourceCwd,$j.projectPath,$stateLabels[$p.status],[string]$p.reason,(T 'GuiChoiceSkip'))
+        $row=$table.Rows[$index]; $row.Tag=$review
         if ($p.status -eq 'blocked') {
             $cell=[Windows.Forms.DataGridViewComboBoxCell]::new(); $cell.Items.AddRange(@((T 'GuiChoiceSkip'),(T 'GuiChoiceKeepLocal'))); $cell.Value=(T 'GuiChoiceSkip'); $row.Cells['choice']=$cell
             $row.DefaultCellStyle.BackColor=[Drawing.Color]::MistyRose
         } elseif ($p.status -in @('conflict','local_newer')) { $row.DefaultCellStyle.BackColor=[Drawing.Color]::LightYellow }
     }
     $table.ClearSelection()
-    $details=New-Control TextBox 16 363 1148 42 '' $dialog; $details.Multiline=$true; $details.ReadOnly=$true; $details.ScrollBars='Vertical'
+    $details=New-Control TextBox 16 363 1148 42 '' $dialog; $details.Multiline=$true; $details.ReadOnly=$true; $details.ScrollBars='Vertical'; $details.Anchor='Bottom,Left,Right'
     $detailsIdsFormat=(T 'GuiReviewDetailsIds'); $detailsPathsFormat=(T 'GuiReviewDetailsPaths')
     $table.Add_SelectionChanged({
         if ($table.SelectedRows.Count) { $review=$table.SelectedRows[0].Tag; $details.Text=($detailsIdsFormat -f $review.job.nativeId,$review.job.remoteId) + "`r`n" + ($detailsPathsFormat -f $review.job.sourceCwd,$review.job.projectPath,$review.preview.reason) }
     }.GetNewClosure())
-    $accept=New-Control Button 854 415 160 38 (T 'GuiReviewAccept') $dialog; $accept.DialogResult='OK'
-    $cancel=New-Control Button 1028 415 136 38 (T 'GuiReviewCancelAll') $dialog; $cancel.DialogResult='Cancel'
+    $accept=New-Control Button 854 415 160 38 (T 'GuiReviewAccept') $dialog; $accept.DialogResult='OK'; $accept.Anchor='Bottom,Right'
+    $cancel=New-Control Button 1028 415 136 38 (T 'GuiReviewCancelAll') $dialog; $cancel.DialogResult='Cancel'; $cancel.Anchor='Bottom,Right'
     $dialog.CancelButton=$cancel
     return @{dialog=$dialog;table=$table;accept=$accept;details=$details}
 }
@@ -303,9 +312,11 @@ function Browse-Folder([object]$Target) {
 $form=[Windows.Forms.Form]::new()
 $form.Text=(T 'GuiFormTitle')
 $form.ClientSize=[Drawing.Size]::new(1080,730)
-$form.MinimumSize=[Drawing.Size]::new(1096,769)
-$form.FormBorderStyle='FixedSingle'; $form.MaximizeBox=$false
+# 대화 표가 줄어들어 세로를 약 95px 낮출 수 있다(1366×768·150% 배율 화면의 작업 영역).
+$form.MinimumSize=[Drawing.Size]::new(1096,675)
 $form.StartPosition='CenterScreen'
+$workingArea=[Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+if ($form.Height -gt $workingArea.Height) { $form.Height=[Math]::Max($form.MinimumSize.Height,$workingArea.Height) }
 $form.Font=[Drawing.Font]::new('맑은 고딕',10)
 $form.BackColor=[Drawing.Color]::FromArgb(245,247,250)
 $header=New-Control Label 24 18 1020 36 (T 'GuiHeader') $form
@@ -315,6 +326,8 @@ $tabs=New-Control TabControl 20 98 1040 486 '' $form
 $tabs.Anchor='Top,Bottom,Left,Right'
 $main=[Windows.Forms.TabPage]::new((T 'GuiTabMain')); $tabs.TabPages.Add($main)
 $settings=[Windows.Forms.TabPage]::new((T 'GuiTabSettings')); $tabs.TabPages.Add($settings)
+# 탭 페이지는 핸들이 생겨야 실제 크기가 된다. 그 전에 Anchor를 걸면 표가 창 밖까지 늘어난다.
+$null=$tabs.Handle
 $null=New-Control Label 16 17 74 25 (T 'GuiAgentLabel') $main
 $agent=New-Control ComboBox 94 13 170 30 '' $main
 $agent.DropDownStyle='DropDownList'; $agent.Items.AddRange(@('Claude Code','Codex Desktop'))
@@ -323,22 +336,31 @@ $null=New-Control Label 286 17 132 25 (T 'GuiSavedProjects') $main
 $projectPicker=New-Control ComboBox 420 13 564 30 '' $main
 $projectPicker.DropDownStyle='DropDownList'
 $script:Bindings=@()
-$configRoot=if ($env:CTXHOP_CONFIG_DIR) {$env:CTXHOP_CONFIG_DIR} else {Join-Path $env:USERPROFILE '.ctxhop'}
-$configFile=Join-Path $configRoot 'config.json'
-if (Test-Path -LiteralPath $configFile) {
-    try {
-        $config=Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        $script:Bindings=@($config.projects.bindings)
-        foreach ($binding in $script:Bindings) { $projectPicker.Items.Add("$($binding.identity) · $($binding.localRoot)") | Out-Null }
-    } catch {}
+function Load-Bindings {
+    $script:Bindings=@(); $projectPicker.Items.Clear()
+    $configRoot=if ($env:CTXHOP_CONFIG_DIR) {$env:CTXHOP_CONFIG_DIR} else {Join-Path $env:USERPROFILE '.ctxhop'}
+    $configFile=Join-Path $configRoot 'config.json'
+    if (Test-Path -LiteralPath $configFile) {
+        try {
+            $config=Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $script:Bindings=@($config.projects.bindings | Where-Object { $_ -and $_.localRoot })
+            foreach ($binding in $script:Bindings) { $projectPicker.Items.Add("$($binding.identity) · $($binding.localRoot)") | Out-Null }
+        } catch {}
+    }
 }
+Load-Bindings
 $null=New-Control Label 16 60 74 25 (T 'GuiProjectLabel') $main
 $project=New-Control TextBox 94 56 740 28 $script:Prefs.projectPath $main
 $null=New-Button 844 51 140 (T 'GuiBrowseFolder') $main { Browse-Folder $project }
 $null=New-Control Label 16 102 74 25 (T 'GuiIdentityLabel') $main
 $identity=New-Control TextBox 94 98 355 28 $script:Prefs.identity $main
-$null=New-Button 466 92 146 (T 'GuiRegisterProject') $main { Start-Job (Base-Job 'Bind') }
+$registerButton=New-Button 466 92 146 (T 'GuiRegisterProject') $main { Start-Job (Base-Job 'Bind') }
 $null=New-Button 630 92 175 (T 'GuiLoadList') $main { Start-Job (Base-Job 'List') }
+$unbindButton=New-Button 818 92 166 (T 'GuiUnbindProject') $main {
+    $job=Base-Job 'Unbind'
+    if (-not $job.projectPath -or -not $job.identity) { throw (T 'CwBindInputRequired') }
+    if (Confirm (T 'GuiUnbindConfirm' $job.identity "`r`n" $job.projectPath)) { Start-Job $job }
+}
 $null=New-Control Label 16 140 74 25 (T 'GuiSearchLabel') $main
 $search=New-Control TextBox 94 136 355 28 '' $main
 $view=New-Control ComboBox 466 136 146 28 '' $main; $view.DropDownStyle='DropDownList'; $view.Items.AddRange(@((T 'GuiViewAll'),(T 'GuiViewLocal'),(T 'GuiViewShared'))); $view.SelectedIndex=0
@@ -350,12 +372,14 @@ $grid=New-Control DataGridView 16 205 988 174 '' $main
 $grid.ReadOnly=$true; $grid.AllowUserToAddRows=$false; $grid.AllowUserToDeleteRows=$false
 $grid.RowHeadersVisible=$false; $grid.SelectionMode='FullRowSelect'; $grid.MultiSelect=$false
 $grid.BackgroundColor=[Drawing.Color]::White
-$grid.Anchor='Top,Left'; $grid.AutoGenerateColumns=$false
+$grid.Anchor='Top,Bottom,Left,Right'; $grid.AutoGenerateColumns=$false
 foreach ($column in @(@('title',(T 'GuiColConversation'),190),@('agent',(T 'GuiColAgent'),95),@('updated',(T 'GuiColUpdated'),105),@('local',(T 'GuiColLocal'),50),@('backup',(T 'GuiColBackup'),70),@('id',(T 'GuiColSessionId'),180),@('context',(T 'GuiColContext'),185))) {
     $c=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $c.Name=$column[0]; $c.HeaderText=$column[1]; $c.FillWeight=$column[2]; $grid.Columns.Add($c) | Out-Null
 }
 $grid.AutoSizeColumnsMode='Fill'
-$selectionLabel=New-Control Label 16 384 988 24 (T 'GuiNoSelection') $main
+# 세션 UUID와 날짜가 잘리지 않을 최소 너비(맑은 고딕 10pt 기준).
+$grid.Columns['id'].MinimumWidth=300; $grid.Columns['updated'].MinimumWidth=135
+$selectionLabel=New-Control Label 16 384 988 24 (T 'GuiNoSelection') $main; $selectionLabel.Anchor='Bottom,Left,Right'
 $backupButton=New-Button 16 411 220 (T 'GuiBackupSelected') $main {
     $job=Selected-Job 'Backup'
     if (Confirm "$(T 'GuiFieldSession' $job.title)`r`n$(T 'GuiFieldAgent' $job.agent)`r`nID: $($job.nativeId)`r`n$(T 'GuiFieldProject' $job.identity)`r`n`r`n$(T 'GuiBackupConfirm')") { Start-Job $job }
@@ -363,9 +387,10 @@ $backupButton=New-Button 16 411 220 (T 'GuiBackupSelected') $main {
 $restoreButton=New-Button 252 411 220 (T 'GuiPreviewRestore') $main { if ($agent.SelectedIndex -eq 1) { Start-DesktopPreview } else { Start-Job (Selected-Job 'Preview') } }
 $openButton=New-Button 488 411 200 (T 'GuiOpenSelected') $main { Start-Job (Selected-Job 'Open') }
 $script:SessionButtons=@($backupButton,$restoreButton,$openButton)
+foreach ($button in $script:SessionButtons) { $button.Anchor='Bottom,Left' }
 $grid.Add_SelectionChanged({ Update-Selection })
 Update-Selection
-$null=New-Control Label 708 416 296 32 (T 'GuiDriveHint') $main
+$driveHint=New-Control Label 708 416 296 32 (T 'GuiDriveHint') $main; $driveHint.Anchor='Bottom,Left'
 $null=New-Control Label 22 22 970 42 (T 'GuiSettingsIntro') $settings
 $null=New-Control Label 22 84 150 25 (T 'GuiStorePath') $settings
 $store=New-Control TextBox 182 80 640 28 $script:Prefs.store $settings
@@ -392,15 +417,48 @@ $null=New-Button 494 225 238 (T 'GuiCreateInvite') $settings {
 $null=New-Control Label 22 278 150 25 (T 'GuiCodexDataFolder') $settings
 $desktopHome=New-Control TextBox 182 274 640 28 $script:Prefs.home $settings
 $null=New-Button 834 268 142 (T 'GuiBrowseFolder') $settings { Browse-Folder $desktopHome }
-$null=New-Control Label 22 325 956 94 "$(T 'GuiSettingsNote1')`r`n$(T 'GuiSettingsNote2')`r`n$(T 'GuiSettingsNote3')" $settings
+$null=New-Button 22 318 240 (T 'GuiPassphraseChange') $settings { if (Confirm (T 'GuiPassphraseChangeConfirm')) { Start-Job (Base-Job 'PassphraseChange') } }
+$null=New-Button 278 318 300 (T 'GuiPassphraseReset') $settings { if (Confirm (T 'GuiPassphraseResetConfirm')) { Start-Job (Base-Job 'PassphraseReset') } }
+$null=New-Control Label 22 368 956 76 "$(T 'GuiSettingsNote1')`r`n$(T 'GuiSettingsNote2')`r`n$(T 'GuiSettingsNote3')" $settings
+# 창을 줄이면 설정 탭 아래쪽은 스크롤로 본다.
+$settings.AutoScroll=$true
 $status=New-Control Label 24 595 860 38 (T 'GuiStatusInitial') $form
-$cancelButton=New-Button 900 591 148 (T 'GuiCancelList') $form {
-    if (-not $script:Pending -or $script:Pending.job.action -ne 'List') { return }
-    $script:Pending.cancelled=$true
-    $cancelButton.Enabled=$false
-    $status.Text=(T 'GuiListCancelling')
+function Stop-ProcessTree([int]$Id) {
+    # 프로세스 표를 한 번만 읽어 트리를 정하고, 부모부터 끝내 끝내는 사이 새 자식이 생기지 않게 한다.
+    # Windows는 부모가 끝나도 ParentProcessId를 그대로 두고 PID를 재사용하므로, 부모보다 먼저 생긴 "자식"은 다른 프로그램의 것으로 보고 건드리지 않는다.
+    $all=@(Get-CimInstance Win32_Process)
+    $tree=@($all | Where-Object { $_.ProcessId -eq $Id })
+    for ($i=0; $i -lt $tree.Count; $i++) {
+        $parent=$tree[$i]
+        $tree+=@($all | Where-Object { $_.ParentProcessId -eq $parent.ProcessId -and $_.CreationDate -gt $parent.CreationDate })
+    }
+    foreach ($process in $tree) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }
 }
-$cancelButton.Enabled=$false
+$cancelButton=New-Button 900 591 148 (T 'GuiCancelJob') $form {
+    $pending=$script:Pending
+    if (-not $pending -or $pending.job.action -in @('Restore','Open')) { return }
+    if ($pending.job.action -ne 'List' -and -not (Confirm (T 'GuiCancelConfirm' $pending.job.action))) { return }
+    # 확인 창이 떠 있는 동안 작업이 끝났으면 그 결과를 그대로 보여 주고, 이어서 시작된 작업도 건드리지 않는다.
+    if (-not [object]::ReferenceEquals($pending,$script:Pending) -or $pending.process.HasExited) { return }
+    $pending.cancelled=$true
+    $cancelButton.Enabled=$false
+    # 작업 창과 그 안의 ctxhop·Python까지 끝낸다. 결과는 Finish-Job이 버린다.
+    if (-not $pending.process.HasExited) { Stop-ProcessTree $pending.process.Id }
+    $status.Text=(T 'GuiCancelling')
+}
+$cancelButton.Enabled=$false; $cancelButton.Anchor='Bottom,Right'
+$tips=[Windows.Forms.ToolTip]::new()
+$tips.SetToolTip($backupButton,(T 'GuiTipBackup')); $tips.SetToolTip($restoreButton,(T 'GuiTipRestore')); $tips.SetToolTip($openButton,(T 'GuiTipOpen'))
+$tips.SetToolTip($registerButton,(T 'GuiTipRegister')); $tips.SetToolTip($unbindButton,(T 'GuiTipUnbind')); $tips.SetToolTip($cancelButton,(T 'GuiTipCancel'))
+# 꺼진 버튼은 툴팁을 띄우지 않으므로, 마우스 아래의 꺼진 버튼 설명을 그 버튼이 놓인 탭·창의 툴팁으로 대신 띄운다.
+foreach ($surface in @($main,$form)) {
+    $surface.Add_MouseMove({
+        param($sender,$e)
+        $hit=$sender.GetChildAtPoint($e.Location)
+        $text=if ($hit -and -not $hit.Enabled) {$tips.GetToolTip($hit)} else {''}
+        if ($tips.GetToolTip($sender) -ne $text) { $tips.SetToolTip($sender,$text) }
+    })
+}
 $status.Anchor='Bottom,Left,Right'
 $progress=New-Control ProgressBar 24 634 1025 8 '' $form; $progress.Anchor='Bottom,Left,Right'
 $log=New-Control TextBox 24 651 1025 58 '' $form; $log.Multiline=$true; $log.ReadOnly=$true; $log.ScrollBars='Vertical'; $log.Anchor='Bottom,Left,Right'

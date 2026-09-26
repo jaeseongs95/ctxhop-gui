@@ -72,6 +72,8 @@ try {
         Assert ($script:Answers.Count -gt 0) 'Unexpected confirmation dialog.'
         $answer = $script:Answers[0]
         $script:Answers = @($script:Answers | Select-Object -Skip 1)
+        # 확인 창이 떠 있는 동안 일어나는 일은 스크립트 블록 답으로 흉내 낸다.
+        if ($answer -is [scriptblock]) { return (& $answer) }
         return $answer
     }
     $stubPath = Join-Path $fixtureRoot 'Worker.ps1'
@@ -134,14 +136,21 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Write-Output ('Columns: ' + (($grid.Columns | ForEach-Object { '{0}={1}px/weight{2}' -f $_.HeaderText,$_.Width,$_.FillWeight }) -join '; '))
     Write-Output "Layout: form=$($form.ClientSize); tabs=$($tabs.Size); main=$($main.ClientSize); grid=$($grid.Size); autoscale=$($form.AutoScaleMode)/$($form.AutoScaleDimensions)"
     $initialClientSize = $form.ClientSize
+    $initialGridHeight = $grid.Height
+    $backupButton = $script:Buttons | Where-Object Text -eq '선택한 대화 백업'
+    Assert ($grid.Right -le $main.ClientSize.Width -and $grid.Bottom -lt $backupButton.Top) 'Grid must fit inside the tab without covering the actions.'
     $form.ClientSize = [Drawing.Size]::new(1280,930)
     [Windows.Forms.Application]::DoEvents()
-    $backupButton = $script:Buttons | Where-Object Text -eq '선택한 대화 백업'
     Write-Output "Resize: gridBottom=$($grid.Bottom); actionTop=$($backupButton.Top); gridInsideTab=$($grid.Right -le $main.ClientSize.Width); overlap=$($grid.Bottom -gt $backupButton.Top)"
+    Assert ($grid.Height -gt $initialGridHeight -and $grid.Right -le $main.ClientSize.Width -and $grid.Bottom -lt $backupButton.Top) 'A larger window must enlarge the grid inside the tab without covering the actions.'
+    $form.Size = $form.MinimumSize
+    [Windows.Forms.Application]::DoEvents()
+    Write-Output "Minimum: form=$($form.Size); gridHeight=$($grid.Height); actionBottom=$($backupButton.Bottom); tabHeight=$($main.ClientSize.Height)"
+    Assert ($grid.Height -ge 60 -and $grid.Bottom -lt $backupButton.Top -and $backupButton.Bottom -le $main.ClientSize.Height) 'The minimum window must keep the grid and actions visible.'
     $form.ClientSize = $initialClientSize
     [Windows.Forms.Application]::DoEvents()
-    Assert ($grid.Right -le $main.ClientSize.Width -and $grid.Bottom -lt $backupButton.Top) 'Grid must fit inside the tab without covering the actions.'
-    Assert ($form.FormBorderStyle -eq 'FixedSingle' -and -not $form.MaximizeBox) 'Fixed layout should prevent unsupported window resizing.'
+    Assert ($grid.Height -eq $initialGridHeight -and $grid.Bottom -lt $backupButton.Top) 'Restoring the size must restore the layout.'
+    Assert ($form.FormBorderStyle -eq 'Sizable' -and $form.MinimumSize.Height -le 675) 'The window must be resizable down to small laptop work areas.'
     $fixtureNow = Get-Date
     $large = @(for ($i=1; $i -le 5000; $i++) {
         [pscustomobject]@{
@@ -197,6 +206,8 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Wait-Filter
     Assert ($grid.Rows.Count -eq 0) 'Clearing search after a project change must not reveal the old project sessions.'
     Set-Fixtures
+    # 저장소에 올리는 미리보기에 실제 PC 이름과 사용자 폴더가 찍히지 않게 한다.
+    $device.Text = 'PC-A'; $desktopHome.Text = 'C:\Users\me\.codex'
     $tabs.SelectedTab = $settings
     [Windows.Forms.Application]::DoEvents()
     $bitmap = [Drawing.Bitmap]::new($form.Width,$form.Height)
@@ -230,15 +241,38 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Finish-Job
     Assert ($null -eq $script:Pending -and $status.Text -like '*취소했습니다*' -and $script:Errors.Count -eq 0) 'Cancelled List should return to idle without an error dialog.'
     Assert ($grid.Rows.Count -eq 2 -and -not $cancelButton.Enabled -and $projectPicker.Enabled -and -not (Test-Path -LiteralPath $cancelRequest)) 'List cancellation must preserve rows, restore controls, and remove fixture request files.'
+    $statusJob = Base-Job 'Status'
+    $statusJob.fixtureDelay = 20000
+    Start-Job $statusJob
+    $statusProcess = $script:Pending.process
+    Assert ($cancelButton.Enabled) 'Non-restore tasks must be cancellable.'
+    $script:Answers = @($false)
+    $cancelButton.PerformClick()
+    Assert (-not $script:Pending.cancelled -and -not $statusProcess.HasExited) 'Declining the cancel confirmation must keep the task running.'
+    $running = $script:Pending
+    $script:Answers = @({ $script:Pending = $running.Clone(); $true })
+    $cancelButton.PerformClick()
+    Assert (-not $running.cancelled -and -not $script:Pending.cancelled -and -not $statusProcess.HasExited) 'A task that finished while the cancel confirmation was open, and the task after it, must not be stopped.'
+    $script:Pending = $running
+    $script:Answers = @($true)
+    $cancelButton.PerformClick()
+    Assert ($script:Pending.cancelled -and $statusProcess.WaitForExit(5000)) 'Cancelling a task must stop the worker process it started.'
+    Finish-Job
+    Assert ($null -eq $script:Pending -and $status.Text -eq (T 'GuiJobCancelled') -and $script:Errors.Count -eq 0) 'A cancelled task should return to idle with the cancel message.'
+    $script:Answers = @($true)
+    ($script:Buttons | Where-Object Text -eq '등록 해제').PerformClick()
+    Assert ($script:Pending.job.action -eq 'Unbind' -and $script:Pending.job.identity -eq $identity.Text -and $script:Pending.job.projectPath -eq $project.Text) 'Unregister must send the project fields after confirmation.'
+    Finish-Fixture
+    Assert ($projectPicker.Items.Count -eq 2 -and $script:Errors.Count -eq 0) 'Registered projects must reload after unregistering.'
     Set-Fixtures
     $script:Answers = @($false)
     ($script:Buttons | Where-Object Text -eq '선택한 대화 백업').PerformClick()
     Assert ($null -eq $script:Pending) 'Declined backup confirmation must leave the form idle.'
     $script:Answers = @($true,$false)
     ($script:Buttons | Where-Object Text -eq '미리보기 후 복원').PerformClick()
-    Assert (-not $cancelButton.Enabled) 'Restore previews must not enable the List cancellation button.'
+    Assert ($cancelButton.Enabled) 'A restore preview can be cancelled.'
     Finish-Fixture
-    Assert ($script:Pending.job.action -eq 'Restore') 'Accepted preview should start Restore.'
+    Assert ($script:Pending.job.action -eq 'Restore' -and -not $cancelButton.Enabled) 'Accepted preview should start Restore, which cannot be cancelled.'
     Finish-Fixture
     Assert ($null -eq $script:Pending) 'Declined open should complete without another process.'
     Set-Fixtures
