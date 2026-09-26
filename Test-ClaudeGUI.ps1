@@ -53,6 +53,7 @@ try {
     $fixturePrefsBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixturePrefsFile))
     $fixtureGuiPath = Join-Path $fixtureRoot 'GUI fixture.ps1'
     [IO.File]::WriteAllText($fixtureGuiPath,$source.Substring(0,$tail),[Text.UTF8Encoding]::new($true))
+    Copy-Item -LiteralPath (Join-Path $testRoot 'Strings.ps1') -Destination $fixtureRoot
     . $fixtureGuiPath -SmokeTest
     $timer.Stop()
     Assert ($agent.SelectedIndex -eq 1 -and $script:Prefs.PSObject.Properties.Name -contains 'identity' -and $script:Prefs.store -eq 'G:\내 드라이브\세션연동') 'Partial preferences should preserve defaults and reject non-string fields.'

@@ -39,6 +39,25 @@
 | Worker 결과 파일 | GUI가 띄운 `Worker.ps1`이 `ClaudeWorker.ps1 -LibraryOnly`를 dot-source하면 ClaudeWorker의 `param` 블록이 같은 스코프의 `$RequestFile`·`$ResultFile`을 빈 값으로 다시 묶음. 요청을 읽지 못하고 결과 파일도 쓰지 못해 GUI의 모든 작업이 "작업 창이 중단되었습니다"로 끝남. 기존 시험은 Worker를 라이브러리로만 불러 이 경로를 실행하지 않았음(언어 선택 작업 중 발견) | dot-source 전에 두 경로를 보관했다가 되돌림 | `Test-DesktopWorker`가 GUI처럼 Worker를 별도 프로세스로 실행해 결과 파일을 확인. 수정 전 Worker에서는 실패 |
 | macOS CI | `internal/desktopbundle`의 경로 검사가 상위 폴더의 모든 링크를 거부하는데(의도한 보안 동작), macOS 임시 폴더 `/var`가 `/private/var` 링크라 bundle 시험 11개가 실패 | 제품 검사는 그대로 두고, 시험이 링크를 푼 임시 폴더(`filepath.EvalSymlinks`)를 쓰도록 수정 | GitHub CI |
 
+## 언어 선택 (한국어·English)
+
+- 설정 탭에 **Language / 언어** 선택(한국어, English)을 추가했습니다. 선택은 `vnext-preferences.json`의 `language`에 저장되고 다시 시작하면 적용됩니다. 작업 요청에도 `language`가 실려 작업 창(`Worker.ps1`)의 메시지가 같은 언어로 나옵니다.
+- GUI·Codex Worker·Claude Worker의 화면·오류 문장 229개를 `Strings.ps1`(`키=@('한국어','English')`)로 옮겼습니다. 한국어 문장은 원래 문자열과 같아서 기존 시험이 그대로 통과합니다.
+- 번역하지 않은 것: Python 백엔드의 차단 사유, ctxhop·Codex·Claude 실행 파일 출력, 글꼴 이름과 기본 Drive 경로.
+- `ClaudeWorker.ps1`은 안정판(`D08E9A15…`)과 더 이상 바이트가 같지 않습니다.
+  - 바뀐 것: 문장을 `T '키'` 호출로 바꾼 것, `Strings.ps1`을 불러오는 줄, 요청의 언어를 적용하는 `Set-Language` 줄. 판단·분기 논리는 그대로입니다.
+  - `Test-DesktopWorker`는 이 판의 해시를 고정합니다.
+- 수동 복구 진입점 `backend\Invoke-Desktop.ps1`은 언어를 받지 않아 오류 문장이 항상 한국어입니다.
+- 저장소에 있는 `gui-*-preview.png`는 이번에 다시 그리지 않아 언어 선택이 보이지 않습니다. 영어·한국어 화면은 격리 스크린샷으로 따로 확인했습니다.
+- `Test-Strings.ps1`(신규)이 확인하는 것:
+  - 두 언어 문장의 짝과 자리표시자
+  - 세 스크립트에 남은 번역 안 된 한글(주석 제외)
+  - 쓰이지 않거나 없는 키
+  - 영어 화면(글자 넘침은 스크린샷으로 따로 확인)
+  - 영어 선택 값으로 복원 결정
+  - 별도 프로세스로 띄운 작업 창이 요청 언어로 답하는지
+- 목록을 그릴 때 행마다 문장을 찾지 않도록 반복문 밖에서 한 번만 찾습니다(5,000개 첫 표시: 이번 실행들 133~187ms, 이전 기록 201ms).
+
 ## 실행한 검사 (Windows PowerShell 5.1, Python 3.12.14 Codex 번들, 엔진 `0.158.0-alpha.2.1`)
 
 | 검사 | 결과 | 원시 로그 |
@@ -52,10 +71,12 @@
 
 PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -File`로 실행했고 5개 모두 종료 코드 0이었습니다(각 로그 끝에 `EXIT CODE` 기록, README의 `RemoteSigned`로는 다시 실행하지 않음).
 
+언어 선택 뒤 같은 명령으로 6개를 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1219, `Test-DesktopWorker` 61, `Test-DesktopGUI` 25, `Test-ClaudeGUI` 93(5,000개 첫 표시 143ms), `Test-ClaudeWorker` 640 assertions, `Test-DesktopIntegration` 32. 이 실행의 원시 로그는 작업 PC의 임시 폴더에만 있습니다.
+
 - 전송(`bin\ctxhop.exe`)은 PowerShell 테스트에서 mock이고, 성공 경로의 mock은 bundle 메타데이터 규칙(정확한 7개 필드, BOM 없음, NUL·줄바꿈 없음)을 확인합니다.
 - `backend\test_guard_shim.py`는 시험 전용이며 앱 종료 검사와 엔진 버전 조회만 바꿉니다(엔진은 환경변수 값). Worker·GUI는 이 파일을 호출하지 않습니다. `Test-DesktopIntegration.ps1`의 성공 경로를 다른 PC에서도 다시 돌릴 수 있도록 패키지에 남겨 두었습니다.
 - native 시험은 격리 `CODEX_HOME`과 localhost 고정 응답만 사용했고 외부 모델 호출은 없습니다. 검사 뒤 `%USERPROFILE%\.ctxhop`, 공유 `v1\keyfile`의 수정 시각이 이전과 같고, `%LOCALAPPDATA%\CtxHopGUI`와 임시 fixture가 남지 않은 것을 확인했습니다. PowerShell 7은 이 PC에 없어 실행하지 않았습니다.
-- 이전 일곱 판(백엔드 `6AE2432C…`, 패키지 zip `04B80957…`, `6E48C2C2…`, `3ACC8589…`, `F0797242…`, `0A16B4CB…`, `8FAD77C3…`)에 대한 독립 감사는 모두 Gate PASS(차단 결함 없음)였습니다. 위 표의 제목 줄바꿈·버전 일치·복구 임시 파일·결과 표시·성공 경로 시험(1차), 미리보기 엔진 차단·`ChatGPT.exe`·하위 에이전트 표시(2차), 문서 누락(3차), 되살리기 조건·`arg0` 위치·엔진 업데이트 안내 문구(4차), staging 삭제 안전화·수동 진입점 변조 시험·끝 `\` 안내·복구 잠금 안 구조 재확인(6차), 연결 폴더 거부·잠금 안 재확인 시험(7차)은 그 감사의 비차단 발견사항을 반영한 것입니다. `F0797242…` 이후 바뀐 파일은 `backend\desktop_sessions.py`, `backend\Invoke-Desktop.ps1`, `backend\test_desktop_sessions.py`(`test_24`·`test_25`), `backend\test_guard_shim.py`, `Worker.ps1`, `Test-DesktopWorker.ps1`, `Test-DesktopIntegration.ps1`, `README.md`, `verification.md`, 그리고 시험이 다시 그리는 `gui-*-preview.png`입니다. 7차 감사(`8FAD77C3…`) 이후에는 시험 두 개(`test_26`, `Test-DesktopWorker`의 연결 폴더 거부)와 이 문서만 바뀌었고, 두 시험은 보호 장치를 뺀 변이 사본에서 실패하는 것을 확인했습니다.
+- 이전 일곱 판(백엔드 `6AE2432C…`, 패키지 zip `04B80957…`, `6E48C2C2…`, `3ACC8589…`, `F0797242…`, `0A16B4CB…`, `8FAD77C3…`)에 대한 독립 감사는 모두 Gate PASS(차단 결함 없음)였습니다. 위 표의 제목 줄바꿈·버전 일치·복구 임시 파일·결과 표시·성공 경로 시험(1차), 미리보기 엔진 차단·`ChatGPT.exe`·하위 에이전트 표시(2차), 문서 누락(3차), 되살리기 조건·`arg0` 위치·엔진 업데이트 안내 문구(4차), staging 삭제 안전화·수동 진입점 변조 시험·끝 `\` 안내·복구 잠금 안 구조 재확인(6차), 연결 폴더 거부·잠금 안 재확인 시험(7차)은 그 감사의 비차단 발견사항을 반영한 것입니다. `F0797242…` 이후 바뀐 파일은 `backend\desktop_sessions.py`, `backend\Invoke-Desktop.ps1`, `backend\test_desktop_sessions.py`(`test_24`·`test_25`), `backend\test_guard_shim.py`, `Worker.ps1`, `Test-DesktopWorker.ps1`, `Test-DesktopIntegration.ps1`, `README.md`, `verification.md`, 그리고 시험이 다시 그리는 `gui-*-preview.png`입니다. 7차 감사(`8FAD77C3…`)와 패키지 zip 사이에는 시험 두 개(`test_26`, `Test-DesktopWorker`의 연결 폴더 거부)와 이 문서만 바뀌었고, 두 시험은 보호 장치를 뺀 변이 사본에서 실패하는 것을 확인했습니다. 그 뒤 GitHub PR에서 고친 것과 언어 선택은 위의 두 절에 있으며, 각각 별도 독립 감사에서 Gate PASS를 받았습니다.
 - 사용자 결정(2026-09-26): Python 실행 파일 SHA 고정 제거를 수용, 시험 전용 `test_guard_shim.py`는 패키지에 유지.
 
 ## 고정 해시 (SHA-256)
@@ -67,9 +88,10 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 | `backend\schema.json` (백엔드 고정) | `D24ACAC2105569B5B9CFDABC5259DB8217B9A9F175D7D2B57A09A2D4F76FA0A2` |
 | `bin\ctxhop.exe` (bundle 전송, Worker 고정, 변경 없음) | `9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006` |
 | `bin\ctxhop-claude.exe` (`0.2.0-gui.1`, 변경 없음) | `A1702CE1839AF90C0DDB87E7C07F1BE7899BE8EBDD9117FE680D2EC9739C233D` |
-| `ClaudeWorker.ps1` (안정판 Worker와 동일, 변경 없음) | `D08E9A15A19C8F3D09126EF8535CFD13AE39D9CFF3BC9BADA1DCE53C4741E47F` |
-| `Worker.ps1` (결과 파일 경로 보관 수정) | `549FC0AD3CB8D028442443E9CDC4AB1654DE7EF53BAEB29AF906E6B01E903FA7` |
-| `GUI.ps1` (완료 문구, 작업 불가 행의 백업 열·선택 안내, 설정 탭 안내 문구만 변경) | `A66668A61C73F59EDC2071966C8C14CE6D7A9F75275EA21A21E9D9752CFEC5CD` |
+| `ClaudeWorker.ps1` (안정판 `D08E9A15…`에서 문장만 `Strings.ps1`로 옮김) | `059448A8C945A586459085EAFB88F163AF90FD8A7CEC955B9F550C5DEB94D28A` |
+| `Worker.ps1` (결과 파일 경로 보관 수정, 언어 선택) | `C8AA63D2F8F853A77B5AD48F6E74468E777FA3EDF76C8DF5AC0539F81FE59EA8` |
+| `GUI.ps1` (언어 선택) | `9FE39D5E0935D98B4EAC1D39FFAFF5B9D5E990A77C8714AEC214829382F3D827` |
+| `Strings.ps1` (한국어·영어 문장 표) | `2B4621B2631AFDEACCF6EDC4DA3F768BD07304E2E5BCA42BDE3A466BFF217A08` |
 
 `transport-source\`와 `bin\ctxhop.exe`는 노트북 세션 결과를 그대로 옮겼습니다. 이 PC에는 Go가 없어 Go 시험을 다시 실행하지 않았고, 기록된 결과(`transport-source\verification-results\`: 전체 suite 통과, race는 gcc 부재로 미실행)를 근거로 둡니다.
 

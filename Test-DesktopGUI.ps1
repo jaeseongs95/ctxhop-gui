@@ -16,6 +16,7 @@ try {
     $tail=$source.LastIndexOf('if ($SmokeTest) {')
     $fixture=Join-Path $testDirectory 'GUI.ps1'
     [IO.File]::WriteAllText($fixture,$source.Substring(0,$tail),[Text.UTF8Encoding]::new($true))
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Strings.ps1') -Destination $testDirectory
     . $fixture -SmokeTest
     $timer.Stop(); $filterTimer.Stop()
     function Show-Error([string]$Message) {$script:Errors+=,$Message; $status.Text=$Message}

@@ -127,8 +127,8 @@ try {
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
     Assert ($failure.Exception.Data['backendResult'].journal -eq 'fixture/recovery/pending.json') 'failure must preserve backend recovery journal data'
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
-    # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)과 바이트 동일해야 한다.
-    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq 'D08E9A15A19C8F3D09126EF8535CFD13AE39D9CFF3BC9BADA1DCE53C4741E47F') 'Claude worker copy must be byte identical'
+    # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판과 바이트 동일해야 한다.
+    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '059448A8C945A586459085EAFB88F163AF90FD8A7CEC955B9F550C5DEB94D28A') 'Claude worker copy must match the audited string-table version'
     Throws {Assert-FrozenFile (Join-Path $testDirectory 'nonexistent.py') ''} '준비되지'
     Throws {Assert-BundleId '../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'} '잘못된'
     Throws {Assert-BundleId 'peer-a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'} '잘못된'

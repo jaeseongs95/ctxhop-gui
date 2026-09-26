@@ -109,7 +109,7 @@ try {
     $manual=& (Join-Path $PSScriptRoot 'backend\Invoke-Desktop.ps1') -Action pending -HomePath ($target+'\') | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 0 -and @($manual.pending).Count -eq 0) 'manual entry point passes a spaced path with a trailing backslash intact'
     $copy=Join-Path $testDirectory 'tampered-package'; $null=New-Item -ItemType Directory -Path (Join-Path $copy 'backend')
-    foreach ($name in @('Worker.ps1','ClaudeWorker.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
+    foreach ($name in @('Worker.ps1','ClaudeWorker.ps1','Strings.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
     [IO.File]::AppendAllText((Join-Path $copy 'backend\desktop_sessions.py'),"`n# tampered`n")
     $manual=& (Join-Path $copy 'backend\Invoke-Desktop.ps1') -Action pending -HomePath $receiver | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 1 -and $manual.reason -match '다릅니다') 'manual entry point refuses a changed backend'
