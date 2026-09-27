@@ -54,7 +54,11 @@ function Invoke-Ctx([string[]]$Arguments, [switch]$Json) {
     $exe = Find-Executable 'ctxhop'
     # 로그 시각은 밀리초까지만 적히므로 시작 시각도 밀리초로 자른다.
     $since = [datetimeoffset]::FromUnixTimeMilliseconds([datetimeoffset]::Now.ToUnixTimeMilliseconds())
-    if ($Json) { $output = & $exe @Arguments } else { & $exe @Arguments | Out-Host }
+    # ctxhop은 UTF-8로 출력한다. PowerShell 5.1은 콘솔 코드 페이지(한국어 Windows의 새 창은 949)로 읽어 한글이 깨지므로 호출하는 동안만 UTF-8로 읽는다.
+    $encoding = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    try { if ($Json) { $output = & $exe @Arguments } else { & $exe @Arguments | Out-Host } }
+    finally { [Console]::OutputEncoding = $encoding }
     if ($LASTEXITCODE -ne 0) {
         $message = T 'CwCtxFailed' $Arguments[0] $LASTEXITCODE
         $reason = Get-CtxFailureReason $Arguments[0] $since

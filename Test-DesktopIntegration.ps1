@@ -14,7 +14,7 @@ $engine=Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin\*\cod
 if (-not $engine) { throw 'Codex Desktop 엔진이 없어 native fixture를 만들 수 없습니다.' }
 $runtime=Get-DesktopRuntime
 $testDirectory=Join-Path ([IO.Path]::GetTempPath()) ('CtxHop-vnext-integration-'+[guid]::NewGuid().ToString('N'))
-$oldLocal=$env:LOCALAPPDATA; $oldEncoding=[Console]::OutputEncoding
+$oldLocal=$env:LOCALAPPDATA; $oldEncoding=[Console]::OutputEncoding; $oldCeiling=$env:GIT_CEILING_DIRECTORIES
 try {
     $null=New-Item -ItemType Directory -Path $testDirectory
     [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -26,17 +26,20 @@ try {
     # 엔진이 필요한 미리보기·백업·복원이 항상 쓰기 전에 차단된다.
     $env:LOCALAPPDATA=$testDirectory
     $remote=Join-Path $testDirectory 'remote'; $null=New-Item -ItemType Directory -Path $remote
+    # 올린 bundle의 메타데이터. 목록은 프로젝트 파일 절에서만 돌려준다(앞 절의 목록 검사는 이 PC 대화만 본다).
+    $script:Stored=[ordered]@{}; $script:ListStored=$false
     function Invoke-Bundle([string[]]$Arguments) {
         switch ($Arguments[0]) {
-            list { return [pscustomobject]@{bundles=@()} }
+            list { return [pscustomobject]@{bundles=@(if ($script:ListStored) { $script:Stored.Values })} }
             put {
                 $bytes=[IO.File]::ReadAllBytes($Arguments[[array]::IndexOf($Arguments,'--metadata')+1])
                 Assert (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191)) 'metadata is UTF-8 without BOM'
                 $m=[Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
                 Assert ((@($m.PSObject.Properties.Name) | Sort-Object) -join ',' -eq 'cliVersion,historyMode,recordCount,sessionId,sourceCwd,title,updatedAt') 'metadata has the exact seven fields'
                 Assert (-not @($m.PSObject.Properties.Value | Where-Object { $_ -is [string] -and $_ -match "[`0`r`n]" })) 'metadata strings have no NUL or line breaks (bundle rule)'
-                Assert ($m.historyMode -ceq 'paginated;family=0') 'backups mark the subagent family format (no subagents here)'
+                if ($m.historyMode -notlike 'project-*') { Assert ($m.historyMode -ceq 'paginated;family=0') 'backups mark the subagent family format (no subagents here)' }
                 $id='peer-fixture/'+[guid]::NewGuid().ToString('N')
+                $script:Stored[$id]=[pscustomobject]@{id=$id;metadata=$m}
                 Copy-Item -LiteralPath $Arguments[[array]::IndexOf($Arguments,'--input')+1] -Destination (Join-Path $remote $id.Split('/')[1])
                 return [pscustomobject]@{id=$id}
             }
@@ -113,7 +116,7 @@ try {
     $manual=& (Join-Path $PSScriptRoot 'backend\Invoke-Desktop.ps1') -Action pending -HomePath ($target+'\') | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 0 -and @($manual.pending).Count -eq 0) 'manual entry point passes a spaced path with a trailing backslash intact'
     $copy=Join-Path $testDirectory 'tampered-package'; $null=New-Item -ItemType Directory -Path (Join-Path $copy 'backend')
-    foreach ($name in @('Worker.ps1','ClaudeWorker.ps1','Strings.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
+    foreach ($name in @('Worker.ps1','ClaudeWorker.ps1','Strings.ps1','ProjectFiles.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
     [IO.File]::AppendAllText((Join-Path $copy 'backend\desktop_sessions.py'),"`n# tampered`n")
     $manual=& (Join-Path $copy 'backend\Invoke-Desktop.ps1') -Action pending -HomePath $receiver | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 1 -and $manual.reason -match '다릅니다') 'manual entry point refuses a changed backend'
@@ -125,11 +128,27 @@ try {
     $again.action='Restore'; $again.receipt=$q.receipt; $again.token=$q.preview.token; $again.choice='incoming'
     $unchanged=Invoke-JobCore $again
     Assert ($unchanged.applied.status -eq 'equal' -and $unchanged.message -match '변경 없음') 'unchanged restore is not reported as completed'
+    # 3) 프로젝트 파일: 실제 export가 돌려준 작업 폴더(이 fixture 대화는 CODEX_HOME에서 시작)로 폴더 백업과 연결 기록을 올리고,
+    #    미리보기·복원으로 다른 폴더에 되돌린다. git이 임시 폴더 위쪽 저장소를 찾지 않게 한다.
+    $env:GIT_CEILING_DIRECTORIES=$testDirectory; $script:ListStored=$true
+    $withFiles=Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread;projectBackup=$true}
+    $startFolder=@($withFiles.project.folders)[0]
+    Assert ($startFolder.role -eq 'start' -and $startFolder.status -eq 'uploaded' -and $startFolder.files -gt 0 -and (ConvertTo-ProjectPath $startFolder.sourcePath) -eq (ConvertTo-ProjectPath $fixtureHome)) "the real export names the conversation folder and it is uploaded: $($withFiles.project.folders | ConvertTo-Json -Compress)"
+    Assert (@($script:Stored.Values | Where-Object { $_.metadata.historyMode -ceq 'project-link;v1;codex-desktop' -and $_.metadata.title -ceq $withFiles.bundle.id }).Count -eq 1) 'a link record names the conversation backup'
+    $projectTarget=Join-Path $testDirectory '프로젝트 복원 폴더'; $null=New-Item -ItemType Directory -Path $projectTarget
+    $withRestore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$projectTarget;nativeId=$thread;remoteId=$withFiles.bundle.id;projectRestore=$true}
+    $pp=Invoke-JobCore $withRestore
+    Assert ($pp.project.state -eq 'found' -and $pp.project.folders[0].state -eq 'ready' -and $pp.project.folders[0].compare.new -eq $startFolder.files) "preview finds the linked folder backup: $($pp.project | ConvertTo-Json -Depth 4 -Compress)"
+    $withRestore.action='Restore'; $withRestore.receipt=$pp.receipt; $withRestore.token=$pp.preview.token; $withRestore.choice='incoming'
+    $pr=Invoke-JobCore $withRestore
+    Assert ($pr.project.folders[0].written -eq $startFolder.files -and [IO.File]::ReadAllText((Join-Path $projectTarget 'probe.json')) -eq [IO.File]::ReadAllText((Join-Path $fixtureHome 'probe.json'))) "project files are restored into the chosen folder: $($pr.message)"
+    Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $withRestore.receipt))) 'the project preview staging copy is removed after restore'
+    $env:GIT_CEILING_DIRECTORIES=$oldCeiling; $script:ListStored=$false
     $env:CTXHOP_TEST_ENGINE='0.158.0-alpha.2'
     Throws {Invoke-JobCore @{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.bundle.id}} '엔진'
     Write-Output "PASS: $script:Checks real-backend integration assertions. Engine $($engine.FullName); bundle transport mocked."
 } finally {
-    $env:LOCALAPPDATA=$oldLocal; [Console]::OutputEncoding=$oldEncoding
+    $env:LOCALAPPDATA=$oldLocal; [Console]::OutputEncoding=$oldEncoding; $env:GIT_CEILING_DIRECTORIES=$oldCeiling
     Remove-Item -LiteralPath Env:CTXHOP_TEST_ENGINE -ErrorAction SilentlyContinue
     $resolved=[IO.Path]::GetFullPath($testDirectory); $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
     if (-not $resolved.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($resolved) -notmatch '^CtxHop-vnext-integration-[a-f0-9]{32}$') { throw 'Refusing cleanup outside fixture directory' }

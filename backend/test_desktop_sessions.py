@@ -534,6 +534,8 @@ class Sessions(unittest.TestCase):
         with mock.patch.object(d, 'engine_version', return_value=d.VERSIONS[-1]):
             code, exported = self.run_cli('export', '--home', str(self.home), '--id', self.thread_id, '--output', str(output))
             self.assertEqual((code, exported['metadata']['historyMode']), (0, 'paginated;family=3'))
+            # 프로젝트 폴더 백업이 쓸 작업 폴더: 가져온 묶음은 모두 가져올 때 고른 폴더를 쓴다.
+            self.assertEqual(exported['folders'], {'cwds': [str(self.cwd)], 'edits': []})
             code, blocked = self.run_cli('export', '--home', str(self.home), '--id', self.ids(family)[1],
                 '--output', str(self.root / 'child-export.zip'))
         self.assertEqual(code, 1)
@@ -787,6 +789,25 @@ class Sessions(unittest.TestCase):
                 mock.patch.object(d.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run:
             d.assert_no_writers()
         self.assertEqual(run.call_args[0][0][0], r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe')
+
+    def test_37_work_folders_lists_every_cwd_and_absolute_patch_paths(self):
+        # 패치는 function_call arguments처럼 JSON 문자열 안에 JSON으로 한 번 더 들어 있을 수 있다. 상대 경로는 작업 폴더 안이라 빼고,
+        # 같은 경로는 한 번만, 대화 cwd → 턴마다 바뀐 cwd → 하위 대화 cwd 순으로 처음 본 순서를 지킨다.
+        def line(kind, payload):
+            return (json.dumps({'type': kind, 'payload': payload}, ensure_ascii=False) + '\n').encode('utf-8')
+        patch = '*** Begin Patch\n*** Update File: D:\\codex\\보고서\\a.py\n*** Add File: notes/b.md\n*** End Patch'
+        parent = (line('session_meta', {'id': 'p'}) + line('turn_context', {'cwd': 'D:\\codex\\보고서'})
+            + line('turn_context', {'cwd': 'D:\\other'})
+            + line('response_item', {'type': 'function_call', 'name': 'shell',
+                'arguments': json.dumps({'command': ['apply_patch', patch]}, ensure_ascii=False)})
+            + line('response_item', {'type': 'custom_tool_call', 'name': 'apply_patch',
+                'input': '*** Begin Patch\n*** Delete File: C:\\Users\\me\\Desktop\\x.txt\n*** End Patch'})
+            + line('response_item', {'type': 'custom_tool_call', 'name': 'apply_patch', 'input': patch}))
+        child = line('session_meta', {'id': 'c'}) + line('turn_context', {'cwd': 'E:\\sub'})
+        family = {'members': [{'data': {'thread': {'cwd': 'D:\\codex\\보고서'}}, 'rollout': parent},
+            {'data': {'thread': {'cwd': 'E:\\sub'}}, 'rollout': child}]}
+        self.assertEqual(d.work_folders(family), {'cwds': ['D:\\codex\\보고서', 'D:\\other', 'E:\\sub'],
+            'edits': ['D:\\codex\\보고서\\a.py', 'C:\\Users\\me\\Desktop\\x.txt']})
 
 
 if __name__ == '__main__':

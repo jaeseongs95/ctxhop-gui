@@ -351,6 +351,49 @@ def selected(home, thread_id):
     return family
 
 
+PATCH_FILE = re.compile(r'^\*\*\* (?:Update|Add|Delete) File: (.+)$', re.M)
+ABSOLUTE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\)')
+
+
+def texts(value):
+    """레코드 안의 모든 문자열. function_call arguments처럼 JSON 문자열 안에 JSON이 한 번 더 들어 있으면 끝까지 푼다."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from texts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from texts(item)
+    elif isinstance(value, str):
+        if value[:1] in ('{', '['):
+            try:
+                yield from texts(json.loads(value))
+                return
+            except ValueError:
+                pass
+        yield value
+
+
+def work_folders(family):
+    """묶음이 작업한 폴더(대화와 턴마다 기록된 cwd, 처음 본 순서)와 패치가 절대 경로로 고친 파일. 합치고 거르는 일은 GUI가 한다."""
+    cwds, edits = [], []
+    for item in family['members']:
+        if item['data']['thread']['cwd'] not in cwds:
+            cwds.append(item['data']['thread']['cwd'])
+        for line in item['rollout'].splitlines():
+            if b'turn_context' not in line and b'File: ' not in line:
+                continue
+            obj = json.loads(line)
+            payload = obj['payload']
+            if obj.get('type') == 'turn_context' and isinstance(payload.get('cwd'), str) and payload['cwd'] not in cwds:
+                cwds.append(payload['cwd'])
+            for text in texts(payload):
+                for match in PATCH_FILE.finditer(text):
+                    path = match.group(1).strip()
+                    if ABSOLUTE.match(path) and path not in edits:
+                        edits.append(path)
+    return {'cwds': cwds, 'edits': edits[:1000]}  # ponytail: 폴더 밖 편집 목록은 보여 주기용이라 1000개에서 자른다
+
+
 def member_hash(item):
     return digest(encoded(item['data']) + item['rollout'])
 
@@ -1057,7 +1100,7 @@ def main():
             info = summary(snapshot)
             result = {'status': 'exported', 'metadata': {key: info[key] for key in
                 ('sessionId', 'title', 'sourceCwd', 'updatedAt', 'historyMode', 'cliVersion', 'recordCount')},
-                'session': info,
+                'session': info, 'folders': work_folders(snapshot),
                 'sha256': digest(Path(args.output).read_bytes()), 'bytes': Path(args.output).stat().st_size}
         elif args.action == 'inspect':
             result = inspect(home, args.archive, args.cwd, engine_version())

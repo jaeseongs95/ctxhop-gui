@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
-# All native calls and process queries are mocked. Only this new temporary root is mutated.
+# All native calls and process queries are mocked; one group compiles its own fixture exe in the temporary root.
+# Only this new temporary root is mutated.
 $script:Assertions = 0
 $script:Failures = @()
 $script:Groups = 0
@@ -744,6 +745,26 @@ try {
             try { & $script:RealInvokeCtx @('init','--no-hook'); '' } catch { $_.Exception.Message }
         }
         Assert ($message -match 'ctxhop init' -and $message -match 'encryption passwords do not match') "the GUI error includes the ctxhop reason: $message"
+    }
+
+    Test-Group 'ctxhop output is read as UTF-8 even when the console code page is 949' {
+        # GUI 작업 창은 새 콘솔이라 한국어 Windows에서 코드 페이지가 949다. 실제로 UTF-8 바이트를 쓰는 시험용 실행 파일로 확인한다.
+        $exe=Join-Path $script:CaseRoot 'fake-ctxhop-utf8.exe'
+        Add-Type -OutputAssembly $exe -OutputType ConsoleApplication -TypeDefinition @'
+public static class FakeCtxUtf8 { public static void Main() {
+    byte[] b = System.Text.Encoding.UTF8.GetBytes("{\"title\":\"\uD55C\uAE00 \uC81C\uBAA9\",\"path\":\"D:\\\\codex\\\\\uBCF4\uACE0\uC11C\"}");
+    System.IO.Stream o = System.Console.OpenStandardOutput(); o.Write(b, 0, b.Length); o.Flush(); } }
+'@
+        $saved=[Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding=[Text.Encoding]::GetEncoding(949)
+            $report = & {
+                function Find-Executable([string]$Name) { return $exe }
+                & $script:RealInvokeCtx @('list','--json') -Json
+            }
+            Assert ($report.title -eq '한글 제목' -and $report.path -eq 'D:\codex\보고서') "Korean text survives: $($report.title) / $($report.path)"
+            Assert ([Console]::OutputEncoding.CodePage -eq 949) 'the console code page is put back after the call'
+        } finally { [Console]::OutputEncoding=$saved }
     }
 }
 catch {

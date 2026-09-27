@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 $script:PrefsPath = Join-Path $env:LOCALAPPDATA 'CtxHopGUI\vnext-preferences.json'
-$script:Prefs = [pscustomobject]@{projectPath=''; identity=''; agent='claude-code'; store='G:\내 드라이브\세션연동'; invite=''; deviceName=$env:COMPUTERNAME; home=$(if ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $env:USERPROFILE '.codex'}); language='ko'}
+$script:Prefs = [pscustomobject]@{projectPath=''; identity=''; agent='claude-code'; store='G:\내 드라이브\세션연동'; invite=''; deviceName=$env:COMPUTERNAME; home=$(if ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $env:USERPROFILE '.codex'}); language='ko'; projectFiles='on'}
 if (Test-Path -LiteralPath $script:PrefsPath) {
     try {
         $saved=Get-Content -LiteralPath $script:PrefsPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -59,6 +59,7 @@ function Save-Prefs {
     $script:Prefs.deviceName=$device.Text.Trim()
     $script:Prefs.home=$desktopHome.Text.Trim().Trim('"')
     $script:Prefs.language=if ($languagePicker.SelectedIndex -eq 1) {'en'} else {'ko'}
+    $script:Prefs.projectFiles=if ($projectFiles.Checked) {'on'} else {'off'}
     if (-not $SmokeTest) {
         New-Item -ItemType Directory -Path (Split-Path $script:PrefsPath) -Force | Out-Null
         $script:Prefs | ConvertTo-Json | Set-Content -LiteralPath $script:PrefsPath -Encoding UTF8
@@ -66,7 +67,7 @@ function Save-Prefs {
 }
 function Base-Job([string]$Action) {
     Save-Prefs
-    return @{action=$Action; projectPath=$script:Prefs.projectPath; identity=$script:Prefs.identity; agent=$script:Prefs.agent; store=$script:Prefs.store; invite=$script:Prefs.invite; deviceName=$script:Prefs.deviceName;home=$script:Prefs.home;search=$search.Text.Trim();language=$script:UiLanguage}
+    return @{action=$Action; projectPath=$script:Prefs.projectPath; identity=$script:Prefs.identity; agent=$script:Prefs.agent; store=$script:Prefs.store; invite=$script:Prefs.invite; deviceName=$script:Prefs.deviceName;home=$script:Prefs.home;search=$search.Text.Trim();language=$script:UiLanguage;projectBackup=$projectFiles.Checked;projectRestore=$projectFiles.Checked}
 }
 function Selected-Job([string]$Action) {
     $job = Base-Job $Action
@@ -184,6 +185,100 @@ function Start-Job([hashtable]$Job) {
     $status.Text=if ($windowStyle -eq 'Hidden') {T 'GuiStatusProcessingHidden'} else {T 'GuiStatusProcessingWindow'}
     $log.AppendText("`r`n$(T 'GuiLogJobStarted' $Job.action $Job.agent)`r`n")
 }
+# 큰 작업 폴더(200MB 이상)가 있는 대화는 대화도 올리지 않고 보류한다. 백업이 끝나면 한 창에 모아 체크한 대화만 대화와 파일을 함께 올린다.
+# 항목은 @{job=백업 작업; folders=Worker가 돌려준 큰 폴더}. 기본은 모두 체크하지 않음.
+function New-DeferredDialog([object[]]$Items) {
+    $dialog=[Windows.Forms.Form]::new(); $dialog.Text=(T 'GuiDeferredTitle'); $dialog.ClientSize=[Drawing.Size]::new(900,400)
+    $dialog.StartPosition='CenterParent'; $dialog.Font=[Drawing.Font]::new('맑은 고딕',10); $dialog.MinimumSize=[Drawing.Size]::new(700,300)
+    $dialog.FormBorderStyle='Sizable'; $dialog.MinimizeBox=$false
+    $intro=New-Control Label 16 12 868 46 (T 'GuiDeferredIntro' @($Items).Count) $dialog; $intro.Anchor='Top,Left,Right'
+    $list=New-Control ListView 16 62 868 270 '' $dialog; $list.Anchor='Top,Bottom,Left,Right'
+    $list.View='Details'; $list.CheckBoxes=$true; $list.FullRowSelect=$true
+    $null=$list.Columns.Add((T 'GuiColConversation'),260); $null=$list.Columns.Add((T 'GuiDeferredColFolders'),580)
+    foreach ($item in $Items) {
+        $row=[Windows.Forms.ListViewItem]::new([string]$item.job.title)
+        $null=$row.SubItems.Add((@($item.folders | ForEach-Object { T 'GuiProjectAskLine' $_.path $_.files ([math]::Ceiling([double]$_.bytes/1MB)) }) -join '; '))
+        $row.Tag=$item; $null=$list.Items.Add($row)
+    }
+    $accept=New-Control Button 504 346 220 38 (T 'GuiDeferredUpload') $dialog; $accept.DialogResult='OK'; $accept.Anchor='Bottom,Right'
+    $cancel=New-Control Button 734 346 150 38 (T 'GuiDeferredSkip') $dialog; $cancel.DialogResult='Cancel'; $cancel.Anchor='Bottom,Right'
+    $dialog.CancelButton=$cancel
+    return @{dialog=$dialog;list=$list}
+}
+# 체크한 항목만 돌려준다. 창을 닫거나 올리지 않음을 누르면 없음.
+function Select-DeferredBackups([object[]]$Items) {
+    $ui=New-DeferredDialog $Items
+    try {
+        if ((Show-Dialog $ui.dialog) -ne 'OK') { return @() }
+        return @($ui.list.CheckedItems | ForEach-Object { $_.Tag })
+    } finally { $ui.dialog.Dispose() }
+}
+# 고른 대화는 그 큰 폴더를 허락한 채 같은 백업을 다시 실행한다. 다시 물은 경우 앞서 허락한 폴더도 유지한다.
+function Approve-Deferred([object]$Item) {
+    $job=$Item.job.Clone(); $job.projectApproved=@(@($Item.job.projectApproved) + @($Item.folders | ForEach-Object { [string]$_.path }) | Where-Object { $_ } | Select-Object -Unique)
+    return $job
+}
+function Get-ProjectReasonText([string]$Reason) {
+    switch ($Reason) {
+        'missing' { return (T 'GuiProjectReasonMissing') }
+        'tooLarge' { return (T 'GuiProjectReasonTooLarge') }
+        'tooBroad' { return (T 'GuiProjectReasonTooBroad') }
+        'parentOfStart' { return (T 'GuiProjectReasonParentOfStart') }
+        'agentSettings' { return (T 'GuiProjectReasonAgentSettings') }
+        default { return $Reason }
+    }
+}
+function Get-ProjectSum([object]$Project,[string]$Field) { return [int](@($Project.folders | ForEach-Object { $_.compare.$Field } | Where-Object { $null -ne $_ }) | Measure-Object -Sum).Sum }
+# 미리보기의 프로젝트 파일 부분: 폴더마다 복원할 곳과 새·바뀔·같은·이 PC에만 있는 파일 수.
+function Format-ProjectPreview([object]$Project) {
+    switch ([string]$Project.state) {
+        'found' {
+            $lines=@(T 'GuiProjectHeader' $Project.createdAt)
+            foreach ($folder in @($Project.folders)) {
+                $lines+=switch ([string]$folder.state) {
+                    'ready' { T 'GuiProjectFolderReady' $folder.sourcePath $folder.target $folder.compare.new $folder.compare.changed $folder.compare.same $folder.compare.localOnly }
+                    'needsFolder' { T 'GuiProjectFolderNeeds' $folder.sourcePath }
+                    'error' { T 'GuiProjectFolderError' $folder.sourcePath $folder.reason }
+                    default { T 'GuiProjectFolderSkipped' $folder.sourcePath (Get-ProjectReasonText $folder.reason) }
+                }
+            }
+            $outside=@($Project.outside | Where-Object { $_ })
+            if ($outside.Count) { $lines+=T 'GuiProjectOutsidePreview' $outside.Count (@($outside | Select-Object -First 10) -join ', ') }
+            return ($lines -join "`r`n")
+        }
+        'none' { return (T 'GuiProjectNone') }
+        'error' { return (T 'GuiProjectError' $Project.reason) }
+        default { return (T 'GuiProjectOff') }
+    }
+}
+function Format-ProjectCell([object]$Project) {
+    switch ([string]$Project.state) {
+        'found' { return (T 'GuiProjectCell' @($Project.folders | Where-Object { $_.state -in @('ready','needsFolder') }).Count (Get-ProjectSum $Project 'new') (Get-ProjectSum $Project 'changed') @($Project.folders | Where-Object { $_.state -eq 'needsFolder' }).Count) }
+        'none' { return (T 'GuiProjectCellNone') }
+        'error' { return (T 'GuiProjectCellError') }
+        default { return (T 'GuiProjectCellOff') }
+    }
+}
+function Pick-ProjectFolder([string]$Source) {
+    if (-not (Confirm (T 'GuiProjectPickFolder' $Source "`r`n"))) { return '' }
+    $dialog=[Windows.Forms.FolderBrowserDialog]::new(); $dialog.Description=(T 'GuiProjectPickDescription' $Source)
+    try { if ((Show-Dialog $dialog) -eq 'OK') { return $dialog.SelectedPath } else { return '' } } finally { $dialog.Dispose() }
+}
+# 이 PC에 없는 추가 작업 폴더는 복원할 폴더를 고르거나 건너뛴다(빈 값). 원래 경로가 있는 폴더는 묻지 않는다.
+function Select-ProjectTargets([hashtable]$Job,[object]$Project) {
+    if (-not $Job.projectRestore -or [string]$Project.state -ne 'found') { return }
+    $Job.projectReceipt=[string]$Project.receipt
+    $targets=@{}
+    foreach ($folder in @($Project.folders | Where-Object { $_.state -eq 'needsFolder' })) { $targets[[string]$folder.index]=Pick-ProjectFolder $folder.sourcePath }
+    if ($targets.Count) { $Job.projectTargets=$targets }
+}
+function Write-ProjectLog([object]$Project) {
+    # 폴더 밖에서 고친 파일(백업하지 않음)과 복원하지 못한 파일을 기록 창에 남긴다.
+    $outside=@($Project.outside | Where-Object { $_ })
+    if ($outside.Count) { $log.AppendText((T 'GuiProjectOutsideList' (@($outside | Select-Object -First 20) -join ', '))+"`r`n") }
+    $failed=@($Project.folders | ForEach-Object { @($_.failed) } | Where-Object { $_ })
+    if ($failed.Count) { $log.AppendText((T 'GuiProjectRestoreFailures' (@($failed | Select-Object -First 10 | ForEach-Object { "$($_.path): $($_.reason)" }) -join '; '))+"`r`n") }
+}
 function Finish-Job {
     if (-not $script:Pending -or -not $script:Pending.process.HasExited) { return }
     $pending=$script:Pending; $script:Pending=$null
@@ -206,7 +301,7 @@ function Finish-Job {
         if (-not (Test-Path -LiteralPath $pending.result)) { throw (T 'GuiWorkerAborted') }
         $result = Get-Content -LiteralPath $pending.result -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($pending.job.agent -eq 'codex-desktop' -and $pending.job.action -eq 'Preview') {
-            if ($result.ok) { Add-DesktopReview $pending.job $result.data.preview $result.data.receipt } else { Add-DesktopReview $pending.job ([pscustomobject]@{status='blocked';reason=[string]$result.error;token='';source=$null;target=$null}) '' }
+            if ($result.ok) { Add-DesktopReview $pending.job $result.data.preview $result.data.receipt $result.data.project } else { Add-DesktopReview $pending.job ([pscustomobject]@{status='blocked';reason=[string]$result.error;token='';source=$null;target=$null}) '' }
             Continue-DesktopPreview
             return
         }
@@ -229,15 +324,24 @@ function Finish-Job {
             Status {
                 $log.AppendText("$(T 'GuiStatusLog' $result.data.device $result.data.store $result.data.syncConfig)`r`n")
             }
+            Backup {
+                # 큰 작업 폴더가 있으면 아직 아무것도 올리지 않았다. 목록 창에서 고르면 대화와 파일을 함께 올린다.
+                if ($result.data.needsProjectConfirm) {
+                    $picked=@(Select-DeferredBackups @(@{job=$pending.job;folders=@($result.data.folders)}))
+                    if ($picked.Count) { Start-Job (Approve-Deferred $picked[0]) } else { $status.Text=(T 'GuiDeferredNotUploaded'); $log.AppendText("$(T 'GuiDeferredNotUploaded')`r`n") }
+                } else { Write-ProjectLog $result.data.project }
+            }
             Preview {
                 $p=$result.data.preview
-                $summary="$(T 'GuiFieldSession' $pending.job.title)`r`n$(T 'GuiFieldSessionId' $p.session)`r`n$(T 'GuiFieldAgent' $p.agent)`r`n$(T 'GuiFieldProject' $pending.job.identity)`r`n$(T 'GuiFieldWorkspace' $p.workspace)`r`n$(T 'GuiFieldDifferences' $p.differences)`r`n`r`n$(T 'GuiPreviewConfirm')"
+                $summary="$(T 'GuiFieldSession' $pending.job.title)`r`n$(T 'GuiFieldSessionId' $p.session)`r`n$(T 'GuiFieldAgent' $p.agent)`r`n$(T 'GuiFieldProject' $pending.job.identity)`r`n$(T 'GuiFieldWorkspace' $p.workspace)`r`n$(T 'GuiFieldDifferences' $p.differences)`r`n$(Format-ProjectPreview $result.data.project)`r`n`r`n$(T 'GuiPreviewConfirm')"
                 if (Confirm $summary) {
                     $job=$pending.job; $job.action='Restore'
+                    Select-ProjectTargets $job $result.data.project
                     Start-Job $job
                 }
             }
             Restore {
+                Write-ProjectLog $result.data.project
                 if ($pending.job.agent -eq 'codex-desktop') { Continue-DesktopApply; break }
                 $id=$result.data.restored.session
                 if (Confirm (T 'GuiRestoredOpenNow' $id)) {
@@ -252,9 +356,9 @@ function Finish-Job {
         $pending.process.Dispose()
     }
 }
-function Add-DesktopReview([hashtable]$Job,[object]$Preview,[string]$Receipt) {
+function Add-DesktopReview([hashtable]$Job,[object]$Preview,[string]$Receipt,[object]$Project=$null) {
     if ($Preview.status -notin @('new','equal','incoming_newer','local_newer','conflict','blocked')) { $Preview=[pscustomobject]@{status='blocked';reason=(T 'GuiUnknownInspectState');token='';source=$null;target=$null} }
-    $script:DesktopReviews += [pscustomobject]@{job=$Job;preview=$Preview;receipt=$Receipt}
+    $script:DesktopReviews += [pscustomobject]@{job=$Job;preview=$Preview;receipt=$Receipt;project=$Project}
 }
 function Start-DesktopPreview {
     $script:DesktopReviews=@(); $script:DesktopPreviewQueue=@()
@@ -277,7 +381,8 @@ function Get-DesktopDecisions([object]$Table) {
             $decisions+=,$job
         } elseif ($choice -notin @((T 'GuiChoiceSkip'),(T 'GuiChoiceKeepLocal'))) { throw (T 'GuiCheckEachChoice') }
     }
-    $duplicates=@($decisions | Group-Object nativeId | Where-Object Count -gt 1)
+    # 결정은 해시테이블이라 PowerShell 5.1의 Group-Object가 속성 이름으로는 키를 읽지 못한다(모두 한 묶음이 됨). 스크립트 블록으로 묶는다.
+    $duplicates=@($decisions | Group-Object { $_.nativeId } | Where-Object Count -gt 1)
     if ($duplicates.Count) { throw (T 'GuiDuplicateUuid') }
     return $decisions
 }
@@ -290,14 +395,14 @@ function New-DesktopReviewDialog([object[]]$Reviews) {
     $table.AllowUserToAddRows=$false; $table.AllowUserToDeleteRows=$false; $table.RowHeadersVisible=$false; $table.AutoGenerateColumns=$false; $table.AutoSizeColumnsMode='Fill'
     # 행 높이를 내용에 맞춰 긴 제목·경로도 잘리지 않게 한다.
     $table.DefaultCellStyle.WrapMode='True'; $table.AutoSizeRowsMode='AllCells'
-    foreach ($column in @(@('title',(T 'GuiColConversation'),150),@('backup',(T 'GuiColBackupId'),150),@('id','UUID',150),@('source',(T 'GuiColSourceFolder'),150),@('target',(T 'GuiColTargetFolder'),150),@('state',(T 'GuiColInspection'),100),@('reason',(T 'GuiColReason'),150))) {
+    foreach ($column in @(@('title',(T 'GuiColConversation'),150),@('backup',(T 'GuiColBackupId'),150),@('id','UUID',150),@('source',(T 'GuiColSourceFolder'),150),@('target',(T 'GuiColTargetFolder'),150),@('state',(T 'GuiColInspection'),100),@('reason',(T 'GuiColReason'),150),@('project',(T 'GuiColProjectFiles'),150))) {
         $c=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $c.Name=$column[0]; $c.HeaderText=$column[1]; $c.FillWeight=$column[2]; $c.ReadOnly=$true; $table.Columns.Add($c)|Out-Null
     }
     $choiceColumn=[Windows.Forms.DataGridViewComboBoxColumn]::new(); $choiceColumn.Name='choice'; $choiceColumn.HeaderText=(T 'GuiColChoice'); $choiceColumn.FillWeight=150; $choiceColumn.Items.AddRange(@((T 'GuiChoiceSkip'),(T 'GuiChoiceKeepLocal'),(T 'GuiChoiceRestore'))); $table.Columns.Add($choiceColumn)|Out-Null
     $stateLabels=@{new=(T 'GuiStateNew');equal=(T 'GuiStateEqual');incoming_newer=(T 'GuiStateIncomingNewer');local_newer=(T 'GuiStateLocalNewer');conflict=(T 'GuiStateConflict');blocked=(T 'GuiStateBlocked')}
     foreach ($review in $Reviews) {
         $p=$review.preview; $j=$review.job
-        $index=$table.Rows.Add($j.title,$j.remoteId,$j.nativeId,$j.sourceCwd,$j.projectPath,$stateLabels[$p.status],[string]$p.reason,(T 'GuiChoiceSkip'))
+        $index=$table.Rows.Add($j.title,$j.remoteId,$j.nativeId,$j.sourceCwd,$j.projectPath,$stateLabels[$p.status],[string]$p.reason,(Format-ProjectCell $review.project),(T 'GuiChoiceSkip'))
         $row=$table.Rows[$index]; $row.Tag=$review
         if ($p.status -eq 'blocked') {
             $cell=[Windows.Forms.DataGridViewComboBoxCell]::new(); $cell.Items.AddRange(@((T 'GuiChoiceSkip'),(T 'GuiChoiceKeepLocal'))); $cell.Value=(T 'GuiChoiceSkip'); $row.Cells['choice']=$cell
@@ -306,9 +411,10 @@ function New-DesktopReviewDialog([object[]]$Reviews) {
     }
     $table.ClearSelection()
     $details=New-Control TextBox 16 363 1148 42 '' $dialog; $details.Multiline=$true; $details.ReadOnly=$true; $details.ScrollBars='Vertical'; $details.Anchor='Bottom,Left,Right'
-    $detailsIdsFormat=(T 'GuiReviewDetailsIds'); $detailsPathsFormat=(T 'GuiReviewDetailsPaths')
+    # 닫힌 스크립트 블록(GetNewClosure)은 이 스크립트의 함수를 찾지 못하므로 문장과 함수를 미리 잡아 둔다.
+    $detailsIdsFormat=(T 'GuiReviewDetailsIds'); $detailsPathsFormat=(T 'GuiReviewDetailsPaths'); $formatProject=${function:Format-ProjectPreview}
     $table.Add_SelectionChanged({
-        if ($table.SelectedRows.Count) { $review=$table.SelectedRows[0].Tag; $details.Text=($detailsIdsFormat -f $review.job.nativeId,$review.job.remoteId) + "`r`n" + ($detailsPathsFormat -f $review.job.sourceCwd,$review.job.projectPath,$review.preview.reason) }
+        if ($table.SelectedRows.Count) { $review=$table.SelectedRows[0].Tag; $details.Text=($detailsIdsFormat -f $review.job.nativeId,$review.job.remoteId) + "`r`n" + ($detailsPathsFormat -f $review.job.sourceCwd,$review.job.projectPath,$review.preview.reason) + "`r`n" + (& $formatProject $review.project) }
     }.GetNewClosure())
     $accept=New-Control Button 854 415 160 38 (T 'GuiReviewAccept') $dialog; $accept.DialogResult='OK'; $accept.Anchor='Bottom,Right'
     $cancel=New-Control Button 1028 415 136 38 (T 'GuiReviewCancelAll') $dialog; $cancel.DialogResult='Cancel'; $cancel.Anchor='Bottom,Right'
@@ -325,8 +431,13 @@ function Continue-DesktopPreview {
         while ($reviewUI.dialog.ShowDialog($form) -eq 'OK') {
             try { $decisions=@(Get-DesktopDecisions $reviewUI.table) } catch { Show-Error $_.Exception.Message; continue }
             if (-not $decisions.Count) { $status.Text=(T 'GuiAllSkipped'); return }
-            $summary=($decisions | ForEach-Object {"$($_.title) · $($_.nativeId) · $($_.remoteId)`r`n$(T 'GuiRestoreFolder' $_.projectPath)"}) -join "`r`n`r`n"
-            if (Confirm "$(T 'GuiApplyCount' $decisions.Count)`r`n$(T 'GuiApplyWarning')`r`n`r`n$summary") { $script:DesktopApplyQueue=$decisions; Continue-DesktopApply }
+            # 결정마다 검토한 프로젝트 파일. 같은 UUID는 하나만 고를 수 있으므로 백업 ID로 찾는다.
+            $projects=@{}; foreach ($review in $script:DesktopReviews) { $projects[[string]$review.job.remoteId]=$review.project }
+            $summary=($decisions | ForEach-Object {"$($_.title) · $($_.nativeId) · $($_.remoteId)`r`n$(T 'GuiRestoreFolder' $_.projectPath)`r`n$(Format-ProjectPreview $projects[[string]$_.remoteId])"}) -join "`r`n`r`n"
+            if (Confirm "$(T 'GuiApplyCount' $decisions.Count)`r`n$(T 'GuiApplyWarning')`r`n`r`n$summary") {
+                foreach ($decision in $decisions) { Select-ProjectTargets $decision $projects[[string]$decision.remoteId] }
+                $script:DesktopApplyQueue=$decisions; Continue-DesktopApply
+            }
             return
         }
         $status.Text=(T 'GuiReviewCancelled')
@@ -350,21 +461,43 @@ function Start-BulkBackup {
     $current=$local.Count-$blocked-$ready.Count
     if (-not $ready.Count) { throw (T 'GuiBulkNothing' $local.Count $current $blocked) }
     if (-not (Confirm (T 'GuiBulkConfirm' $ready.Count $current $blocked "`r`n"))) { return }
-    $script:Bulk=@{items=$ready;next=0;done=0;failed=@();busy=@();streak=0;stop=$false;skipped=$current+$blocked}
+    # deferred: 큰 작업 폴더 때문에 보류한 대화, picked: 끝에 고른 대화 수(-1은 아직 묻지 않음).
+    $script:Bulk=@{items=$ready;next=0;done=0;failed=@();busy=@();streak=0;stop=$false;skipped=$current+$blocked;deferred=@();picked=-1}
     Continue-BulkBackup
 }
 function Continue-BulkBackup {
     $bulk=$script:Bulk
     # 저장소에 쓸 수 없는 경우처럼 모든 대화가 같은 이유로 실패하면 연속 3번 실패한 뒤 멈춘다.
-    if ($bulk.stop -or $bulk.streak -ge 3 -or $bulk.next -ge $bulk.items.Count) { End-BulkBackup; return }
+    if ($bulk.stop -or $bulk.streak -ge 3) { End-BulkBackup; return }
+    if ($bulk.next -ge $bulk.items.Count) {
+        # 모든 대화를 한 번 돈 뒤 보류한 대화를 한 번만 묻고, 고른 대화를 큰 폴더와 함께 이어서 올린다.
+        if ($bulk.picked -ge 0 -or -not $bulk.deferred.Count) { End-BulkBackup; return }
+        $picked=@(Select-DeferredBackups $bulk.deferred); $bulk.picked=$picked.Count
+        if (-not $picked.Count) { End-BulkBackup; return }
+        $bulk.items=@($bulk.items) + @($picked | ForEach-Object { [pscustomobject]@{nativeId=$_.job.nativeId;title=$_.job.title;approved=@($_.folders | ForEach-Object { [string]$_.path })} })
+    }
     $item=$bulk.items[$bulk.next]; $bulk.next++
     $job=Base-Job 'Backup'; $job.nativeId=$item.nativeId; $job.remoteId=''; $job.title=$item.title
+    if ($item.approved) { $job.projectApproved=@($item.approved) }
     try { Start-Job $job } catch { $script:Bulk=$null; throw }
     $status.Text=(T 'GuiBulkProgress' $bulk.next $bulk.items.Count $bulk.done $bulk.failed.Count)
 }
 function Step-BulkBackup([hashtable]$Job,[object]$Result) {
     $bulk=$script:Bulk
-    if ($Result.ok) { $bulk.done++; $bulk.streak=0; $log.AppendText("$($Result.data.message)`r`n") }
+    if ($Result.ok -and $Result.data.needsProjectConfirm) {
+        if ($bulk.picked -lt 0) {
+            # 큰 작업 폴더가 있는 대화는 아무것도 올리지 않고 보류한다. 끝에 한 번에 묻는다.
+            $bulk.deferred+=,@{job=$Job;folders=@($Result.data.folders)}
+            $log.AppendText("$(T 'GuiBulkItemDeferred' $Job.title $Job.nativeId)`r`n")
+        } else {
+            # 고른 뒤 다시 실행하는 사이에 다른 폴더도 커졌다. 묻지 않은 폴더를 올리지 않고 실패로 남긴다.
+            $bulk.failed+="$($Job.title) · $($Job.nativeId): $(T 'GuiDeferredChanged')"
+            $log.AppendText("$(T 'GuiBulkItemFailed' $Job.title $Job.nativeId (T 'GuiDeferredChanged'))`r`n")
+        }
+        Continue-BulkBackup
+        return
+    }
+    if ($Result.ok) { $bulk.done++; $bulk.streak=0; $log.AppendText("$($Result.data.message)`r`n"); Write-ProjectLog $Result.data.project }
     elseif ($Result.backendResult.status -eq 'busy') {
         # 지금 진행 중인 대화는 실패가 아니라 건너뜀이다. 연속 실패에도 넣지 않고, 턴이 끝난 뒤 다시 누르면 백업된다.
         $bulk.busy+="$($Job.title) · $($Job.nativeId)"
@@ -379,7 +512,10 @@ function Step-BulkBackup([hashtable]$Job,[object]$Result) {
 }
 function End-BulkBackup {
     $bulk=$script:Bulk; $script:Bulk=$null
-    $summary=T 'GuiBulkSummary' $bulk.done $bulk.skipped $bulk.busy.Count $bulk.failed.Count ($bulk.items.Count-$bulk.done-$bulk.busy.Count-$bulk.failed.Count)
+    # 하지 않음: 시작하지 못했거나 취소한 대화와, 보류했지만 고르지 않은(또는 묻기 전에 멈춘) 대화. 고른 대화는 목록 끝에 다시 들어가 있다.
+    $unpicked=$bulk.deferred.Count-[math]::Max($bulk.picked,0)
+    $summary=T 'GuiBulkSummary' $bulk.done $bulk.skipped $bulk.busy.Count $bulk.failed.Count ($bulk.items.Count-$bulk.done-$bulk.busy.Count-$bulk.failed.Count-$bulk.deferred.Count+$unpicked)
+    if ($bulk.deferred.Count) { $summary+=(T 'GuiBulkDeferredSummary' $bulk.deferred.Count ([math]::Max($bulk.picked,0))) }
     if ($bulk.streak -ge 3) { $summary+=(T 'GuiBulkStreakStop') } elseif ($bulk.stop) { $summary+=(T 'GuiBulkStopped') }
     $status.Text=$summary; $log.AppendText("$summary`r`n")
     if ($bulk.failed.Count) { Show-Error ("$summary`r`n`r`n" + (@($bulk.failed | Select-Object -First 10) -join "`r`n")) }
@@ -471,7 +607,8 @@ foreach ($column in @(@('title',(T 'GuiColConversation'),190),@('agent',(T 'GuiC
 $grid.AutoSizeColumnsMode='Fill'
 # 세션 UUID와 날짜가 잘리지 않을 최소 너비(맑은 고딕 10pt 기준).
 $grid.Columns['id'].MinimumWidth=300; $grid.Columns['updated'].MinimumWidth=135
-$selectionLabel=New-Control Label 16 384 988 24 (T 'GuiNoSelection') $main; $selectionLabel.Anchor='Bottom,Left,Right'
+$selectionLabel=New-Control Label 16 384 720 24 (T 'GuiNoSelection') $main; $selectionLabel.Anchor='Bottom,Left,Right'
+$projectFiles=New-Control CheckBox 740 381 264 28 (T 'GuiProjectFiles') $main; $projectFiles.Checked=($script:Prefs.projectFiles -ne 'off'); $projectFiles.Anchor='Bottom,Right'
 $backupButton=New-Button 16 411 220 (T 'GuiBackupSelected') $main {
     $job=Selected-Job 'Backup'
     $question=if ($job.agent -eq 'codex-desktop') { T 'GuiBackupConfirmDesktop' } else { T 'GuiBackupConfirm' }
@@ -547,7 +684,7 @@ $cancelButton.Enabled=$false; $cancelButton.Anchor='Bottom,Right'
 $tips=[Windows.Forms.ToolTip]::new()
 $tips.SetToolTip($backupButton,(T 'GuiTipBackup')); $tips.SetToolTip($restoreButton,(T 'GuiTipRestore')); $tips.SetToolTip($openButton,(T 'GuiTipOpen'))
 $tips.SetToolTip($registerButton,(T 'GuiTipRegister')); $tips.SetToolTip($unbindButton,(T 'GuiTipUnbind')); $tips.SetToolTip($cancelButton,(T 'GuiTipCancel'))
-$tips.SetToolTip($bulkButton,(T 'GuiTipBulkBackup')); $tips.SetToolTip($projectOnly,(T 'GuiTipProjectOnly'))
+$tips.SetToolTip($bulkButton,(T 'GuiTipBulkBackup')); $tips.SetToolTip($projectOnly,(T 'GuiTipProjectOnly')); $tips.SetToolTip($projectFiles,(T 'GuiTipProjectFiles'))
 # 꺼진 버튼은 툴팁을 띄우지 않으므로, 마우스 아래의 꺼진 버튼 설명을 그 버튼이 놓인 탭·창의 툴팁으로 대신 띄운다.
 foreach ($surface in @($main,$form)) {
     $surface.Add_MouseMove({
