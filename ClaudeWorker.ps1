@@ -3,7 +3,7 @@
 param([string]$RequestFile, [string]$ResultFile, [switch]$LibraryOnly)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Strings.ps1')
-$script:RestoreBinarySHA256='A1702CE1839AF90C0DDB87E7C07F1BE7899BE8EBDD9117FE680D2EC9739C233D'
+$script:RestoreBinarySHA256='15CE00DC32BE07ECF089F5D49154469A4B259E1B7EB0ED0123C0FE57152BFC2B'
 function Find-Executable([string]$Name) {
     $paths = if ($Name -eq 'ctxhop') {
         @((Join-Path $PSScriptRoot 'bin\ctxhop.exe'), (Join-Path $env:USERPROFILE '.ctxhop\bin\ctxhop.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\CtxHop\bin\ctxhop.exe'))
@@ -175,14 +175,21 @@ function Begin-Restore([object]$Job) {
         $backups+=@{ original=$file.FullName; backup=$backup; sha256=$hash }
     }
     $journal=Join-Path $root "$name.pending.json"
-    @{ agent=$Job.agent; nativeId=$Job.nativeId; remoteId=$Job.remoteId; projectPath=$Job.projectPath; originals=$backups; started=(Get-Date).ToString('o') } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journal -Encoding UTF8
+    # Claude 세션 옆 폴더(subagents·tool-results)에서 복원이 바꾸는 파일의 원본은 ctxhop이 이 폴더에 남긴다(바뀐 파일이 있을 때만 생김).
+    $companion=if ($Job.agent -eq 'claude-code') {Join-Path $root "$name.companion"} else {$null}
+    @{ agent=$Job.agent; nativeId=$Job.nativeId; remoteId=$Job.remoteId; projectPath=$Job.projectPath; originals=$backups; companionBackup=$companion; started=(Get-Date).ToString('o') } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journal -Encoding UTF8
     return $journal
 }
-function Complete-Restore([string]$Journal, [object]$Job) {
+function Assert-Sidecar([object]$Sidecar) {
+    if (-not $Sidecar -or $Sidecar.state -notin @('restored','absent')) { throw (T 'CwSidecarInvalid') }
+    foreach ($field in @('files','written','unchanged','backedUp')) { if (($Sidecar.$field -isnot [int] -and $Sidecar.$field -isnot [long]) -or $Sidecar.$field -lt 0) { throw (T 'CwSidecarInvalid') } }
+}
+function Complete-Restore([string]$Journal, [object]$Job, [object]$Sidecar=$null) {
     $null=Assert-NativeMapping $Job.agent $Job.nativeId $Job.projectPath -Required
     $record=Get-Content -LiteralPath $Journal -Raw -Encoding UTF8 | ConvertFrom-Json
     $file=@(Get-NativeFiles $Job.agent $Job.nativeId)[0]
     $record | Add-Member -NotePropertyName restoredSha256 -NotePropertyValue (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    if ($Sidecar) { $record | Add-Member -NotePropertyName sidecar -NotePropertyValue $Sidecar }
     $completed=$Journal.Replace('.pending.json','.completed.json')
     $record | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $completed -Encoding UTF8
     Remove-Item -LiteralPath $Journal
@@ -195,14 +202,14 @@ function Get-CtxVersion {
 }
 function Assert-CtxVersion {
     $version=Get-CtxVersion
-    if ($version -notin @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1')) { throw (T 'CwCtxVersionUnsupported' $version) }
+    if ($version -notin @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1','ctxhop 0.2.0-gui.2')) { throw (T 'CwCtxVersionUnsupported' $version) }
 }
 function Assert-RestoreRuntime {
     $exe=Find-Executable 'ctxhop'
     $bundled=Join-Path $PSScriptRoot 'bin\ctxhop.exe'
     if ([IO.Path]::GetFullPath($exe) -ne [IO.Path]::GetFullPath($bundled)) { throw (T 'CwRestoreNeedsBundled') }
     if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $script:RestoreBinarySHA256) { throw (T 'CwRestoreHashMismatch') }
-    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.1') { throw (T 'CwRestoreVersionUnverified') }
+    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.2') { throw (T 'CwRestoreVersionUnverified') }
 }
 function Assert-ListSchema([object]$Report) {
     if ($Report.scope -ne 'project' -or -not ($Report.PSObject.Properties.Name -contains 'sessions') -or $null -eq $Report.sessions -or $Report.sessions -isnot [array]) { throw (T 'CwUnknownListResponse') }
@@ -359,12 +366,20 @@ function Invoke-JobCore([object]$Job) {
                 Assert-Preview $preview $Job.agent $session.nativeId
                 Assert-AgentClosed $Job.agent
                 $journal=Begin-Restore $Job
-                $restored = Invoke-Ctx @('resume','--json','--agent',$Job.agent,'--no-workspace-context','--no-environment',$session.remoteId) -Json
+                $arguments=@('resume','--json','--agent',$Job.agent,'--no-workspace-context','--no-environment')
+                if ($Job.agent -eq 'claude-code') { $arguments+=@('--sidecar-backup',$journal.Replace('.pending.json','.companion')) }
+                $restored = Invoke-Ctx ($arguments+@($session.remoteId)) -Json
                 if ($restored.agent -ne $Job.agent -or $restored.session -ne $session.nativeId) { throw (T 'CwRestoredMismatch') }
                 if ($restored.environmentSkipped -isnot [bool] -or $restored.environmentSkipped -ne $true) { throw (T 'CwRestoredEnvNotSkipped') }
                 Assert-NativeId $restored.session
-                Complete-Restore $journal $Job
-                return @{ restored=$restored; message=(T 'CwRestoreDone') }
+                $message=T 'CwRestoreDone'
+                if ($Job.agent -eq 'claude-code') {
+                    # 하위 에이전트 대화·도구 결과 폴더도 함께 돌아왔는지 확인한다. 이전 판으로 올린 백업에는 없다.
+                    Assert-Sidecar $restored.sidecar
+                    $message+=if ($restored.sidecar.state -eq 'absent') {T 'CwSidecarAbsent'} else {T 'CwSidecarRestored' $restored.sidecar.files $restored.sidecar.written $restored.sidecar.backedUp}
+                }
+                Complete-Restore $journal $Job $restored.sidecar
+                return @{ restored=$restored; message=$message }
             }
             Open { Start-Agent $Job.agent $session.nativeId $Job.projectPath; return @{ message=(T 'CwAgentExited') } }
         }

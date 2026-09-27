@@ -28,6 +28,8 @@ $script:Filtered=@()
 $script:DesktopPreviewQueue=@()
 $script:DesktopReviews=@()
 $script:DesktopApplyQueue=@()
+$script:Bulk=$null
+$script:BulkSummary=''
 function New-Control([string]$Type, [int]$X, [int]$Y, [int]$Width, [int]$Height, [string]$Text, [object]$Parent) {
     $control = New-Object "System.Windows.Forms.$Type"
     $control.SetBounds($X,$Y,$Width,$Height)
@@ -83,31 +85,50 @@ function Fill-Sessions([object[]]$Items) {
     $script:Page=0
     Apply-Filter
 }
-function Filter-Metadata([object[]]$Items, [string]$Query, [string]$Mode, [int]$Days) {
+# Codex는 작업 폴더를 \\?\ 붙은 확장 경로로 적기도 하므로 접두사·끝의 \를 떼고 비교한다(대소문자는 -eq·OrdinalIgnoreCase가 무시).
+function Get-PathKey([string]$Path) {
+    $p=$Path.Trim()
+    if ($p.StartsWith('\\?\UNC\')) { $p='\\'+$p.Substring(8) } elseif ($p.StartsWith('\\?\')) { $p=$p.Substring(4) }
+    return $p.TrimEnd('\')
+}
+# 이 PC 대화는 프로젝트 폴더와 그 하위에서 만든 것만 본다. 공유 백업은 다른 PC 경로일 수 있어 마지막 폴더 이름이 같아도 이 프로젝트로 본다.
+# 원본 폴더를 모르는 공유 백업(확인하지 못한 백업)은 숨기지 않고, 원본 폴더를 모르는 이 PC 대화는 숨긴다.
+function Test-InProject([object]$Item, [string]$Project) {
+    if (-not $Project) { return $true }
+    if (-not $Item.sourceCwd) { return (-not $Item.local) }
+    $root=Get-PathKey $Project; $cwd=Get-PathKey ([string]$Item.sourceCwd)
+    if ($cwd -eq $root -or $cwd.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $name=$root.Substring($root.LastIndexOf('\')+1)
+    return (-not $Item.local -and $name -and $cwd.Substring($cwd.LastIndexOf('\')+1) -eq $name)
+}
+function Filter-Metadata([object[]]$Items, [string]$Query, [string]$Mode, [int]$Days, [string]$Project='') {
     $cutoff=if ($Days -gt 0) {(Get-Date).AddDays(-$Days)} else {[datetime]::MinValue}
     @($Items | Where-Object {
         $matches=(-not $Query -or ([string]$_.title).IndexOf($Query,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or ([string]$_.nativeId).IndexOf($Query,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or ([string]$_.sourceCwd).IndexOf($Query,[StringComparison]::OrdinalIgnoreCase) -ge 0)
         $date=[datetime]::MinValue
         $null=[datetime]::TryParse([string]$_.updatedAt,[ref]$date)
-        $matches -and ($Mode -ne 'local' -or $_.local) -and ($Mode -ne 'remote' -or $_.recordCount -gt 0) -and $date -ge $cutoff
+        $matches -and ($Mode -ne 'local' -or $_.local) -and ($Mode -ne 'remote' -or $_.recordCount -gt 0) -and $date -ge $cutoff -and (Test-InProject $_ $Project)
     } | Sort-Object updatedAt -Descending)
 }
 function Apply-Filter {
     $selected=if ($grid.SelectedRows.Count) {$grid.SelectedRows[0].Tag} else {$null}
     $mode=switch ($view.SelectedIndex) {1 {'local'} 2 {'remote'} default {'all'}}
     $days=switch ($dateFilter.SelectedIndex) {1 {7} 2 {30} default {0}}
-    $script:Filtered=@(Filter-Metadata $script:Sessions $search.Text.Trim() $mode $days)
+    $root=if ($agent.SelectedIndex -eq 1 -and $projectOnly.Checked) {$project.Text.Trim().Trim('"')} else {''}
+    $script:Filtered=@(Filter-Metadata $script:Sessions $search.Text.Trim() $mode $days $root)
     $pages=[math]::Max(1,[math]::Ceiling($script:Filtered.Count/$script:PageSize))
     $script:Page=[math]::Max(0,[math]::Min($script:Page,$pages-1))
     $grid.SuspendLayout(); $grid.Rows.Clear()
     $visible=@($script:Filtered | Select-Object -Skip ($script:Page*$script:PageSize) -First $script:PageSize)
-    $yes=T 'GuiYes'; $no=T 'GuiNo'; $blocked=T 'GuiBackupBlocked'; $shared=T 'GuiBackupShared'; $none=T 'GuiBackupNone'; $archived=T 'GuiArchivedSuffix'
+    $yes=T 'GuiYes'; $no=T 'GuiNo'; $blocked=T 'GuiBackupBlocked'; $shared=T 'GuiBackupShared'; $none=T 'GuiBackupNone'; $archived=T 'GuiArchivedSuffix'; $oldFormat=T 'GuiOldFormatSuffix'
     foreach ($item in $visible) {
         $title = [regex]::Replace([string]$item.title, '[\x00-\x1f\x7f-\x9f]', ' ')
         $label = if ($item.agent -eq 'codex-desktop') {'Codex Desktop'} else {'Claude Code'}
         $local = if ($item.local) {$yes} else {$no}
         $backup = if ($item.blockedReason) {$blocked} elseif ($item.remoteId -and $item.agent -eq 'codex-desktop') {$shared} elseif ($item.recordCount -gt 0) {$yes} else {$none}
-        $context=if ($item.agent -eq 'codex-desktop') {"$($item.sourceCwd) · $($item.historyMode)" + $(if ($item.archived) {$archived} else {''})} else {''}
+        # 하위 에이전트 대화 수는 부모 행에 붙여 보여 준다. 묶음 표시가 없는 공유 백업은 하위 대화가 빠졌을 수 있는 이전 형식이다.
+        $family=if ($item.blockedReason) {''} elseif ($null -eq $item.children) {$oldFormat} elseif ($item.children -gt 0) {T 'GuiChildrenSuffix' $item.children} else {''}
+        $context=if ($item.agent -eq 'codex-desktop') {"$($item.sourceCwd) · $([string]$item.historyMode -replace ';family=\d+$','')" + $family + $(if ($item.archived) {$archived} else {''})} else {''}
         # Codex 백업은 UTC ISO 문자열이라 이 PC 시간으로 짧게 보여 준다. 정렬은 원래 값으로 한다.
         $updated=[datetime]::MinValue
         $shown=if ([datetime]::TryParse([string]$item.updatedAt,[ref]$updated)) {$updated.ToString('yyyy-MM-dd HH:mm')} else {[string]$item.updatedAt}
@@ -169,8 +190,16 @@ function Finish-Job {
     $projectPicker.Enabled=$true; $desktopHome.ReadOnly=$false
     $progress.Style='Blocks'
     Update-Selection
+    # 전체 백업 요약은 바로 다음 목록 불러오기가 성공할 때만 보여 주고, 실패·취소돼도 남기지 않는다.
+    $bulkSummary=''; if ($pending.job.action -eq 'List') { $bulkSummary=$script:BulkSummary; $script:BulkSummary='' }
     try {
-        if ($pending.cancelled) { $script:DesktopPreviewQueue=@(); $status.Text=if ($pending.job.action -eq 'List') {T 'GuiListCancelled'} else {T 'GuiJobCancelled'}; return }
+        if ($pending.cancelled) { $script:DesktopPreviewQueue=@(); $status.Text=if ($pending.job.action -eq 'List') {T 'GuiListCancelled'} else {T 'GuiJobCancelled'}; if ($script:Bulk) { $script:Bulk.stop=$true; End-BulkBackup }; return }
+        if ($script:Bulk -and $pending.job.action -eq 'Backup') {
+            # 전체 백업 중에는 한 대화의 실패로 멈추지 않고 기록한 뒤 다음 대화로 넘어간다.
+            $result=try { Get-Content -LiteralPath $pending.result -Raw -Encoding UTF8 | ConvertFrom-Json } catch { [pscustomobject]@{ok=$false;error=(T 'GuiWorkerAborted')} }
+            Step-BulkBackup $pending.job $result
+            return
+        }
         if (-not (Test-Path -LiteralPath $pending.result)) { throw (T 'GuiWorkerAborted') }
         $result = Get-Content -LiteralPath $pending.result -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($pending.job.agent -eq 'codex-desktop' -and $pending.job.action -eq 'Preview') {
@@ -187,7 +216,10 @@ function Finish-Job {
         $status.Text=$result.data.message
         $log.AppendText("$($result.data.message)`r`n")
         switch ($pending.job.action) {
-            List { Fill-Sessions @($result.data.sessions); if ($result.data.excluded -gt 0) { $status.Text += (T 'GuiExcludedSuffix' $result.data.excluded) } }
+            List {
+                Fill-Sessions @($result.data.sessions); if ($result.data.excluded -gt 0) { $status.Text += (T 'GuiExcludedSuffix' $result.data.excluded) }
+                if ($bulkSummary) { $status.Text=$bulkSummary }
+            }
             Bind { Load-Bindings }
             Unbind { Load-Bindings }
             Status {
@@ -302,6 +334,49 @@ function Continue-DesktopApply {
         Start-Job $next
     } else { $status.Text=(T 'GuiApplyDone') }
 }
+# 필터에 맞는 이 PC의 Codex 대화를 모든 페이지에서 골라 기존 백업 작업을 하나씩 돌린다.
+# 같은 UUID·같은 수정 시각의 묶음 형식 공유 백업이 이미 있으면 내용이 같으므로 다시 올리지 않는다.
+# 이전 형식 백업은 하위 대화가 빠졌을 수 있으므로 최신으로 보지 않는다.
+function Start-BulkBackup {
+    $latest=@{}
+    foreach ($item in $script:Sessions) { if (-not $item.local -and $item.remoteId -and -not $item.blockedReason -and $null -ne $item.children) { $latest["$($item.nativeId)|$($item.updatedAt)"]=$true } }
+    $local=@($script:Filtered | Where-Object { $_.agent -eq 'codex-desktop' -and $_.local })
+    $blocked=@($local | Where-Object { $_.blockedReason }).Count
+    $ready=@($local | Where-Object { -not $_.blockedReason -and -not $latest.ContainsKey("$($_.nativeId)|$($_.updatedAt)") })
+    $current=$local.Count-$blocked-$ready.Count
+    if (-not $ready.Count) { throw (T 'GuiBulkNothing' $local.Count $current $blocked) }
+    if (-not (Confirm (T 'GuiBulkConfirm' $ready.Count $current $blocked "`r`n"))) { return }
+    $script:Bulk=@{items=$ready;next=0;done=0;failed=@();streak=0;stop=$false;skipped=$current+$blocked}
+    Continue-BulkBackup
+}
+function Continue-BulkBackup {
+    $bulk=$script:Bulk
+    # 앱이 켜져 있거나 저장소에 쓸 수 없으면 모든 대화가 같은 이유로 실패하므로 연속 3번 실패하면 멈춘다.
+    if ($bulk.stop -or $bulk.streak -ge 3 -or $bulk.next -ge $bulk.items.Count) { End-BulkBackup; return }
+    $item=$bulk.items[$bulk.next]; $bulk.next++
+    $job=Base-Job 'Backup'; $job.nativeId=$item.nativeId; $job.remoteId=''; $job.title=$item.title
+    try { Start-Job $job } catch { $script:Bulk=$null; throw }
+    $status.Text=(T 'GuiBulkProgress' $bulk.next $bulk.items.Count $bulk.done $bulk.failed.Count)
+}
+function Step-BulkBackup([hashtable]$Job,[object]$Result) {
+    $bulk=$script:Bulk
+    if ($Result.ok) { $bulk.done++; $bulk.streak=0; $log.AppendText("$($Result.data.message)`r`n") }
+    else {
+        $reason=if ($Result.error) {[string]$Result.error} else {T 'GuiWorkerAborted'}
+        $bulk.failed+="$($Job.title) · $($Job.nativeId): $reason"; $bulk.streak++
+        $log.AppendText("$(T 'GuiBulkItemFailed' $Job.title $Job.nativeId $reason)`r`n")
+    }
+    Continue-BulkBackup
+}
+function End-BulkBackup {
+    $bulk=$script:Bulk; $script:Bulk=$null
+    $summary=T 'GuiBulkSummary' $bulk.done $bulk.skipped $bulk.failed.Count ($bulk.items.Count-$bulk.done-$bulk.failed.Count)
+    if ($bulk.streak -ge 3) { $summary+=(T 'GuiBulkStreakStop') } elseif ($bulk.stop) { $summary+=(T 'GuiBulkStopped') }
+    $status.Text=$summary; $log.AppendText("$summary`r`n")
+    if ($bulk.failed.Count) { Show-Error ("$summary`r`n`r`n" + (@($bulk.failed | Select-Object -First 10) -join "`r`n")) }
+    # 새 백업이 목록에 보여야 다음 전체 백업이 같은 대화를 다시 올리지 않는다.
+    if ($bulk.done -and -not $script:Pending) { Start-Job (Base-Job 'List'); $script:BulkSummary=$summary }
+}
 # 빈 칸·공백·잘못된 문자는 Test-Path가 예외를 내거나 현재 폴더로 풀므로 폴더가 아닌 것으로 본다.
 function Test-Folder([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -371,7 +446,9 @@ $null=New-Control Label 16 140 74 25 (T 'GuiSearchLabel') $main
 $search=New-Control TextBox 94 136 355 28 '' $main
 $view=New-Control ComboBox 466 136 146 28 '' $main; $view.DropDownStyle='DropDownList'; $view.Items.AddRange(@((T 'GuiViewAll'),(T 'GuiViewLocal'),(T 'GuiViewShared'))); $view.SelectedIndex=0
 $dateFilter=New-Control ComboBox 630 136 175 28 '' $main; $dateFilter.DropDownStyle='DropDownList'; $dateFilter.Items.AddRange(@((T 'GuiDateAll'),(T 'GuiDate7'),(T 'GuiDate30'))); $dateFilter.SelectedIndex=0
-$countLabel=New-Control Label 16 172 745 24 (T 'GuiCountInitial') $main
+$countLabel=New-Control Label 16 172 440 24 (T 'GuiCountInitial') $main
+$projectOnly=New-Control CheckBox 466 169 330 28 (T 'GuiProjectOnly') $main; $projectOnly.Checked=$true
+$projectOnly.Add_CheckedChanged({ $script:Page=0; Apply-Filter })
 $null=New-Button 806 164 82 (T 'GuiPrevPage') $main { if ($script:Page -gt 0) { $script:Page--; Apply-Filter } }
 $null=New-Button 902 164 82 (T 'GuiNextPage') $main { $script:Page++; Apply-Filter }
 $grid=New-Control DataGridView 16 205 988 174 '' $main
@@ -394,6 +471,8 @@ $restoreButton=New-Button 252 411 220 (T 'GuiPreviewRestore') $main { if ($agent
 $openButton=New-Button 488 411 200 (T 'GuiOpenSelected') $main { Start-Job (Selected-Job 'Open') }
 $script:SessionButtons=@($backupButton,$restoreButton,$openButton)
 foreach ($button in $script:SessionButtons) { $button.Anchor='Bottom,Left' }
+# Codex 대화는 GUI가 열지 않으므로 Codex Desktop에서는 열기 버튼 자리에 전체 백업을 둔다.
+$bulkButton=New-Button 488 411 200 (T 'GuiBackupFiltered') $main { Start-BulkBackup }; $bulkButton.Anchor='Bottom,Left'
 $grid.Add_SelectionChanged({ Update-Selection })
 Update-Selection
 $driveHint=New-Control Label 708 416 296 32 (T 'GuiDriveHint') $main; $driveHint.Anchor='Bottom,Left'
@@ -443,6 +522,8 @@ function Stop-ProcessTree([int]$Id) {
 $cancelButton=New-Button 900 591 148 (T 'GuiCancelJob') $form {
     $pending=$script:Pending
     if (-not $pending -or $pending.job.action -in @('Restore','Open')) { return }
+    # 전체 백업은 처음 누르면 지금 대화를 마친 뒤 멈추고, 한 번 더 누르면 아래처럼 작업 창을 바로 끝낸다.
+    if ($script:Bulk -and -not $script:Bulk.stop) { $script:Bulk.stop=$true; $status.Text=(T 'GuiBulkStopping'); return }
     if ($pending.job.action -ne 'List' -and -not (Confirm (T 'GuiCancelConfirm' $pending.job.action))) { return }
     # 확인 창이 떠 있는 동안 작업이 끝났으면 그 결과를 그대로 보여 주고, 이어서 시작된 작업도 건드리지 않는다.
     if (-not [object]::ReferenceEquals($pending,$script:Pending) -or $pending.process.HasExited) { return }
@@ -456,6 +537,7 @@ $cancelButton.Enabled=$false; $cancelButton.Anchor='Bottom,Right'
 $tips=[Windows.Forms.ToolTip]::new()
 $tips.SetToolTip($backupButton,(T 'GuiTipBackup')); $tips.SetToolTip($restoreButton,(T 'GuiTipRestore')); $tips.SetToolTip($openButton,(T 'GuiTipOpen'))
 $tips.SetToolTip($registerButton,(T 'GuiTipRegister')); $tips.SetToolTip($unbindButton,(T 'GuiTipUnbind')); $tips.SetToolTip($cancelButton,(T 'GuiTipCancel'))
+$tips.SetToolTip($bulkButton,(T 'GuiTipBulkBackup')); $tips.SetToolTip($projectOnly,(T 'GuiTipProjectOnly'))
 # 꺼진 버튼은 툴팁을 띄우지 않으므로, 마우스 아래의 꺼진 버튼 설명을 그 버튼이 놓인 탭·창의 툴팁으로 대신 띄운다.
 foreach ($surface in @($main,$form)) {
     $surface.Add_MouseMove({
@@ -468,8 +550,12 @@ foreach ($surface in @($main,$form)) {
 $status.Anchor='Bottom,Left,Right'
 $progress=New-Control ProgressBar 24 634 1025 8 '' $form; $progress.Anchor='Bottom,Left,Right'
 $log=New-Control TextBox 24 651 1025 58 '' $form; $log.Multiline=$true; $log.ReadOnly=$true; $log.ScrollBars='Vertical'; $log.Anchor='Bottom,Left,Right'
-$agent.Add_SelectedIndexChanged({ $grid.MultiSelect=($agent.SelectedIndex -eq 1); $projectPicker.Enabled=($agent.SelectedIndex -eq 0); Fill-Sessions @(); Save-Prefs })
-$grid.MultiSelect=($agent.SelectedIndex -eq 1)
+function Set-AgentMode {
+    $desktop=$agent.SelectedIndex -eq 1
+    $grid.MultiSelect=$desktop; $openButton.Visible=-not $desktop; $bulkButton.Visible=$desktop; $projectOnly.Visible=$desktop
+}
+$agent.Add_SelectedIndexChanged({ Set-AgentMode; $projectPicker.Enabled=($agent.SelectedIndex -eq 0); Fill-Sessions @(); Save-Prefs })
+Set-AgentMode
 $desktopHome.Add_TextChanged({ if ($script:Sessions.Count) { Fill-Sessions @() } })
 $project.Add_TextChanged({ if ($script:Sessions.Count) { Fill-Sessions @() } })
 $identity.Add_TextChanged({ if ($script:Sessions.Count) { Fill-Sessions @() } })

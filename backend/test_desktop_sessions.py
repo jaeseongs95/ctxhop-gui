@@ -48,32 +48,86 @@ class Sessions(unittest.TestCase):
         return d.apply(self.home, archive, self.cwd, preview['token'], choice,
             guard=self.guard, failpoint=failpoint)
 
-    def append(self, label):
-        snapshot = copy.deepcopy(self.original)
-        snapshot['rollout'] += d.encoded({'timestamp': '2026-09-26T08:00:00Z',
+    def grown(self, family, index, label):
+        """묶음의 index번 대화 세션 파일 끝에 기록 하나를 더한 사본."""
+        family = copy.deepcopy(family)
+        family['members'][index]['rollout'] += d.encoded({'timestamp': '2026-09-26T08:00:00Z',
             'type': 'event_msg', 'payload': {'type': 'user_message', 'message': label}}) + b'\n'
+        return family
+
+    def save(self, family, label):
         archive = self.root / (label + '.zip')
-        d.write_archive(snapshot, archive)
+        d.write_archive(family, archive)
         return archive
+
+    def append(self, label):
+        return self.save(self.grown(self.original, 0, label), label)
+
+    def rekeyed(self, item, thread_id, row_source, **header_fields):
+        """대화 하나를 thread_id로 복사한다. 세션 헤더를 고치고 이력 행의 thread_id와 파일 위치를 맞춘다."""
+        item = copy.deepcopy(item)
+        item['data']['thread'].update(id=thread_id, source=row_source)
+        first, rest = item['rollout'].split(b'\n', 1)
+        header = json.loads(first)
+        header['payload'].update(id=thread_id, **header_fields)
+        new_first = json.dumps(header, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        item['rollout'] = new_first + b'\n' + rest
+        for rows in item['data']['history'].values():
+            for entry in rows:
+                entry['thread_id'] = thread_id
+                for key in ('rollout_byte_offset', 'rollout_end_byte_offset', 'next_rollout_byte_offset'):
+                    if entry.get(key):
+                        self.assertGreater(entry[key], len(first))
+                        entry[key] += len(new_first) - len(first)
+        return item
+
+    def child(self, parent_id, root_id, label):
+        """fixture 대화를 복사해 만든 하위 에이전트 대화(새 ID, subagent source, 헤더 parent_thread_id·session_id)."""
+        spawn = {'parent_thread_id': parent_id, 'depth': 1, 'agent_nickname': label, 'agent_role': 'worker', 'agent_path': None}
+        item = self.rekeyed(self.original['members'][0], str(uuid.uuid4()),
+            json.dumps({'subagent': {'thread_spawn': spawn}}, separators=(',', ':')),
+            session_id=root_id, parent_thread_id=parent_id, source={'subagent': {'thread_spawn': spawn}})
+        item['data']['thread'].update(title=label, agent_nickname=label, agent_role='worker')
+        return item
+
+    def family(self, parents, base=None, status='open'):
+        """base(기본 fixture)에 하위 대화를 붙인다. parents: 새 하위 대화마다 부모의 묶음 안 번호(0 = 최상위)."""
+        family = copy.deepcopy(base or self.original)
+        root_id = family['members'][0]['data']['thread']['id']
+        for number, index in enumerate(parents):
+            parent_id = family['members'][index]['data']['thread']['id']
+            item = self.child(parent_id, root_id, f'agent-{len(family["members"])}')
+            family['members'].append(item)
+            family['edges'].append({'parent_thread_id': parent_id, 'child_thread_id': item['data']['thread']['id'], 'status': status})
+        d.validate_family(family)
+        return family
+
+    def ids(self, family):
+        return [item['data']['thread']['id'] for item in family['members']]
+
+    def edges(self):
+        with d.ro(self.home / d.FILES[0]) as db:
+            return sorted(tuple(row) for row in db.execute('SELECT parent_thread_id,child_thread_id,status FROM thread_spawn_edges'))
 
     def test_01_first_import_and_offsets(self):
         self.assertEqual(self.preview()['status'], 'new')
         result = self.apply()
         self.assertEqual(result['status'], 'imported')
-        restored = d.selected(self.home, self.thread_id)
-        self.assertEqual(d.canonical(restored['rollout'], self.thread_id), d.canonical(self.original['rollout'], self.thread_id))
+        restored = d.selected(self.home, self.thread_id)['members'][0]
+        original = self.original['members'][0]
+        self.assertEqual(d.canonical(restored['rollout'], self.thread_id), d.canonical(original['rollout'], self.thread_id))
         self.assertEqual(restored['data']['thread']['cwd'], str(self.cwd))
         self.assertEqual(restored['data']['thread']['sandbox_policy'], '{"type":"read-only"}')
         self.assertEqual(restored['data']['thread']['approval_mode'], 'untrusted')
         self.assertEqual(restored['data']['thread']['project_id'], None)
-        delta = len(restored['rollout']) - len(self.original['rollout'])
-        for left, right in zip(self.original['data']['history']['thread_turns'], restored['data']['history']['thread_turns']):
+        delta = len(restored['rollout']) - len(original['rollout'])
+        for left, right in zip(original['data']['history']['thread_turns'], restored['data']['history']['thread_turns']):
             for key in ('rollout_byte_offset', 'rollout_end_byte_offset'):
-                if left[key] and left[key] > len(self.original['rollout'].split(b'\n')[0]):
+                if left[key] and left[key] > len(original['rollout'].split(b'\n')[0]):
                     if key == 'rollout_end_byte_offset':
                         self.assertEqual(right[key], left[key] + delta)
                     else:
-                        header_delta = len(restored['rollout'].split(b'\n')[0]) - len(self.original['rollout'].split(b'\n')[0])
+                        header_delta = len(restored['rollout'].split(b'\n')[0]) - len(original['rollout'].split(b'\n')[0])
                         self.assertEqual(right[key], left[key] + header_delta)
         self.assertEqual(self.preview()['status'], 'equal')
 
@@ -109,7 +163,7 @@ class Sessions(unittest.TestCase):
         result = self.apply(newer)
         self.assertTrue(result['replaced'])
         self.assertTrue((Path(result['recovery']) / 'before.zip').exists())
-        row = d.selected(self.home, self.thread_id)['data']['thread']
+        row = d.selected(self.home, self.thread_id)['members'][0]['data']['thread']
         self.assertEqual(row['is_pinned'], 1)
         self.assertEqual(row['approval_mode'], 'on-request')
         self.assertEqual(self.preview()['status'], 'local_newer')
@@ -147,7 +201,7 @@ class Sessions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '구조'):
             self.preview()
         bad = copy.deepcopy(self.original)
-        bad['data']['thread']['id); DROP TABLE threads; --'] = 1
+        bad['members'][0]['data']['thread']['id); DROP TABLE threads; --'] = 1
         badfile = self.root / 'bad.zip'
         d.write_archive(bad, badfile)
         with self.assertRaisesRegex(ValueError, '열 목록'):
@@ -155,13 +209,13 @@ class Sessions(unittest.TestCase):
 
     def test_08_wrong_id_and_missing_newline(self):
         bad = copy.deepcopy(self.original)
-        bad['data']['thread']['id'] = str(uuid.uuid4())
+        bad['members'][0]['data']['thread']['id'] = str(uuid.uuid4())
         with self.assertRaisesRegex(ValueError, 'ID'):
-            d.validate(bad)
+            d.validate_family(bad)
         bad = copy.deepcopy(self.original)
-        bad['rollout'] = bad['rollout'].rstrip(b'\n')
+        bad['members'][0]['rollout'] = bad['members'][0]['rollout'].rstrip(b'\n')
         with self.assertRaisesRegex(ValueError, '불완전'):
-            d.validate(bad)
+            d.validate_family(bad)
 
     def test_09_outside_path_and_zip_duplicates(self):
         with self.assertRaises(ValueError):
@@ -207,14 +261,14 @@ class Sessions(unittest.TestCase):
             self.apply(failpoint=fail)
         run = d.pending(self.home)[0].parent
         journal = json.loads((run / 'journal.json').read_text(encoding='utf-8'))
-        Path(journal['path']).write_bytes(b'new user changes\n')
+        Path(journal['members'][0]['path']).write_bytes(b'new user changes\n')
         with self.assertRaisesRegex(ValueError, '파일이 변경'):
             d.recover(self.home, run, guard=self.guard)
 
     def test_13_page_search_all_projects(self):
         self.apply()
         with sqlite3.connect(self.home / d.FILES[0]) as db:
-            row = d.selected(self.home, self.thread_id)['data']['thread']
+            row = d.selected(self.home, self.thread_id)['members'][0]['data']['thread']
             for index in range(5000):
                 item = {**row, 'id': str(uuid.uuid4()), 'title': f'fixture {index}', 'cwd': f'C:\\project{index%10}', 'archived': index%2}
                 columns = list(item)
@@ -240,13 +294,13 @@ class Sessions(unittest.TestCase):
 
     def test_15_null_required_and_runtime_version(self):
         bad = copy.deepcopy(self.original)
-        bad['data']['thread']['title'] = None
+        bad['members'][0]['data']['thread']['title'] = None
         with self.assertRaisesRegex(ValueError, '필수'):
-            d.validate(bad)
+            d.validate_family(bad)
         bad = copy.deepcopy(self.original)
         bad['manifest']['engineVersion'] = 'unknown'
         with self.assertRaisesRegex(ValueError, '버전'):
-            d.validate(bad)
+            d.validate_family(bad)
 
     def test_16_guard_again_before_commit(self):
         calls = []
@@ -263,7 +317,8 @@ class Sessions(unittest.TestCase):
         self.assertEqual(d.pending(self.home), [])
 
     def test_17_actual_native_extension(self):
-        if d.canonical(self.full['rollout'], self.thread_id) == d.canonical(self.original['rollout'], self.thread_id):
+        full, original = self.full['members'][0], self.original['members'][0]
+        if d.canonical(full['rollout'], self.thread_id) == d.canonical(original['rollout'], self.thread_id):
             self.skipTest('2-turn native fixture required')
         self.apply()
         archive = self.root / 'actual-native-latest.zip'
@@ -294,11 +349,13 @@ class Sessions(unittest.TestCase):
         self.assertEqual(set(result['metadata']), {'sessionId', 'title', 'sourceCwd', 'updatedAt', 'historyMode', 'cliVersion', 'recordCount'})
         self.assertEqual(result['metadata']['cliVersion'], '0.158.0-alpha.2.1')
         self.assertRegex(result['metadata']['updatedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+        self.assertRegex(result['metadata']['historyMode'], r'^paginated;family=0$')
         self.assertEqual(d.read_archive(output)['manifest']['engineVersion'], '0.158.0-alpha.2.1')
         code, page = self.run_cli('list', '--home', str(FIXTURE), '--search', self.thread_id[:8])
         self.assertEqual((code, page['total']), (0, 1))
+        self.assertEqual(set(page['sessions'][0]), {'id', 'title', 'cwd', 'historyMode', 'archived', 'children', 'updatedAt'})
         self.assertIs(type(page['sessions'][0]['archived']), bool)
-        self.assertIs(page['sessions'][0]['subagent'], False)
+        self.assertEqual(page['sessions'][0]['children'], 0)
         self.assertRegex(page['sessions'][0]['updatedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
         # 실제 writer 검사(앱 실행 중) 또는 잘못된 token 중 먼저 걸리는 쪽에서 쓰기 전에 차단돼야 한다.
         code, blocked = self.run_cli('apply', '--home', str(self.home), '--archive', str(self.archive),
@@ -336,7 +393,7 @@ class Sessions(unittest.TestCase):
         self.assertEqual(d.recover(self.home, run, guard=self.guard)['status'], 'rolled_back')
         self.assertEqual(d.pending(self.home), [])
 
-    def test_22_preview_blocks_engine_mismatch_and_marks_subagents(self):
+    def test_22_preview_blocks_engine_mismatch_and_hides_subagents(self):
         stamped = d.read_archive(self.archive)['manifest']['engineVersion']
         other = next(v for v in d.VERSIONS if v != stamped)
         with mock.patch.object(d, 'engine_version', return_value=other):
@@ -347,9 +404,12 @@ class Sessions(unittest.TestCase):
             code, preview = self.run_cli('inspect', '--home', str(self.home), '--archive', str(self.archive), '--cwd', str(self.cwd))
         self.assertEqual((code, preview['status']), (0, 'new'))
         self.apply()
+        # 부모 없는 내부 도우미 대화(예: guardian)도 하위 에이전트 source라 목록과 백업 대상에서 빠진다.
         with sqlite3.connect(self.home / d.FILES[0]) as db:
             db.execute('UPDATE threads SET source=? WHERE id=?', ('{"subagent":{"other":"guardian"}}', self.thread_id))
-        self.assertIs(d.list_sessions(self.home)['sessions'][0]['subagent'], True)
+        self.assertEqual(d.list_sessions(self.home)['total'], 0)
+        with self.assertRaisesRegex(ValueError, '부모 대화'):
+            d.selected(self.home, self.thread_id)
         self.assertRegex(d.CLOSED_CHECK, r'\|ChatGPT\|')
 
     def test_23_conflict_restore_local_branch_revivable_from_before_zip(self):
@@ -373,10 +433,10 @@ class Sessions(unittest.TestCase):
         # 목록의 최신 버전이 아니라 guard가 돌려준 이 PC 엔진을 기록해야 alpha.2 PC에서도 되살릴 수 있다.
         old = d.VERSIONS[0]
         def stamped(label):
-            snapshot = d.read_archive(self.append(label))
-            snapshot['manifest']['engineVersion'] = old
+            family = d.read_archive(self.append(label))
+            family['manifest']['engineVersion'] = old
             archive = self.root / (label + '-old.zip')
-            d.write_archive(snapshot, archive)
+            d.write_archive(family, archive)
             return archive
         for archive in (stamped('localBranch'), stamped('sharedBranch')):
             result = d.apply(self.home, archive, self.cwd, self.preview(archive)['token'], 'incoming', guard=lambda: old)
@@ -440,6 +500,201 @@ class Sessions(unittest.TestCase):
         run = d.pending(self.home)[0].parent
         d.recover(self.home, run, guard=self.guard)
         self.assertEqual(d.pending(self.home), [])
+
+    # 하위 에이전트 대화 묶음
+
+    def test_27_family_round_trip_and_list(self):
+        family = self.family([0, 0, 1])  # 최상위 아래 둘, 첫 하위 아래 하나(중첩)
+        archive = self.save(family, 'family')
+        preview = self.preview(archive)
+        self.assertEqual(preview['status'], 'new')
+        self.assertIn('하위 대화 3개', preview['reason'])
+        self.assertEqual((preview['source']['children'], preview['source']['historyMode']), (3, 'paginated;family=3'))
+        result = self.apply(archive)
+        self.assertEqual((result['status'], result['members']), ('imported', 4))
+        restored = d.selected(self.home, self.thread_id)
+        self.assertEqual(sorted(self.ids(restored)), sorted(self.ids(family)))
+        self.assertEqual(self.edges(), sorted(tuple(edge.values()) for edge in family['edges']))
+        sources = {item['data']['thread']['id']: item for item in family['members']}
+        for item in restored['members']:
+            thread_id = item['data']['thread']['id']
+            header = d.records(item['rollout'], thread_id, [self.thread_id])[0]['payload']
+            self.assertEqual((item['data']['thread']['cwd'], header['cwd']), (str(self.cwd), str(self.cwd)))
+            source = d.records(sources[thread_id]['rollout'], thread_id, [self.thread_id])[0]['payload']
+            self.assertEqual(header.get('parent_thread_id'), source.get('parent_thread_id'))
+        page = d.list_sessions(self.home)
+        self.assertEqual((page['total'], page['sessions'][0]['id'], page['sessions'][0]['children']), (1, self.thread_id, 3))
+        with self.assertRaisesRegex(ValueError, '부모 대화'):
+            d.selected(self.home, self.ids(family)[3])
+        self.assertEqual(self.preview(archive)['status'], 'equal')
+        # 내보내기: 부모를 고르면 묶음 전체, 하위 대화 ID는 차단
+        output = self.root / 'family-export.zip'
+        with mock.patch.object(d, 'assert_closed', return_value=d.VERSIONS[-1]):
+            code, exported = self.run_cli('export', '--home', str(self.home), '--id', self.thread_id, '--output', str(output))
+            self.assertEqual((code, exported['metadata']['historyMode']), (0, 'paginated;family=3'))
+            code, blocked = self.run_cli('export', '--home', str(self.home), '--id', self.ids(family)[1],
+                '--output', str(self.root / 'child-export.zip'))
+        self.assertEqual(code, 1)
+        self.assertIn('부모 대화', blocked['reason'])
+        self.assertEqual(sorted(self.ids(d.read_archive(output))), sorted(self.ids(family)))
+
+    def test_28_family_merge_keeps_local_newer_children(self):
+        base = self.family([0, 0])
+        a, b = self.ids(base)[1:]
+        self.apply(self.save(self.grown(base, 2, 'b-local'), 'local'))
+        incoming = self.family([1], base=self.grown(base, 1, 'a-newer'))  # a 이어짐, b 이 PC가 더 최신, c 새로(a 아래)
+        incoming['edges'][0]['status'] = 'closed'
+        archive = self.save(incoming, 'incoming')
+        preview = self.preview(archive)
+        self.assertEqual(preview['status'], 'incoming_newer')
+        for part in ('새로 1', '이어짐 1', '이 PC가 더 최신 1'):
+            self.assertIn(part, preview['reason'])
+        result = self.apply(archive)
+        self.assertEqual(result['members'], 2)
+        after = {item['data']['thread']['id']: item for item in d.selected(self.home, self.thread_id)['members']}
+        self.assertEqual(len(after), 4)
+        chain = [self.thread_id]
+        self.assertEqual(d.canonical(after[a]['rollout'], a, chain), d.canonical(incoming['members'][1]['rollout'], a, chain))
+        local_b = self.grown(base, 2, 'b-local')['members'][2]['rollout']
+        self.assertEqual(d.canonical(after[b]['rollout'], b, chain), d.canonical(local_b, b, chain))
+        self.assertIn((self.thread_id, a, 'closed'), self.edges())
+        self.assertEqual(self.preview(archive)['status'], 'local_newer')
+
+    def test_29_family_conflict_is_one_choice(self):
+        base = self.family([0])
+        local, shared = self.grown(base, 1, 'child-local'), self.grown(base, 1, 'child-shared')
+        self.apply(self.save(local, 'local'))
+        local_state = d.selected(self.home, self.thread_id)
+        archive = self.save(shared, 'shared')
+        self.assertEqual(self.preview(archive)['status'], 'conflict')
+        self.assertEqual(self.apply(archive, choice='skip')['status'], 'skipped')
+        result = self.apply(archive)
+        self.assertEqual(result['members'], 1)
+        self.assertEqual(self.preview(archive)['status'], 'equal')
+        # before.zip은 이 PC 묶음 전체라 그대로 되살릴 수 있다.
+        before = d.read_archive(Path(result['recovery']) / 'before.zip')
+        self.assertEqual(d.snapshot_hash(before), d.snapshot_hash(local_state))
+
+    def test_30_family_recovery_removes_new_children_and_edges(self):
+        family = self.family([0, 1])
+        archive = self.save(family, 'family')
+        def fail(stage):
+            raise RuntimeError('injected ' + stage)
+        with self.assertRaises(RuntimeError):
+            self.apply(archive, failpoint=fail)
+        run = d.pending(self.home)[0].parent
+        self.assertEqual(len(json.loads((run / 'journal.json').read_text(encoding='utf-8'))['edges']), 2)
+        d.recover(self.home, run, guard=self.guard)
+        self.assertIsNone(d.selected(self.home, self.thread_id))
+        self.assertEqual(self.edges(), [])
+        self.assertEqual(list((self.home / 'sessions').rglob('*.jsonl')), [])
+        # 기존 묶음을 갱신하다 커밋 뒤 중단: 이어진 하위 대화·새 하위 대화·연결 상태가 모두 이전으로 돌아간다.
+        base = self.family([0])
+        self.apply(self.save(base, 'base'))
+        before, before_edges = d.selected(self.home, self.thread_id), self.edges()
+        incoming = self.family([1], base=self.grown(base, 1, 'more'))
+        incoming['edges'][0]['status'] = 'closed'
+        def after_commit(stage):
+            if stage == 'commit':
+                raise RuntimeError('injected commit')
+        with self.assertRaises(RuntimeError):
+            self.apply(self.save(incoming, 'incoming'), failpoint=after_commit)
+        run = d.pending(self.home)[0].parent
+        self.assertEqual(d.recover(self.home, run, guard=self.guard)['members'], 2)
+        self.assertEqual(d.snapshot_hash(d.selected(self.home, self.thread_id)), d.snapshot_hash(before))
+        self.assertEqual(self.edges(), before_edges)
+        self.assertFalse(any(self.ids(incoming)[2] in p.name for p in (self.home / 'sessions').rglob('*.jsonl')))
+
+    def test_31_recovery_refuses_links_added_after_failure(self):
+        archive = self.save(self.family([0]), 'family')
+        def fail(stage):
+            raise RuntimeError('injected ' + stage)
+        with self.assertRaises(RuntimeError):
+            self.apply(archive, failpoint=fail)
+        run = d.pending(self.home)[0].parent
+        child = json.loads((run / 'journal.json').read_text(encoding='utf-8'))['members'][1]['id']
+        with sqlite3.connect(self.home / d.FILES[0]) as db:
+            db.execute('INSERT INTO thread_spawn_edges VALUES (?,?,?)', (child, str(uuid.uuid4()), 'open'))
+        with self.assertRaisesRegex(ValueError, '다른 작업'):
+            d.recover(self.home, run, guard=self.guard)
+
+    def legacy_archive(self, item, path):
+        """이전 판 형식 1 보관 파일(대화 하나, manifest에 sessions 없음)."""
+        d.seal(path, {'format': 1, 'schema': d.trusted_schema(), 'engineVersion': d.VERSIONS[-1]},
+            {'data.json': d.encoded(item['data']), 'rollout.jsonl': item['rollout']})
+        return path
+
+    def test_32_format1_archive_and_legacy_journal(self):
+        old = self.legacy_archive(self.original['members'][0], self.root / 'format1.zip')
+        family = d.read_archive(old)
+        self.assertEqual((len(family['members']), family['edges']), (1, []))
+        self.assertEqual(d.summary(family)['historyMode'], 'paginated')
+        self.assertEqual(self.preview(old)['status'], 'new')
+        self.apply(old)
+        self.assertEqual(self.preview(old)['status'], 'equal')
+        before = d.selected(self.home, self.thread_id)
+        # 이전 판이 커밋 뒤 중단하며 남긴 복구 기록(journal에 version 없음, before.zip·incoming.zip·undo)도 되돌린다.
+        def after_commit(stage):
+            if stage == 'commit':
+                raise RuntimeError('injected commit')
+        with self.assertRaises(RuntimeError):
+            self.apply(self.append('newer'), failpoint=after_commit)
+        run = d.pending(self.home)[0].parent
+        journal = json.loads((run / 'journal.json').read_text(encoding='utf-8'))
+        entry = journal['members'][0]
+        (run / 'before.zip').unlink()
+        self.legacy_archive(before['members'][0], run / 'before.zip')
+        self.legacy_archive(d.read_member_archive(run / 'incoming-0000.zip'), run / 'incoming.zip')
+        (run / 'incoming-0000.zip').unlink()
+        legacy = {'status': 'pending', 'home': journal['home'], 'createdDb': [], 'beforeData': None, 'afterData': None,
+            **{key: entry[key] for key in ('id', 'path', 'before', 'after', 'beforeFile', 'afterFile')}}
+        (run / 'journal.json').write_bytes(d.encoded(legacy))
+        self.assertEqual(d.recover(self.home, run, guard=self.guard)['status'], 'rolled_back')
+        self.assertEqual(d.snapshot_hash(d.selected(self.home, self.thread_id)), d.snapshot_hash(before))
+
+    def test_33_family_validation_and_foreign_child(self):
+        family = self.family([0])
+        bad = copy.deepcopy(family)
+        bad['members'][1]['data']['thread']['source'] = 'vscode'
+        with self.assertRaisesRegex(ValueError, '하위 대화가 아닌'):
+            d.validate_family(bad)
+        bad = copy.deepcopy(family)
+        bad['edges'][0]['parent_thread_id'] = bad['edges'][0]['child_thread_id']
+        with self.assertRaisesRegex(ValueError, '연결'):
+            d.validate_family(bad)
+        bad = copy.deepcopy(family)
+        bad['edges'] = []
+        with self.assertRaisesRegex(ValueError, '연결'):
+            d.validate_family(bad)
+        bad = copy.deepcopy(family)
+        bad['members'].reverse()
+        with self.assertRaisesRegex(ValueError, '부모 대화'):
+            d.validate_family(bad)
+        # 같은 하위 대화 ID가 이 PC에서 다른 최상위 대화에 붙어 있으면 가져오지 않는다.
+        self.apply(self.save(family, 'family'))
+        root, child = self.original['members'][0], family['members'][1]
+        other_id, child_id = str(uuid.uuid4()), child['data']['thread']['id']
+        other = copy.deepcopy(self.original)
+        other['members'] = [self.rekeyed(root, other_id, root['data']['thread']['source'], session_id=other_id),
+            self.rekeyed(child, child_id, child['data']['thread']['source'], parent_thread_id=other_id, session_id=other_id)]
+        other['edges'] = [{'parent_thread_id': other_id, 'child_thread_id': child_id, 'status': 'open'}]
+        d.validate_family(other)
+        with self.assertRaisesRegex(ValueError, '다른 대화에 연결'):
+            self.preview(self.save(other, 'other'))
+
+    def test_34_native_reads_imported_children(self):
+        family = self.family([0, 1])
+        self.apply(self.save(family, 'family'))
+        rpc = Rpc(EXE, self.home)
+        try:
+            for child_id in self.ids(family)[1:]:
+                read = rpc.call('thread/read', {'threadId': child_id, 'includeTurns': False})
+                self.assertEqual(read['thread']['id'], child_id)
+                items = rpc.call('thread/items/list', {'threadId': child_id, 'limit': 20})
+                self.assertIn('CTXHOP_NATIVE_FIXTURE_USER', json.dumps(items, ensure_ascii=False))
+            (self.root / 'native-children.json').write_text(json.dumps(read, ensure_ascii=False, indent=2), encoding='utf-8')
+        finally:
+            rpc.close()
 
 
 if __name__ == '__main__':

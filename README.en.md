@@ -36,6 +36,8 @@ Download either the installer or the zip from [Releases](https://github.com/jaes
 
 The installer and the zip include `bin\ctxhop.exe` and `bin\ctxhop-claude.exe`. These builds are not in the repository. See [Integrity checks](#integrity-checks).
 
+**Update both PCs to this build.** It moves subagent conversations together with their parent conversation. Earlier builds cannot read the Codex shared backups this build makes and stop before writing, and Claude companion folders move only between PCs on this build.
+
 ## First-time setup
 
 Use the **Connection · Invite** tab.
@@ -62,23 +64,43 @@ On the **Backup · Restore** tab, choose **Claude Code** as the agent.
 
 Close Claude Code and any editor that can start it, such as VS Code, Cursor, or Windsurf, before a backup or restore. If one is running, the error lists the programs and PIDs to close.
 
+Claude Code keeps a folder with the same name next to each conversation file (`<session ID>.jsonl`). It holds subagent transcripts (`subagents\`) and saved tool results (`tool-results\`). Backup and restore move this folder with the conversation.
+
+- A restore never deletes files that only this PC has. For each file whose content changes, the original is kept in the `.companion` folder next to the recovery record.
+- Files are copied as they are. Paths written inside them are not changed to this PC's folders.
+- Backups made by an earlier build have no such folder, so only the conversation file comes back, and the completion message says so. Back up again with this build on the source PC to move the folder too.
+- The folder is uploaded only when you back up with this GUI. If another ctxhop, such as a Claude Code hook's automatic push, later uploads only the conversation, the restored folder is the one from the last GUI backup.
+
 ## Back up and restore Codex Desktop conversations
 
 Choose **Codex Desktop** as the agent and check the **Codex data folder** on the settings tab (default `%USERPROFILE%\.codex`).
 
 ### List
 
-The list covers all projects, archived conversations, and shared backups. You can search by title, UUID, or source folder, and the list shows 200 rows per page. When you reload, the search also goes to the backend. The list reads metadata page by page and never scans conversation bodies.
+The list loads all projects, archived conversations, and shared backups. You can search by title, UUID, or source folder, and the list shows 200 rows per page. When you reload, the search also goes to the backend. The list reads metadata page by page and never scans conversation bodies.
 
+- **This project only** (on by default) filters the list by the **Project** folder.
+  - Conversations on this PC appear only if they were started in that folder or below it.
+  - Shared backups appear if their source folder is the same or below it, or if their last folder name is the same. This way a project folder with the same name on another PC shows up even if its path differs. A different project with the same folder name can show up too, so check the source folder in the restore preview.
+  - A leading `\\?\`, letter case, and a trailing `\` are ignored. Clear the box to see all projects.
 - Line breaks in titles become spaces in the shared backup list. The conversation itself does not change.
-- Subagent conversations appear but are marked **Blocked**. Back up the parent conversation instead. Other unsupported conversations, such as ones with registered dynamic tools, stop with a reason before anything is written.
+- Subagent conversations do not get their own rows. They travel with their parent conversation as one group, and the parent row's context column shows how many there are as `· N subagents`. Subagent conversations whose parent conversation is missing are not shown and are not backed up.
+- Shared backups made by an earlier build are marked `· older format`. They contain only the parent conversation, so restoring one brings back only the parent.
+- Unsupported conversations, such as ones with registered dynamic tools, stop with a reason before anything is written. If any conversation in a group is unsupported, the whole group stops.
 
 ### Back up
 
 1. Quit the Codex app yourself.
 2. Select one local conversation and click **Back up selected**.
 
-Each backup is a separate encrypted snapshot. Several backups with the same UUID appear as separate rows. The GUI never picks one by date and never overwrites one.
+Each backup is a separate encrypted snapshot that holds the parent conversation and all of its subagent conversations. Several backups with the same UUID appear as separate rows. The GUI never picks one by date and never overwrites one.
+
+**Back up all filtered** backs up, one by one, every conversation on this PC that matches the current filter (This project only, search, view, date), across all pages.
+- It first shows how many it will back up and skip and asks you to confirm. Keep the Codex app closed until it finishes. Each conversation takes a few seconds.
+- Conversations that already have a shared backup with the same UUID and modification time are skipped, so running it again uploads only conversations that changed. The modification time is the latest one in the group, so a change in a subagent conversation alone also triggers a new backup. `Older format` backups have no subagent conversations and do not count as up to date.
+- If one conversation fails, it moves on to the next and shows the done, skipped and failed counts with the reasons at the end. It stops after 3 failures in a row, for example when the app is running.
+- Click **Cancel task** once to stop after the current conversation, or again to stop the task window right away.
+- If anything was backed up, the list reloads to show the new backups.
 
 ### Restore
 
@@ -88,6 +110,9 @@ Each backup is a separate encrypted snapshot. Several backups with the same UUID
    - Every row starts as **Skip**. **Keep local** also writes nothing.
    - On each row you want, choose **Restore backup** yourself. You can pick only one backup per UUID.
    - Damaged or malformed items have no restore option.
+   - A conversation with subagent conversations is judged as one group. If any subagent conversation diverged, the whole group counts as diverged, and you choose restore or skip for the group. The reason column counts the subagent conversations by state.
+   - A restore leaves alone subagent conversations that are newer on this PC or exist only on this PC.
+   - Every conversation in the group uses the working folder chosen in step 1, even a subagent conversation that originally ran in another folder.
 4. Check your choices and the working folder, then approve the restore. If the Codex app is running, the backend stops and asks you to quit it. The GUI never force-closes the Codex or Claude apps. If the check token, backup file, ID, data folder, or target folder changes, run the check again.
 5. Open Codex Desktop yourself and check the UUID, the content, and the working folder. The GUI sends no prompt and no CLI resume command. Prepare project files, Git state, and tools separately.
 
@@ -115,6 +140,8 @@ While a `*.pending.json` remains in `%LOCALAPPDATA%\CtxHopGUI\recovery`, Claude 
    - `sha256`: the copy's SHA256.
 
    To go back to the state before the restore, copy the `backup` file over the `original` path. If `originals` is empty, the restore was adding a conversation that was not on this PC. Check the new conversation in Claude Code.
+
+   Originals of changed files in the companion folder are in the `.companion` folder named by `companionBackup`, under the same relative paths. To bring them back, copy them to the same places in the `<session ID>\` folder next to the conversation file.
 3. **Move** the `*.pending.json` out of the recovery folder (do not delete it). This lifts the block.
 
 ### A Codex restore failed
@@ -129,11 +156,11 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\backend\Invoke-D
 - `-HomePath` must be **the same string** as the Codex data folder on the settings tab. Do not end it with `\`, because `powershell.exe -File` reads a trailing `\'` as a quote. The command then stops before writing and says the folder does not exist. These commands use the same Python and the same pinned backend hash as the GUI.
 - `recover` returns the conversation to its state before the import. It stops on its own if the app rewrote that conversation after the interruption, or if the DB was only partly created.
 - `recover` checks only that the app is closed and the DB structure, not the engine version. After a Codex update it still works if the DB structure is the same. Otherwise it stops before writing. In that case use the next step (bringing back `before.zip` needs the same engine version, so it is not possible then).
-- **If recovery stopped, or the import finished but only its completion record remains**: do not repeat recovery. Check the conversation with that UUID in the Codex app. To keep the current state, **move** the folder listed by `pending` out of `.ctxhop-desktop-recovery` (do not delete it). Inside, `before.zip` is the original before the import and `incoming.zip` is the imported content. Moving the folder lifts the block.
+- **If recovery stopped, or the import finished but only its completion record remains**: do not repeat recovery. Check the conversation with that UUID in the Codex app. To keep the current state, **move** the folder listed by `pending` out of `.ctxhop-desktop-recovery` (do not delete it). Inside, `before.zip` is this PC's whole group (parent and subagent conversations) before the import, and numbered files such as `incoming-0000.zip` hold the imported content of each conversation. Recovery folders left by an earlier build have a single `incoming.zip`. Moving the folder lifts the block.
 
 ### Undo a restore that replaced a local history
 
-When you restore a shared backup over a diverged history, this PC's previous history stays in `<Codex data folder>\.ctxhop-desktop-recovery\<job ID>\before.zip`. Find the folder for that UUID and time. To bring it back, quit the app, check the file as the restore source, then apply it with the `token` from the output:
+When you restore a shared backup over a diverged history, this PC's previous history, the whole group including subagent conversations, stays in `<Codex data folder>\.ctxhop-desktop-recovery\<job ID>\before.zip`. Find the folder for that UUID and time. To bring it back, quit the app, check the file as the restore source, then apply it with the `token` from the output:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\backend\Invoke-Desktop.ps1 -Action inspect -HomePath 'Codex data folder' -Archive '...\before.zip' -Cwd 'working folder of that conversation'
@@ -162,7 +189,7 @@ The GUI never overwrites a whole session folder or DB.
 ### Integrity checks
 
 - `Worker.ps1` pins the SHA256 of `backend\desktop_sessions.py` and `bin\ctxhop.exe`, and checks them before Codex list, backup, and preview. If either file is missing or changed, the GUI stops.
-- `bin\ctxhop-claude.exe` must match the pinned `0.2.0-gui.1` hash before a Claude preview or restore.
+- `bin\ctxhop-claude.exe` must match the pinned `0.2.0-gui.2` hash before a Claude preview or restore. It is `0.2.0-gui.1` plus companion folder backup and restore (`--sidecar-backup`); its source, patch and build record are in `claude-source\`.
 - `ClaudeWorker.ps1` is a copy of the stable `ctxhop-gui` Worker (SHA256 `D08E9A15…`). It adds the chosen language, failure reasons, the overlapping-registration check, unregistering, and password change and reset. Its backup and restore decisions and its recovery records are unchanged.
 - `Worker.ps1` connects the frozen Python backend to the `bundle` command of `bin\ctxhop.exe`. The UI never parses conversation bodies, the DB, or archive formats itself.
 - Screen and job text in both languages lives in `Strings.ps1` as `key=@('Korean','English')`.

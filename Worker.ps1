@@ -10,7 +10,7 @@ $RequestFile=$script:VNextRequestFile; $ResultFile=$script:VNextResultFile
 $script:ClaudeJobCore=${function:Invoke-JobCore}
 $script:ClaudeFindExecutable=${function:Find-Executable}
 # Release integration replaces these pins only after reviewing the final candidate.
-$script:DesktopBackendSHA256='C47841453AFB902CE9C409062C5F645359BD26654186F292D182BDD1E53115BE'
+$script:DesktopBackendSHA256='FB1BB0160AEE8606A7D4057FE6BD2416801DAED3F85B3B48320D54FFB612DA1B'
 $script:DesktopTransportSHA256='9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006'
 function Find-Executable([string]$Name) {
     if ($Name -eq 'ctxhop') { return (Join-Path $PSScriptRoot 'bin\ctxhop-claude.exe') }
@@ -19,7 +19,7 @@ function Find-Executable([string]$Name) {
 function Assert-RestoreRuntime {
     $exe=Find-Executable 'ctxhop'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $script:RestoreBinarySHA256) { throw (T 'WkRestoreBinaryHash') }
-    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.1') { throw (T 'WkRestoreBinaryVersion') }
+    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.2') { throw (T 'WkRestoreBinaryVersion') }
 }
 function Assert-FrozenFile([string]$Path,[string]$Pin) {
     if ($Pin -notmatch '^[a-fA-F0-9]{64}$' -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw (T 'WkComponentMissing' $Path) }
@@ -134,9 +134,9 @@ function Get-DesktopSessions([object]$Job,[string]$DesktopRoot) {
         if (($page.total -isnot [int] -and $page.total -isnot [long]) -or $page.total -lt 0 -or $page.sessions -isnot [array] -or $page.sessions.Count -gt 200) { throw (T 'WkListResponseInvalid') }
         foreach ($row in $page.sessions) {
             Assert-NativeId $row.id
-            if ($row.cwd -isnot [string] -or $row.title -isnot [string] -or $row.historyMode -isnot [string] -or $row.archived -isnot [bool] -or $row.subagent -isnot [bool]) { throw (T 'WkListMetadataInvalid') }
-            $blocked=if ($row.subagent) {T 'WkSubagentBlocked'} else {$null}
-            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$row.id;remoteId='';title=$row.title;updatedAt=$row.updatedAt;local=$true;recordCount=0;sourceCwd=$row.cwd;historyMode=$row.historyMode;archived=$row.archived;blockedReason=$blocked}
+            if ($row.cwd -isnot [string] -or $row.title -isnot [string] -or $row.historyMode -isnot [string] -or $row.archived -isnot [bool] -or ($row.children -isnot [int] -and $row.children -isnot [long]) -or $row.children -lt 0) { throw (T 'WkListMetadataInvalid') }
+            # 하위 에이전트 대화는 백엔드가 목록에서 빼고 부모 대화와 한 묶음으로 옮긴다. children은 그 묶음의 하위 대화 수다.
+            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$row.id;remoteId='';title=$row.title;updatedAt=$row.updatedAt;local=$true;recordCount=0;sourceCwd=$row.cwd;historyMode=$row.historyMode;archived=$row.archived;children=[int]$row.children;blockedReason=$null}
         }
         $offset+=$page.sessions.Count
         if ($page.sessions.Count -eq 0 -and $offset -lt $page.total) { throw (T 'WkListPageStalled') }
@@ -148,7 +148,9 @@ function Get-DesktopSessions([object]$Job,[string]$DesktopRoot) {
             Assert-BundleId $bundle.id; Assert-BundleMetadata $bundle.metadata
             $m=$bundle.metadata
             if ($Job.search -and ($m.title+' '+$m.sessionId+' '+$m.sourceCwd).IndexOf([string]$Job.search,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$m.sessionId;remoteId=$bundle.id;title=$m.title;updatedAt=$m.updatedAt;local=$false;recordCount=$m.recordCount;sourceCwd=$m.sourceCwd;historyMode=$m.historyMode;archived=$false}
+            # 묶음 형식 백업은 historyMode 끝에 ;family=하위 대화 수가 있다. 없으면 하위 대화가 빠졌을 수 있는 이전 형식이다($null).
+            $children=if ($m.historyMode -match ';family=(\d{1,4})$') {[int]$Matches[1]} else {$null}
+            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$m.sessionId;remoteId=$bundle.id;title=$m.title;updatedAt=$m.updatedAt;local=$false;recordCount=$m.recordCount;sourceCwd=$m.sourceCwd;historyMode=$m.historyMode;archived=$false;children=$children}
         } catch {
             $items += [pscustomobject]@{agent='codex-desktop';nativeId='';remoteId=[string]$bundle.id;title=(T 'WkUnverifiedBundleTitle');updatedAt='';local=$false;recordCount=0;blockedReason=$_.Exception.Message}
         }

@@ -19,7 +19,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         list {
             $offset=[int]$Arguments[[array]::IndexOf($Arguments,'--offset')+1]
             $count=if ($offset -eq 0) {200} else {1}
-            return [pscustomobject]@{total=201;sessions=@(for($i=0;$i -lt $count;$i++){[pscustomobject]@{id=('00000000-0000-4000-8000-{0:d12}' -f ($offset+$i));title='fixture';cwd='D:\all-projects';updatedAt='2026-09-26T01:00:00Z';historyMode='paginated';archived=($i%2 -eq 0);subagent=($i -eq 1)}})}
+            return [pscustomobject]@{total=201;sessions=@(for($i=0;$i -lt $count;$i++){[pscustomobject]@{id=('00000000-0000-4000-8000-{0:d12}' -f ($offset+$i));title='fixture';cwd='D:\all-projects';updatedAt='2026-09-26T01:00:00Z';historyMode='paginated';archived=($i%2 -eq 0);children=$(if ($i -eq 1) {2} elseif ($script:ListBadChildren) {-1} else {0})}})}
         }
         export {
             $file=$Arguments[[array]::IndexOf($Arguments,'--output')+1]
@@ -44,7 +44,7 @@ function Invoke-Bundle([string[]]$Arguments) {
     switch ($Arguments[0]) {
         list {
             $a=$script:Metadata.PSObject.Copy(); $b=$script:Metadata.PSObject.Copy()
-            $a.updatedAt='2099-09-26T01:00:00Z'; $b.updatedAt='1990-09-26T01:00:00Z'
+            $a.updatedAt='2099-09-26T01:00:00Z'; $b.updatedAt='1990-09-26T01:00:00Z'; $a.historyMode='paginated;family=3'
             return @{bundles=@(@{id=$script:BundleA;metadata=$a},@{id=$script:BundleB;metadata=$b},@{id='invalid';metadata=@{}})}
         }
         put {
@@ -78,7 +78,9 @@ try {
     Assert (@($list.sessions | Where-Object archived).Count -gt 0) 'archived conversations must remain visible'
     Assert (@($list.sessions | Where-Object nativeId -eq $script:Id).Count -eq 2) 'same UUID branches must not collapse by date'
     Assert ($list.sessions[-1].blockedReason -and -not $list.sessions[-1].local) 'invalid metadata stays visible and blocked'
-    Assert (@($list.sessions | Where-Object {$_.local -and $_.blockedReason -match '하위 에이전트'}).Count -eq 1) 'subagent conversation stays visible but blocked'
+    Assert (@($list.sessions | Where-Object {$_.local -and $_.children -eq 2}).Count -eq 1 -and -not @($list.sessions | Where-Object {$_.local -and $_.blockedReason}).Count) 'local rows carry the subagent count and are never blocked for it'
+    Assert (@($list.sessions | Where-Object {$_.remoteId -eq $script:BundleA -and $_.children -eq 3}).Count -eq 1 -and @($list.sessions | Where-Object {$_.remoteId -eq $script:BundleB -and $null -eq $_.children}).Count -eq 1) 'family backups report their subagent count; older backups report none'
+    $script:ListBadChildren=$true; Throws {Invoke-JobCore @{action='List';agent='codex-desktop';home=$desktopRoot;search=''}} '목록 메타데이터'; $script:ListBadChildren=$false
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $job.action='Backup'; $backup=Invoke-JobCore $job
     Assert ($backup.bundle.id -eq $script:BundleA) 'export publishes opaque encrypted bundle'
@@ -127,8 +129,9 @@ try {
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
     Assert ($failure.Exception.Data['backendResult'].journal -eq 'fixture/recovery/pending.json') 'failure must preserve backend recovery journal data'
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
-    # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판과 바이트 동일해야 한다.
-    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '97405AABD4B533974D070CA6F7A69B1C1CE537F094489D4924FC32F1F8977823') 'Claude worker copy must match the audited usability version'
+    # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판에, ctxhop 0.2.0-gui.2 고정과
+    # Claude 세션 옆 폴더(하위 에이전트·도구 결과) 복원 확인을 더한 판과 바이트 동일해야 한다.
+    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '2B0C34C9402B8A98AA27F0E1468F392FCDD374B60AEDB41E2D0863C4FE550E0F') 'Claude worker copy must match the reviewed version'
     Throws {Assert-FrozenFile (Join-Path $testDirectory 'nonexistent.py') ''} '준비되지'
     Throws {Assert-BundleId '../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'} '잘못된'
     Throws {Assert-BundleId 'peer-a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'} '잘못된'

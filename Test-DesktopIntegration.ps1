@@ -35,6 +35,7 @@ try {
                 $m=[Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
                 Assert ((@($m.PSObject.Properties.Name) | Sort-Object) -join ',' -eq 'cliVersion,historyMode,recordCount,sessionId,sourceCwd,title,updatedAt') 'metadata has the exact seven fields'
                 Assert (-not @($m.PSObject.Properties.Value | Where-Object { $_ -is [string] -and $_ -match "[`0`r`n]" })) 'metadata strings have no NUL or line breaks (bundle rule)'
+                Assert ($m.historyMode -ceq 'paginated;family=0') 'backups mark the subagent family format (no subagents here)'
                 $id='peer-fixture/'+[guid]::NewGuid().ToString('N')
                 Copy-Item -LiteralPath $Arguments[[array]::IndexOf($Arguments,'--input')+1] -Destination (Join-Path $remote $id.Split('/')[1])
                 return [pscustomobject]@{id=$id}
@@ -59,7 +60,7 @@ try {
     Assert ($row[0].archived -is [bool]) 'archived must be bool'
     $date=[datetime]::MinValue
     Assert ([string]$row[0].updatedAt -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$' -and [datetime]::TryParse([string]$row[0].updatedAt,[ref]$date)) 'updatedAt must be RFC3339 that the GUI date filter parses'
-    Assert ($row[0].historyMode -eq 'paginated') 'native fixture is paginated'
+    Assert ($row[0].historyMode -eq 'paginated' -and $row[0].children -eq 0) 'native fixture is paginated and has no subagents'
     $found=Invoke-JobCore @{action='List';agent='codex-desktop';home=$fixtureHome;search=$thread.Substring(0,13)}
     Assert (@($found.sessions).Count -eq 1) 'search is passed to backend'
 
@@ -90,7 +91,7 @@ try {
     $restore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.bundle.id}
     $p=Invoke-JobCore $restore
     Assert ($p.preview.status -eq 'new' -and $p.preview.source.sessionId -eq $thread) 'receiver previews the downloaded backup as new with the same UUID'
-    Assert ($p.preview.source.cliVersion -eq $env:CTXHOP_TEST_ENGINE) 'backup records the engine version'
+    Assert ($p.preview.source.cliVersion -eq $env:CTXHOP_TEST_ENGINE -and $p.preview.source.children -eq 0) 'backup records the engine version and its subagent count'
     Assert (-not @(Get-ChildItem -LiteralPath $receiver -Force)) 'preview never writes the receiver store'
     $restore.action='Restore'; $restore.receipt=$p.receipt; $restore.token=$p.preview.token; $restore.choice='incoming'
 

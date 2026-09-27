@@ -92,6 +92,73 @@
   - 취소한 Codex 백업의 평문 사본은 `staging`에 남고, 공유 저장소에는 목록에 보이지 않는 chunk만 남을 수 있습니다(F8). Claude `push`를 중간에 끊었을 때의 원자성은 확인하지 않았습니다.
 - **독립 감사**: 첫 감사는 FAIL(F1 빈 `bindings`에서 등록 실패, F2 PID 재사용으로 다른 프로그램 종료 가능)이었습니다. F1~F6·F9를 고치고 F7·F8은 위 제한으로 적었습니다.
 
+## 하위 에이전트 대화 묶음 (2026-09-27)
+
+사용자 요청: 하위 에이전트 대화는 목록에 따로 싣지 않고 부모 대화와 함께 옮깁니다. Codex Desktop과 Claude Code 모두 해당합니다. 전체 백업·프로젝트 필터 판(`20260927.2` 후보)은 공개하지 않고 이 변경과 함께 한 판으로 냅니다.
+
+**Codex Desktop (백엔드 묶음 형식 2)**
+
+- **목록**: `source`가 `{"subagent":…}`인 대화는 싣지 않습니다. 부모 행에는 `thread_spawn_edges`를 따라간 하위 대화 수(`children`)와 묶음에서 가장 늦은 수정 시각(`updatedAt`)을 싣습니다. 부모 대화가 없는 하위 대화는 어느 묶음에도 들지 않아 보이지 않고 백업되지 않습니다. 위 표의 "하위 에이전트 대화" 행에 적은 "작업 불가" 표시는 없앴습니다.
+- **백업**: 부모 대화를 고르면 부모와 모든 하위 대화(중첩 포함), 그리고 연결(부모·자식·상태)을 한 파일에 담습니다. 파일 구성은 `manifest.json`(format 2), `data.json`(`{members, edges}`), `rollouts/NNNN.jsonl`입니다.
+  - 하위 대화 ID를 직접 고르면 "부모 대화를 선택하세요"로 멈춥니다.
+  - 공유 백업 메타데이터의 `historyMode` 끝에 `;family=N`을 붙여 이전 형식과 구분합니다.
+  - 이전 형식(format 1, 대화 하나) 백업도 읽고 복원합니다. 목록에는 `· 이전 형식`으로 표시하고, 전체 백업에서는 최신 백업으로 치지 않습니다.
+- **미리보기**: 대화별 상태(새로, 같음, 이어짐, 갈라짐, 이 PC가 더 최신, 이 PC에만)를 묶음 상태 하나로 합칩니다.
+  - 하나라도 갈라지면 묶음 전체가 갈라짐입니다. 쓸 대화가 없고 이 PC가 더 최신이거나 이 PC에만 있는 하위 대화가 있으면 "이 PC가 더 최신"입니다.
+  - 이유 칸에 하위 대화 상태별 개수를 붙입니다.
+  - 가져올 하위 대화가 이 PC에서 다른 부모에 연결돼 있거나, 두 PC의 연결 경로가 다르면 쓰기 전에 멈춥니다.
+  - 검사 토큰에 이 PC 묶음 전체의 해시가 들어갑니다. 미리보기 뒤 하위 대화가 바뀌면 다시 검사해야 합니다.
+- **복원**: 새로, 이어짐, 갈라짐인 대화만 씁니다. 이 PC가 더 최신이거나 이 PC에만 있는 하위 대화는 그대로 둡니다. 연결은 새로 넣거나 상태만 바꿉니다.
+- **복구 기록(version 2)**: 다음을 남깁니다.
+  - `before.zip`: 이 PC 묶음 전체(format 2, 이 PC 엔진 버전 기록). 다시 가져올 수 있습니다.
+  - 대화별 `incoming-NNNN.zip`과 `stage-NNNN`
+  - 넣거나 바꾼 연결과 그 이전 상태
+- **`recover`**: 새로 만든 대화와 연결을 지우고, 바꾼 연결은 이전 상태로, 바꾼 대화는 원래대로 되돌립니다.
+  - 중단 뒤 새 대화에 다른 작업이 연결됐거나 연결 상태가 바뀌었으면 쓰기 전에 멈춥니다.
+  - 이전 판이 남긴 복구 기록(version 없음, `incoming.zip`·`undo`)도 복구합니다.
+- **Worker·GUI**: Worker는 목록 행의 `children`이 0 이상 정수인지 확인하고, 공유 백업은 `historyMode`의 `;family=N`에서 읽습니다. 백엔드 고정 해시도 새 값으로 바꿨습니다. GUI 맥락 칸에는 `· 하위 N`이나 `· 이전 형식`이 나옵니다.
+- **백엔드 시험 8개 추가(전체 34개)**: `test_27`~`test_34`
+  - 중첩 묶음 왕복과 목록
+  - 이 PC가 더 최신인 하위 대화 유지
+  - 갈라짐은 묶음 하나의 선택
+  - 복구가 새 하위 대화와 연결을 지움
+  - 중단 뒤 연결이 더해졌으면 복구 거부
+  - 이전 형식 백업과 이전 복구 기록
+  - 형식 검증과 다른 부모에 연결된 하위 대화
+  - 가져온 하위 대화를 실제 엔진이 읽음
+- **실제 데이터(이 PC `~\.codex`를 읽기 전용으로)**:
+  - 최상위 대화 1,568개 중 1,532개가 묶음 검사를 통과했습니다. 하위 대화가 있는 묶음은 219개, 가장 큰 묶음은 대화 113개·239MB, 가장 느린 묶음 검사는 2.7초였습니다.
+  - 실패 36개는 동적 도구 30, 경로 불일치 3, 레코드 크기 2, 1GiB 초과 1입니다. 모두 최상위 대화 자체가 이전 판에서도 막히던 경우이고, 하위 대화 때문에 새로 막힌 묶음은 없었습니다.
+  - 작은 묶음 4개(중첩 연결, 닫힌 연결 포함)를 격리 폴더로 백업 → 미리보기 → 복원 → 재검사했습니다. 네 묶음 모두 대화 내용과 연결(부모·자식·상태)이 원본과 같았습니다. 재검사는 `equal`이었고, 목록에는 부모 하나와 하위 N개가 나왔고, 모든 대화의 작업 폴더가 복원 폴더로 바뀌었습니다. 격리한 실제 엔진은 가져온 대화를 모두 `thread/read`로 읽었습니다.
+
+**Claude Code (`ctxhop 0.2.0-gui.2`)**
+
+- `ctxhop-claude.exe`를 `0.2.0-gui.1`에서 고쳐 다시 빌드했습니다. push가 세션 옆 `<세션ID>\` 폴더를 암호화한 sidecar로 함께 올리고, 실제 resume(미리보기 제외)이 복원한 세션 파일 옆에 되돌립니다. 이 PC에만 있는 파일은 지우지 않고, 바꾸는 파일의 원본은 `--sidecar-backup` 폴더에 남깁니다. 변경, 시험, 빌드 명령은 `claude-source\PATCH-NOTES.md`에 있습니다.
+  - `go test -count=1 ./...`: 시험이 있는 14개 패키지 모두 통과. `go vet ./...`: 출력 없음. `gofmt`: 바뀐 파일 없음. `TMP`·`TEMP`·`GOTMPDIR`는 `D:\Go\temp`였습니다.
+  - 네 번 따로 빌드해 모두 같은 해시가 나왔습니다. 그중 한 번은 패키지에 넣은 `claude-source\`에서 빌드했습니다.
+  - `claude-source\ctxhop-gui2-sidecar.patch`를 gui.1 소스에 적용하면 이 판의 Go 파일과 똑같아집니다.
+- `ClaudeWorker.ps1`:
+  - 복원 실행 파일의 고정 해시와 버전을 gui.2로 바꿨습니다. 버전 확인은 `0.2.0`, `0.2.0-gui.1`, `0.2.0-gui.2`를 받습니다.
+  - Claude Code 복원에 `--sidecar-backup <복구 기록 이름>.companion`을 넘깁니다. 복구 기록에는 `companionBackup`, 완료 기록에는 `sidecar` 결과를 남깁니다. Codex CLI 복원에는 넘기지 않습니다.
+  - 결과의 `sidecar`가 없거나 상태·개수가 틀리면 복원 완료로 기록하지 않고 pending을 남깁니다.
+  - 완료 메시지에 옮긴 파일 수와 남긴 원본 수를 보여 줍니다. 이전 판 백업이라 옆 폴더가 없으면 그렇다고 알립니다.
+- `Test-ClaudeWorker`: 성공, `absent`, 잘못된 결과 4종(없음·모르는 상태·음수·문자열 개수), `--sidecar-backup` 인자와 복구 기록 경로, Codex CLI 복원에는 넘기지 않는 것을 확인합니다.
+
+**변이 검사**: 새 보호 장치를 하나씩 뺀 변이 사본 14개에서 해당 시험이 모두 실패했습니다.
+
+- Worker 2개: 음수 하위 대화 수 통과, 이전 형식 백업을 묶음으로 봄
+- GUI 4개: 이전 형식 백업을 최신으로 봄, `· 하위 N` 표시 없음, F1, F4
+- ClaudeWorker 3개: 옆 폴더 결과 검사 없음, `--sidecar-backup` 없음, 이전 판 백업 안내 없음
+- 백엔드 5개: 목록에 하위 대화 표시, 연결을 쓰지 않음, 이 PC가 더 최신인 하위 대화를 덮어씀, 복구가 새 연결을 남김, `before.zip`에 부모만 저장
+
+**`20260927.2` 후보 독립 감사의 비차단 지적(F1~F5) 반영**
+
+- F1: 원본 폴더가 비어 있는 이 PC 대화가 프로젝트 필터와 전체 백업에 들어갔습니다. 이제 로컬 행은 원본 폴더가 없으면 필터에서 빠집니다. 원본 폴더를 모르는 공유 백업은 그대로 보입니다.
+- F2: 사용자가 고른 규칙에 없던 "연속 3개 실패 시 멈춤"을 시작 전 확인 창에 적었습니다.
+- F3: 두 번째 취소(작업 창 즉시 종료)를 거친 전체 백업 종료 경로에 시험을 더했습니다.
+- F4: 목록 다시 불러오기가 취소되거나 실패하면 전체 백업 요약을 비웁니다. 나중의 다른 목록에 요약이 나오지 않습니다.
+- F5: "이 프로젝트 대화만을 끄면 …보관 대화를 봅니다"가 켠 상태에서는 보관 대화가 숨는 것처럼 읽혀, 문구를 고쳤습니다.
+
 ## 실행한 검사 (Windows PowerShell 5.1, Python 3.12.14 Codex 번들, 엔진 `0.158.0-alpha.2.1`)
 
 | 검사 | 결과 | 원시 로그 |
@@ -112,6 +179,19 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 감사 지적을 고친 뒤 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1342, `Test-DesktopWorker` 61, `Test-DesktopGUI` 27, `Test-ClaudeGUI` 115, `Test-ClaudeWorker` 41 groups·672 assertions, `Test-DesktopIntegration` 32.
 
 폴더 선택 오류를 고친 뒤 6개를 `powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File`로 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1342, `Test-DesktopWorker` 61, `Test-DesktopGUI` 27, `Test-ClaudeGUI` 119, `Test-ClaudeWorker` 41 groups·672 assertions, `Test-DesktopIntegration` 32. 고친 문제는 칸이 비었거나 잘못된 문자가 든 경로에서 **폴더 선택** 세 곳과 **다른 PC용 초대 만들기**가 `LiteralPath` 또는 `Illegal characters in path` 오류를 내던 것과, 공백만 든 칸을 대화 상자의 시작 폴더로 넘기던 것입니다. 새 `Test-ClaudeGUI` 검사는 네 버튼을 빈 칸·공백·`a|b`로 눌러 보며, 이전 검사식으로 되돌린 변이 사본에서 실패합니다.
+
+전체 백업과 프로젝트 필터를 넣은 뒤 6개를 같은 명령(`RemoteSigned`)으로 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1404, `Test-DesktopWorker` 61, `Test-DesktopGUI` 41, `Test-ClaudeGUI` 119, `Test-ClaudeWorker` 41 groups·672 assertions, `Test-DesktopIntegration` 32.
+- 바꾼 파일은 `GUI.ps1`, `Strings.ps1`, `Test-DesktopGUI.ps1`, README 두 개와 이 문서입니다. Worker와 백엔드는 바꾸지 않았습니다. **필터된 대화 모두 백업**은 기존 한 대화 백업 작업을 GUI가 차례로 실행합니다.
+- 새 `Test-DesktopGUI` 검사는 합성 행으로 다음을 확인합니다.
+  - 프로젝트 필터: `\\?\` 접두사, 대소문자, 끝의 `\`, 하위 폴더, 이름만 비슷한 폴더(`AI논문2`), 이름만 같은 이 PC 폴더와 공유 백업의 차이, 원본 폴더를 모르는 공유 백업.
+  - 전체 백업: 같은 UUID·같은 수정 시각의 공유 백업이 있는 대화와 하위 에이전트 대화를 건너뜀, 시작 전 개수 확인, 한 개씩 실행, 실패해도 계속하고 끝에 한 번 요약, 연속 3개 실패 시 멈춤, 결과 없이 끝난 작업 창을 실패 한 건으로 셈, 첫 취소는 지금 대화를 마친 뒤 멈춤, 끝난 뒤 목록 다시 불러오기.
+- 위 여덟 가지 규칙을 하나씩 뺀 변이 사본 8개에서 `Test-DesktopGUI`가 모두 실패했습니다.
+- 한국어·English 창을 그려 **이 프로젝트 대화만**과 **필터된 대화 모두 백업**이 잘리지 않는 것을 봤습니다. Codex Desktop에서는 늘 꺼져 있던 **선택한 대화 열기** 자리에 **필터된 대화 모두 백업**이 나옵니다.
+- 실제 Codex 대화와 Drive 저장소로 전체 백업을 돌려 보지는 않았습니다. 한 대화 백업 경로는 기존 `Test-DesktopWorker`·`Test-DesktopIntegration`이 확인합니다.
+
+하위 에이전트 대화 묶음과 F1~F5 수정을 넣은 뒤 6개를 같은 명령(`RemoteSigned`)으로 다시 실행했고 모두 종료 코드 0이었습니다: `Test-Strings` 1424, `Test-DesktopWorker` 64, `Test-DesktopGUI` 47, `Test-ClaudeGUI` 119, `Test-ClaudeWorker` 46 groups·772 assertions, `Test-DesktopIntegration` 33.
+- `backend\test_suite.py`(일반·위험 원본 정책 2회, 엔진 `0.158.0-alpha.2.1`)는 각 34/34 통과, `ok: true`였습니다.
+- 그 전 실행에서는 위험 원본 정책 쪽 26개가 실패했습니다. 산출물 폴더 경로가 길어 새 세션 파일 경로가 260자를 넘은 탓으로, 아래 제약의 "Python은 260자를 넘는 경로를 읽지 못합니다"와 같은 원인입니다. 짧은 폴더에서 다시 실행해 위 결과를 얻었습니다.
 
 - 전송(`bin\ctxhop.exe`)은 PowerShell 테스트에서 mock이고, 성공 경로의 mock은 bundle 메타데이터 규칙(정확한 7개 필드, BOM 없음, NUL·줄바꿈 없음)을 확인합니다.
 - `backend\test_guard_shim.py`는 시험 전용이며 앱 종료 검사와 엔진 버전 조회만 바꿉니다(엔진은 환경변수 값). Worker·GUI는 이 파일을 호출하지 않습니다. `Test-DesktopIntegration.ps1`의 성공 경로를 다른 PC에서도 다시 돌릴 수 있도록 패키지에 남겨 두었습니다.
@@ -134,30 +214,40 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 - 바로가기 방식 비교(Windows 11 25H2, 기본 터미널 설정 없음): `.cmd`를 여는 바로가기는 Windows Terminal 창이 잠깐 보였고, PowerShell을 최소화로 직접 여는 바로가기는 콘솔 창이 한 번도 보이지 않았습니다.
 - 덮어 설치·제거 시험 전후로 `%LOCALAPPDATA%\CtxHopGUI`와 실제 설치본은 바뀌지 않았습니다. 마법사 시험에서 띄운 GUI는 시험 폴더를 `LOCALAPPDATA`로 써서 설정을 거기에 저장했습니다.
 
+하위 에이전트 대화 묶음 판(`20260927.2`)도 같은 방식으로 시험했습니다.
+
+- `20260927.1` 시험용 빌드 위에 덮어 설치했습니다. 이전 폴더를 그대로 썼고, 앱 목록 버전은 `2026.09.27.2`, 제거 프로그램은 `unins000` 하나였습니다. 패키지 파일 838개(`claude-source\` 401개 포함)가 해시까지 같았습니다.
+- 설치된 복사본에서 시험 6개를 `RemoteSigned`로 실행해 모두 통과했습니다. mutex를 잡은 동안 설치·제거가 멈추는 것, 제거 뒤 `backend\runtime.json`만 남는 것, 인터넷 출처 표시가 없는 것도 확인했습니다.
+- 설치 마법사(한국어·English)도 앞과 같이 세 화면이었고, 완료 뒤 실행한 GUI는 64비트 PowerShell에서 콘솔 창 없이 떴습니다.
+- 처음 시험에서는 제거 로그가 `unins000`·`unins001` 둘로 나뉘었습니다. 이전 판으로 쓴 시험용 빌드가, 나중에 버린 초기 `.iss`(64비트 설치 모드)로 만든 옛 파일이었기 때문입니다. Inno Setup은 설치 모드(32·64비트)가 같은 로그에만 이어 씁니다. 공개된 `.1`과 같은 설정(32비트 모드)의 시험용 빌드로 다시 해 통과했습니다. 이 PC 실제 설치본의 제거 로그도 32비트 모드 헤더(`Inno Setup Uninstall Log (b)`)임을 읽기 전용으로 확인했습니다.
+
 설치 파일은 서명이 없어 SmartScreen 경고가 뜰 수 있으며, 실제 SmartScreen 창과 다른 PC 설치는 확인하지 않았습니다.
 
 ## 고정 해시 (SHA-256)
 
 | 파일 | SHA-256 |
 |---|---|
-| `backend\desktop_sessions.py` (Worker 고정) | `C47841453AFB902CE9C409062C5F645359BD26654186F292D182BDD1E53115BE` |
+| `backend\desktop_sessions.py` (Worker 고정, 하위 대화 묶음) | `FB1BB0160AEE8606A7D4057FE6BD2416801DAED3F85B3B48320D54FFB612DA1B` |
 | `backend\Invoke-Desktop.ps1` (수동 복구 진입점) | `563FA5BD89A24D4FB12C176BF199143A76E399CFD5FBDD107DD2A5490B3A789A` |
 | `backend\schema.json` (백엔드 고정) | `D24ACAC2105569B5B9CFDABC5259DB8217B9A9F175D7D2B57A09A2D4F76FA0A2` |
 | `bin\ctxhop.exe` (bundle 전송, Worker 고정, 변경 없음) | `9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006` |
-| `bin\ctxhop-claude.exe` (`0.2.0-gui.1`, 변경 없음) | `A1702CE1839AF90C0DDB87E7C07F1BE7899BE8EBDD9117FE680D2EC9739C233D` |
-| `ClaudeWorker.ps1` (안정판 `D08E9A15…`에서 문장을 `Strings.ps1`로 옮기고 언어 적용·실패 이유·겹친 등록 차단·등록 해제·암호 변경/초기화 추가) | `97405AABD4B533974D070CA6F7A69B1C1CE537F094489D4924FC32F1F8977823` |
-| `Worker.ps1` (결과 파일 경로 보관 수정, 언어 선택) | `C8AA63D2F8F853A77B5AD48F6E74468E777FA3EDF76C8DF5AC0539F81FE59EA8` |
-| `GUI.ps1` (언어 선택, 사용성 개선, 폴더 선택 빈 칸 오류 수정) | `507B9BF23CBC4CED31568F2B76AD3DE4044E842B865424F7D4A54D5FCD1F04CC` |
-| `Strings.ps1` (한국어·영어 문장 표) | `E04493D126B9EEBEE2A8A4B56C6A42B814E01766DB70FFCD634483382A4BE75A` |
+| `bin\ctxhop-claude.exe` (`0.2.0-gui.2`, 대화 옆 폴더, ClaudeWorker 고정) | `15CE00DC32BE07ECF089F5D49154469A4B259E1B7EB0ED0123C0FE57152BFC2B` |
+| `ClaudeWorker.ps1` (안정판 `D08E9A15…`에서 문장을 `Strings.ps1`로 옮기고 언어 적용·실패 이유·겹친 등록 차단·등록 해제·암호 변경/초기화·대화 옆 폴더 복원 추가) | `2B0C34C9402B8A98AA27F0E1468F392FCDD374B60AEDB41E2D0863C4FE550E0F` |
+| `Worker.ps1` (결과 파일 경로 보관 수정, 언어 선택, 하위 대화 수) | `A4C920C6C4E9500045567D4ECC9032D41742DD01E620BAF71A6189F7F6C46CAE` |
+| `GUI.ps1` (언어 선택, 사용성 개선, 폴더 선택 빈 칸 오류 수정, 전체 백업, 프로젝트 필터, 하위 대화 표시) | `41598C0687E60BBA2FF961F7B1103A2103FEE49C3FFF38D1AA5CC96F13A9760B` |
+| `Strings.ps1` (한국어·영어 문장 표) | `0EA6ED281CDA4A5372212AFA3DFC4C0ECE756D8364B6381AEB9E1F2B8080C8C4` |
 
-`transport-source\`와 `bin\ctxhop.exe`는 노트북 세션 결과를 그대로 옮겼습니다. 이 PC에는 Go가 없어 Go 시험을 다시 실행하지 않았고, 기록된 결과(`transport-source\verification-results\`: 전체 suite 통과, race는 gcc 부재로 미실행)를 근거로 둡니다.
+`transport-source\`와 `bin\ctxhop.exe`는 노트북 세션 결과를 그대로 옮겼습니다. 이 둘의 Go 시험은 다시 실행하지 않았고, 기록된 결과(`transport-source\verification-results\`: 전체 suite 통과, race는 gcc 부재로 미실행)를 근거로 둡니다. `bin\ctxhop-claude.exe`는 이 PC에서 휴대용 Go 1.27.1로 빌드했고, 소스·패치·시험 로그는 `claude-source\`에 있습니다.
 
 ## 남은 제약
 
 - **두 PC 실제 왕복 미실행**: 실제 사용자 대화의 백업→Drive→복원→앱 화면 확인은 실행하지 않았습니다. 이 PC에서 Codex 앱이 실행 중이라 실제 앱 종료 검사를 통과하는 CLI 성공 경로도 실행하지 않았고, 같은 코드는 guard를 바꾼 시험으로만 확인했습니다. 새로 가져온 세션이 Desktop 앱 사이드바에 보이는지도 확인하지 못했습니다.
 - 두 PC의 Codex Desktop 엔진 버전이 같아야 가져올 수 있습니다. 첫 왕복 전에 노트북 버전을 확인하세요.
 - 두 SQLite DB와 세션 파일의 원자적 갱신은 보장하지 않으며, 중단 기록과 선택 세션 원본으로 복구합니다. 복구가 멈추는 경우는 README의 수동 절차를 따릅니다(GUI 복구 화면 없음).
-- 동적 도구가 등록된 세션, 알 수 없는 DB 구조, 지원하지 않는 엔진 버전은 차단합니다. 하위 에이전트 대화는 단독 백업이 안 되며 부모 대화를 백업해야 합니다(부모 백업에 하위 대화가 함께 들어가는지는 확인하지 않았음). 이 PC 실제 목록 기준으로 하위 에이전트가 아닌 대화 1,565개 중 1,528개가 백업 가능하고, 나머지는 동적 도구 30·경로 불일치 3·레코드 크기 2·1GiB 초과 1·`session_id` 1로 차단됩니다(2차 감사의 읽기 전용 집계).
+- 동적 도구가 등록된 세션, 알 수 없는 DB 구조, 지원하지 않는 엔진 버전은 차단합니다. 하위 에이전트 대화는 부모 대화와 한 묶음으로만 옮기며, 묶음 안의 대화 하나라도 차단 대상이면 묶음 전체를 차단합니다. 이 PC 실제 목록의 묶음 검사 결과는 위 "하위 에이전트 대화 묶음" 절에 있습니다.
+- **묶음의 작업 폴더**: 복원하면 묶음의 모든 대화가 복원 때 고른 작업 폴더를 씁니다. 하위 대화가 원래 다른 폴더에서 실행됐다면 그 폴더 정보는 이 PC에 옮겨지지 않습니다.
+- **Claude 대화 옆 폴더**: 파일을 그대로 복사하며 파일 안의 경로를 이 PC에 맞게 바꾸지 않습니다. 이전 판으로 만든 백업에는 옆 폴더가 없습니다. 옆 폴더는 gui.2 `push`만 올리므로, 그 뒤 다른 ctxhop(예: Claude Code hook의 자동 push)이 대화만 올렸다면 복원되는 옆 폴더는 마지막 GUI 백업 때의 내용입니다. 이때 바뀌는 이 PC 파일의 원본은 `.companion` 폴더에 남습니다.
+- **두 PC 모두 새 판 필요**: 이전 판 GUI는 묶음 형식(format 2) Codex 백업을 읽지 못하고 쓰기 전에 멈춥니다. 이전 판으로 만든 백업에는 하위 대화와 Claude 옆 폴더가 없으므로, 새 판으로 다시 백업해야 함께 옮겨집니다.
 - 앱 종료 검사는 프로세스 이름으로 모든 Codex 실행 파일을 막지만, 버전 확인은 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` 중 최신 파일만 봅니다. 이 PC에는 `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`(`0.155.1`, 다른 앱이 실행)도 있고 같은 `~\.codex`를 씁니다. 실행 중이면 종료 검사가 막지만, 복원 뒤 이 엔진이 가져온 대화를 열면 버전 차이의 영향은 시험하지 않았습니다.
 - 가져오기 중 DB 파일이 새로 만들어지다 중단되면 `recover`가 멈출 수 있습니다. 이때는 README의 수동 절차(pending 폴더 옮기기)를 따릅니다.
 - 건너뛰거나 취소한 미리보기의 staging 폴더(내려받은 평문 사본)는 자동으로 지우지 않습니다. 필요 없으면 사용자가 지웁니다.

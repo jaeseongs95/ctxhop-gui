@@ -87,6 +87,7 @@ function Reset-Fixture {
     $script:ProcessQueryError = $false
     $script:ApplyBehavior = 'valid'
     $script:ApplyAgent = 'claude-code'
+    $script:SidecarResult = [pscustomobject]@{state='restored'; files=3; written=2; unchanged=1; backedUp=1}
     $script:RuntimeChecks = 0
     $script:RuntimeAllowed = $true
     $script:SkipMarkerPresent = $true
@@ -124,6 +125,7 @@ function Assert-OriginalJournal([object]$Record, [string]$Agent = 'claude-code')
 function New-RestoreResult([string]$Id, [string]$Agent) {
     $result=[pscustomobject]@{session=$Id; agent=$Agent; workspace='consistent'}
     if ($script:SkipMarkerPresent) { $result | Add-Member environmentSkipped $script:SkipMarkerValue }
+    if ($Agent -eq 'claude-code' -and $null -ne $script:SidecarResult) { $result | Add-Member sidecar $script:SidecarResult }
     return $result
 }
 function Invoke-IsolatedRestoreGate([string]$Exe, [string]$Hash, [string]$Version, [switch]$HashFailure) {
@@ -197,6 +199,11 @@ try {
                 $pending=Read-Pending
                 $agentIndex=[array]::IndexOf($Arguments,'--agent')
                 $selectedAgent=$Arguments[$agentIndex+1]
+                # Claude 옆 폴더에서 바뀌는 파일의 원본은 이 복원 기록 옆 .companion 폴더에 남긴다. Codex CLI는 옆 폴더가 없다.
+                $companion=@(Get-ChildItem -LiteralPath $script:TestJournalRoot -Filter '*.pending.json' -File)[0].FullName.Replace('.pending.json','.companion')
+                $backupIndex=[array]::IndexOf($Arguments,'--sidecar-backup')
+                if ($selectedAgent -eq 'codex') { Assert ($backupIndex -lt 0 -and $null -eq $pending.companionBackup) 'Codex restore has no companion backup' }
+                else { Assert ($backupIndex -ge 0 -and $Arguments[$backupIndex+1] -eq $companion -and $pending.companionBackup -eq $companion -and $Arguments[-1] -notmatch 'companion') 'Claude restore keeps replaced companion files beside its journal' }
                 if ($selectedAgent -eq 'codex') {
                     Assert-OriginalJournal $pending 'codex'
                     Write-Codex
@@ -498,6 +505,8 @@ try {
         $record=Get-Content -LiteralPath $completed[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-OriginalJournal $record
         Assert ($record.restoredSha256 -eq (Get-FileHash -LiteralPath $script:ClaudeFile -Algorithm SHA256).Hash) 'completed journal must record restored SHA256'
+        Assert ($record.sidecar.state -eq 'restored' -and $record.sidecar.backedUp -eq 1 -and $record.companionBackup -like '*.companion') 'completed journal records the companion folder result and backup folder'
+        Assert ($result.message -like '*파일 3개*' -and $result.message -like '*복구 폴더에 남긴 파일 1개*') "restore message reports subagent files: $($result.message)"
         $null=Assert-NativeMapping 'claude-code' $script:ClaudeId $script:Project -Required
         $call=@(Get-ApplyCalls)[0]
         Assert ($call.Arguments[-1] -eq $script:ClaudeRemote -and $call.Arguments -contains '--no-workspace-context' -and $call.Arguments -contains '--no-environment') 'restore must use remote ID and disable context/environment application'
@@ -529,6 +538,7 @@ try {
         Assert ($completed.Count -eq 1) 'Codex produces completed journal'
         $record=Get-Content -LiteralPath $completed[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-OriginalJournal $record 'codex'
+        Assert ($result.message -notlike '*하위 에이전트*' -and $null -eq $record.sidecar) 'Codex CLI restore has no companion folder result'
         Assert ($record.restoredSha256 -eq (Get-FileHash -LiteralPath $script:CodexFile -Algorithm SHA256).Hash) 'Codex completed journal records restored SHA'
         $null=Assert-NativeMapping 'codex' $script:CodexId $script:Project -Required
         Assert-NoPending
@@ -575,6 +585,25 @@ try {
             }
         }
     }
+    Test-Group 'backup made by an older release restores without the companion folder and says so' {
+        $script:SidecarResult=[pscustomobject]@{state='absent'; files=0; written=0; unchanged=0; backedUp=0}
+        $result=Invoke-Job (New-Job 'Restore')
+        Assert ($result.message -like '*이전 판*다시 백업*') "older backup is explained: $($result.message)"
+        Assert-NoPending
+    }
+    foreach ($sidecarVariant in @('missing','unknown-state','negative-count','string-count')) {
+        Test-Group "unverified companion folder result $sidecarVariant retains pending" {
+            switch ($sidecarVariant) {
+                missing { $script:SidecarResult=$null }
+                unknown-state { $script:SidecarResult.state='partial' }
+                negative-count { $script:SidecarResult.written=-1 }
+                string-count { $script:SidecarResult.files='3' }
+            }
+            Assert-Throws { Invoke-Job (New-Job 'Restore') } '도구 결과|pending' "companion result $sidecarVariant rejected"
+            Assert-OriginalJournal (Read-Pending)
+            Assert (@(Get-ChildItem -LiteralPath $script:TestJournalRoot -Filter '*.completed.json' -File).Count -eq 0) 'unverified companion folder result must not complete journal'
+        }
+    }
     Test-Group 'actual restored file ID mismatch retains pending' {
         $script:ApplyBehavior='wrong-file-id'
         Assert-Throws { Invoke-Job (New-Job 'Restore') } '실제 ID|프로젝트' 'actual restored file ID rejected'
@@ -603,12 +632,12 @@ try {
         Assert ($script:CtxCalls.Count -eq 0) 'version failure prevents ctxhop session operations'
     }
     Test-Group 'general operations accept only official or the pinned custom version' {
-        foreach ($version in @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1')) {
+        foreach ($version in @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1','ctxhop 0.2.0-gui.2')) {
             $script:FakeCtxVersion=$version
             Assert-CtxVersion
             Assert ($true) "general version $version accepted"
         }
-        foreach ($version in @('ctxhop 0.2.0-gui.2','ctxhop 0.2.0-gui.1 extra','ctxhop 0.2.0-unknown','ctxhop 0.1.9')) {
+        foreach ($version in @('ctxhop 0.2.0-gui.3','ctxhop 0.2.0-gui.2 extra','ctxhop 0.2.0-unknown','ctxhop 0.1.9')) {
             $script:FakeCtxVersion=$version
             Assert-Throws { Assert-CtxVersion } '버전|0.2.0' "general version $version rejected"
         }
@@ -629,15 +658,15 @@ try {
     Test-Group 'real restore gate accepts only bundled path plus pinned hash plus custom version' {
         Assert ($script:RestoreBinarySHA256 -cmatch '^[A-Fa-f0-9]{64}$') 'Worker must contain an actual pinned SHA256, not a build placeholder'
         $expected=Join-Path $PSScriptRoot 'bin\ctxhop.exe'
-        Invoke-IsolatedRestoreGate $expected $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.1'
+        Invoke-IsolatedRestoreGate $expected $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.2'
         Assert ($true) 'bundled pinned custom runtime accepted'
         $fallback=Join-Path $script:CaseRoot 'official-ctxhop.exe'
-        Assert-Throws { Invoke-IsolatedRestoreGate $fallback $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.1' } '포함|실행 파일' 'custom version outside bundled path rejected'
-        Assert-Throws { Invoke-IsolatedRestoreGate $expected ('0'*64) 'ctxhop 0.2.0-gui.1' } 'SHA256' 'bundled custom version with wrong binary hash rejected'
-        foreach ($version in @('ctxhop 0.2.0','ctxhop 0.2.0-gui.2','ctxhop 0.2.0-gui.1 extra')) {
+        Assert-Throws { Invoke-IsolatedRestoreGate $fallback $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.2' } '포함|실행 파일' 'custom version outside bundled path rejected'
+        Assert-Throws { Invoke-IsolatedRestoreGate $expected ('0'*64) 'ctxhop 0.2.0-gui.2' } 'SHA256' 'bundled custom version with wrong binary hash rejected'
+        foreach ($version in @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1','ctxhop 0.2.0-gui.2 extra')) {
             Assert-Throws { Invoke-IsolatedRestoreGate $expected $script:RestoreBinarySHA256 $version } '버전' "restore runtime $version rejected"
         }
-        Assert-Throws { Invoke-IsolatedRestoreGate $expected $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.1' -HashFailure } 'hash read failure' 'unreadable runtime hash rejected'
+        Assert-Throws { Invoke-IsolatedRestoreGate $expected $script:RestoreBinarySHA256 'ctxhop 0.2.0-gui.2' -HashFailure } 'hash read failure' 'unreadable runtime hash rejected'
         Assert ($script:NativeCalls.Count -eq 0) 'runtime gate tests must never invoke a real or fake native exe'
     }
     Test-Group 'nested project bindings with another identity are refused before ctxhop' {

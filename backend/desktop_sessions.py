@@ -24,6 +24,7 @@ SCHEMA_HASH = 'd24acac2105569b5b9cfdabc5259db8217b9a9f175d7d2b57a09a2d4f76fa0a2'
 FILES = ('state_5.sqlite', 'thread_history_1.sqlite')
 TABLES = ('thread_turns', 'thread_items', 'thread_history_projection_state', 'thread_realtime_items')
 LIMIT = 1024 * 1024 * 1024
+MAX_MEMBERS = 2000  # 한 묶음(부모 + 모든 하위 에이전트 대화)의 최대 대화 수
 LOCAL_FIELDS = ('project_id', 'thread_section_id', 'is_pinned', 'section_position',
     'section_entered_at_ms', 'creator_user_id', 'creator_account_id', 'sandbox_policy',
     'approval_mode', 'memory_mode', 'daybreak_enabled')
@@ -130,7 +131,8 @@ def create_database(path, name):
                 (version, description, success, base64.b64decode(checksum)))
 
 
-def records(raw, thread_id):
+def records(raw, thread_id, sessions=()):
+    # 하위 에이전트 대화의 헤더 session_id는 부모나 최상위 대화 ID다. sessions는 그 조상 ID들이다.
     if not raw or len(raw) > LIMIT or not raw.endswith(b'\n'):
         raise ValueError('세션 파일이 비었거나 불완전합니다.')
     result = []
@@ -144,7 +146,7 @@ def records(raw, thread_id):
     header = result[0]
     if header.get('type') != 'session_meta' or header['payload'].get('id') != thread_id:
         raise ValueError('세션 헤더 ID가 다릅니다.')
-    if header['payload'].get('session_id', thread_id) != thread_id:
+    if header['payload'].get('session_id', thread_id) not in (thread_id, *sessions):
         raise ValueError('세션 헤더 session_id가 다릅니다.')
     return result
 
@@ -180,8 +182,8 @@ def validate_row(row, table):
             raise ValueError('DB 값 형식이 올바르지 않습니다.')
 
 
-def canonical(raw, thread_id):
-    result = records(raw, thread_id)
+def canonical(raw, thread_id, sessions=()):
+    result = records(raw, thread_id, sessions)
     header = result[0]['payload']
     header['cwd'] = '<mapped-project>'
     header.pop('runtime_workspace_roots', None)
@@ -192,14 +194,12 @@ def canonical(raw, thread_id):
     return [digest(encoded(item)) for item in result]
 
 
-def validate(snapshot):
-    row = snapshot['data']['thread']
+def validate_member(member, sessions=()):
+    """묶음의 대화 하나(DB 행·이력·세션 파일)를 검사하고 세션 헤더를 돌려준다. sessions는 조상 대화 ID다."""
+    row = member['data']['thread']
     validate_row(row, 'threads')
     thread_id = native_id(row['id'])
-    result = records(snapshot['rollout'], thread_id)
-    header = result[0]['payload']
-    if snapshot['manifest'].get('engineVersion') not in VERSIONS:
-        raise ValueError('Desktop 버전이 다릅니다. 두 PC에서 지원 버전을 사용하세요.')
+    header = records(member['rollout'], thread_id, sessions)[0]['payload']
     if not isinstance(header.get('cli_version'), str) or not 0 < len(header['cli_version']) <= 200:
         raise ValueError('세션의 생성 버전 정보가 올바르지 않습니다.')
     if row['history_mode'] not in ('paginated', 'legacy'):
@@ -209,12 +209,9 @@ def validate(snapshot):
     roots = header.get('runtime_workspace_roots', [row['cwd']])
     if not isinstance(roots, list) or len(roots) > 100 or any(not isinstance(p, str) or not Path(p).is_absolute() for p in roots):
         raise ValueError('세션의 작업 폴더 목록이 올바르지 않습니다.')
-    if header.get('dynamic_tools') or snapshot['data'].get('dynamicTools'):
+    if header.get('dynamic_tools') or member['data'].get('dynamicTools'):
         raise ValueError('동적 도구가 등록된 세션은 현재 이식 지원 범위 밖입니다.')
-    expected = trusted_schema()
-    if snapshot['manifest']['schema'] != expected:
-        raise ValueError('보관 파일의 DB 구조가 지원 버전과 다릅니다.')
-    tables = snapshot['data']['history']
+    tables = member['data']['history']
     if set(tables) != set(TABLES):
         raise ValueError('이력 테이블 목록이 다릅니다.')
     for table, rows in tables.items():
@@ -228,13 +225,75 @@ def validate(snapshot):
                 if not isinstance(value, (str, int, float, type(None))):
                     raise ValueError('DB 값의 형식이 올바르지 않습니다.')
                 if key in ('rollout_byte_offset', 'rollout_end_byte_offset', 'next_rollout_byte_offset'):
-                    if value is not None and (type(value) is not int or not 0 <= value <= len(snapshot['rollout'])):
+                    if value is not None and (type(value) is not int or not 0 <= value <= len(member['rollout'])):
                         raise ValueError('이력 파일 위치가 범위를 벗어났습니다.')
-    return thread_id
+    return header
 
 
-def selected(home, thread_id):
-    check_schema(home)
+def is_subagent(source):
+    return source.startswith('{"subagent":')
+
+
+def ancestors(family):
+    """대화 ID마다 조상 ID 목록(부모부터 최상위까지)."""
+    ids = [member['data']['thread']['id'] for member in family['members']]
+    parents = {}
+    for edge in family['edges']:
+        if not isinstance(edge, dict) or set(edge) != {'parent_thread_id', 'child_thread_id', 'status'} or \
+                not all(isinstance(value, str) for value in edge.values()):
+            raise ValueError('하위 대화 연결 형식이 올바르지 않습니다.')
+        if edge['child_thread_id'] in parents:
+            raise ValueError('하위 대화 연결이 중복됐습니다.')
+        parents[edge['child_thread_id']] = edge['parent_thread_id']
+    if set(parents) != set(ids[1:]) or any(parent not in ids for parent in parents.values()):
+        raise ValueError('하위 대화 연결이 묶음과 맞지 않습니다.')
+    result = {}
+    for thread_id in ids:
+        chain, node = [], thread_id
+        while node != ids[0]:
+            node = parents[node]
+            if node == thread_id or node in chain:
+                raise ValueError('하위 대화 연결에 순환이 있습니다.')
+            chain.append(node)
+        result[thread_id] = chain
+    return result
+
+
+def validate_family(family):
+    """묶음 전체를 검사하고 최상위 대화 ID를 돌려준다. 첫 대화가 최상위이고, 나머지는 thread_spawn_edges로 이어진 하위 에이전트 대화다."""
+    manifest = family['manifest']
+    if manifest.get('engineVersion') not in VERSIONS:
+        raise ValueError('Desktop 버전이 다릅니다. 두 PC에서 지원 버전을 사용하세요.')
+    if manifest['schema'] != trusted_schema():
+        raise ValueError('보관 파일의 DB 구조가 지원 버전과 다릅니다.')
+    members = family['members']
+    if not isinstance(members, list) or not 1 <= len(members) <= MAX_MEMBERS or not isinstance(family['edges'], list):
+        raise ValueError('대화 묶음 구성이 올바르지 않습니다.')
+    ids = []
+    for member in members:
+        validate_row(member['data']['thread'], 'threads')
+        ids.append(native_id(member['data']['thread']['id']))
+    if len(set(ids)) != len(ids):
+        raise ValueError('대화 묶음에 같은 대화가 두 번 있습니다.')
+    if is_subagent(members[0]['data']['thread']['source']):
+        raise ValueError('하위 에이전트 대화는 부모 대화와 함께 옮깁니다. 부모 대화를 선택하세요.')
+    chains = ancestors(family)
+    total = 0
+    for member, thread_id in zip(members, ids):
+        header = validate_member(member, chains[thread_id])
+        if thread_id != ids[0]:
+            if not is_subagent(member['data']['thread']['source']):
+                raise ValueError('하위 대화가 아닌 기록이 묶음에 섞였습니다.')
+            if header.get('parent_thread_id') != chains[thread_id][0]:
+                raise ValueError('하위 대화 헤더의 부모가 연결 정보와 다릅니다.')
+        total += len(encoded(member['data'])) + len(member['rollout'])
+    if total > LIMIT:
+        raise ValueError('선택한 대화 묶음이 1GiB를 초과합니다.')
+    return ids[0]
+
+
+def member(home, thread_id):
+    """이 PC의 대화 하나(DB 행·이력·세션 파일). 없으면 None."""
     with ro(home / FILES[0]) as state:
         state.execute('BEGIN')
         found = state.execute('SELECT * FROM threads WHERE id=?', (thread_id,)).fetchone()
@@ -251,69 +310,170 @@ def selected(home, thread_id):
         tables = {table: [dict(item) for item in history.execute(
             f'SELECT * FROM {table} WHERE thread_id=? ORDER BY ' + ('thread_id' if table.endswith('state') else 'rollout_ordinal'),
             (thread_id,))] for table in TABLES}
-    snapshot = {'manifest': {'format': 1, 'schema': trusted_schema(), 'engineVersion': VERSIONS[-1]},
-        'data': {'thread': row, 'history': tables, 'dynamicTools': tools}, 'rollout': raw}
-    validate(snapshot)
-    return snapshot
+    return {'data': {'thread': row, 'history': tables, 'dynamicTools': tools}, 'rollout': raw}
 
 
-def snapshot_hash(snapshot):
-    if snapshot is None:
+def family_edges(db, root):
+    """root에서 thread_spawn_edges를 따라간 모든 하위 연결(부모가 먼저 나오는 순서)."""
+    ids, edges, queue = {root}, [], [root]
+    while queue:
+        parent = queue.pop(0)
+        for row in db.execute('SELECT parent_thread_id,child_thread_id,status FROM thread_spawn_edges '
+                'WHERE parent_thread_id=? ORDER BY child_thread_id', (parent,)):
+            if row['child_thread_id'] in ids:
+                raise ValueError('하위 대화 연결에 순환이 있습니다.')
+            ids.add(row['child_thread_id'])
+            if len(ids) > MAX_MEMBERS:
+                raise ValueError('하위 대화가 너무 많습니다.')
+            edges.append(dict(row))
+            queue.append(row['child_thread_id'])
+    return edges
+
+
+def selected(home, thread_id):
+    """이 PC의 대화와 그 모든 하위 에이전트 대화를 한 묶음으로 읽는다. 없으면 None."""
+    check_schema(home)
+    with ro(home / FILES[0]) as state:
+        state.execute('BEGIN')
+        found = state.execute('SELECT source FROM threads WHERE id=?', (thread_id,)).fetchone()
+        if found is None:
+            return None
+        if is_subagent(found['source']):
+            raise ValueError('하위 에이전트 대화는 부모 대화와 함께 옮깁니다. 부모 대화를 선택하세요.')
+        edges = family_edges(state, thread_id)
+    members = [member(home, x) for x in [thread_id] + [edge['child_thread_id'] for edge in edges]]
+    if any(item is None for item in members):
+        raise ValueError('하위 대화 기록이 DB에 없습니다.')
+    family = {'manifest': {'format': 2, 'schema': trusted_schema(), 'engineVersion': VERSIONS[-1]},
+        'members': members, 'edges': edges}
+    validate_family(family)
+    return family
+
+
+def member_hash(item):
+    return digest(encoded(item['data']) + item['rollout'])
+
+
+def snapshot_hash(family):
+    if family is None:
         return 'absent'
-    return digest(encoded(snapshot['data']) + snapshot['rollout'])
+    return digest(encoded({'members': [member_hash(item) for item in family['members']], 'edges': family['edges']}))
 
 
-def write_archive(snapshot, output):
+def iso(seconds):
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def seal(output, manifest, files):
     output = Path(output).absolute()
     no_reparse(output)
-    manifest = copy.deepcopy(snapshot['manifest'])
-    data = encoded(snapshot['data'])
-    raw = snapshot['rollout']
-    if len(data) + len(raw) > LIMIT:
-        raise ValueError('선택한 세션 묶음이 1GiB를 초과합니다.')
-    manifest['hashes'] = {'data.json': digest(data), 'rollout.jsonl': digest(raw)}
+    if sum(len(raw) for raw in files.values()) > LIMIT:
+        raise ValueError('선택한 대화 묶음이 1GiB를 초과합니다.')
+    manifest = {**manifest, 'hashes': {name: digest(raw) for name, raw in files.items()}}
     with output.open('xb') as stream:
         with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr('manifest.json', encoded(manifest))
-            archive.writestr('data.json', data)
-            archive.writestr('rollout.jsonl', raw)
+            for name, raw in files.items():
+                archive.writestr(name, raw)
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def read_archive(path):
-    path = Path(path)
-    with path.open('rb') as stream:
+def write_archive(family, output):
+    """묶음 보관 파일(형식 2): manifest.json, data.json(대화별 DB 자료와 하위 연결), rollouts/NNNN.jsonl(대화별 세션 파일)."""
+    members = family['members']
+    files = {'data.json': encoded({'members': [item['data'] for item in members], 'edges': family['edges']})}
+    for index, item in enumerate(members):
+        files[f'rollouts/{index:04d}.jsonl'] = item['rollout']
+    seal(output, {'format': 2, 'schema': family['manifest']['schema'], 'engineVersion': family['manifest']['engineVersion']}, files)
+
+
+def write_member_archive(item, engine, sessions, output):
+    """복구 폴더에 남기는 대화 하나(형식 1). sessions는 하위 대화 헤더 검사에 쓰는 조상 ID다."""
+    seal(output, {'format': 1, 'schema': trusted_schema(), 'engineVersion': engine, 'sessions': list(sessions)},
+        {'data.json': encoded(item['data']), 'rollout.jsonl': item['rollout']})
+
+
+def unpack(path):
+    with Path(path).open('rb') as stream:
         sealed_bytes = stream.read(LIMIT + 1)
     if len(sealed_bytes) > LIMIT:
         raise ValueError('보관 파일 크기가 너무 큽니다.')
     with zipfile.ZipFile(io.BytesIO(sealed_bytes)) as archive:
         entries = archive.infolist()
-        if len(entries) != 3 or {x.filename for x in entries} != {'manifest.json', 'data.json', 'rollout.jsonl'}:
+        names = [x.filename for x in entries]
+        if len(set(names)) != len(names) or 'manifest.json' not in names or len(names) > MAX_MEMBERS + 2:
             raise ValueError('보관 파일 항목이 올바르지 않습니다.')
         if sum(x.file_size for x in entries) > LIMIT or archive.getinfo('manifest.json').file_size > 1024*1024:
             raise ValueError('압축 해제 크기가 너무 큽니다.')
-        manifest = json.loads(archive.read('manifest.json'))
-        if manifest.get('format') != 1:
-            raise ValueError('보관 파일 형식 버전이 다릅니다.')
-        data, raw = archive.read('data.json'), archive.read('rollout.jsonl')
-        if manifest['hashes'] != {'data.json': digest(data), 'rollout.jsonl': digest(raw)}:
-            raise ValueError('보관 파일 내용 검증 실패')
-        result = {'manifest': manifest, 'data': json.loads(data), 'rollout': raw, 'archiveHash': digest(sealed_bytes)}
-    validate(result)
-    return result
+        files = {name: archive.read(name) for name in names}
+    manifest = json.loads(files.pop('manifest.json'))
+    if not isinstance(manifest, dict) or manifest.get('format') not in (1, 2):
+        raise ValueError('보관 파일 형식 버전이 다릅니다.')
+    if manifest.get('hashes') != {name: digest(raw) for name, raw in files.items()}:
+        raise ValueError('보관 파일 내용 검증 실패')
+    return manifest, files, digest(sealed_bytes)
 
 
-def summary(snapshot):
-    if snapshot is None:
+def read_archive(path):
+    """보관 파일을 묶음으로 읽는다. 형식 1(이전 판의 대화 하나)과 형식 2(대화 묶음)를 모두 읽는다."""
+    manifest, files, sealed = unpack(path)
+    if set(manifest) != {'format', 'schema', 'engineVersion', 'hashes'}:
+        raise ValueError('보관 파일 항목이 올바르지 않습니다.')
+    if manifest['format'] == 1:
+        if set(files) != {'data.json', 'rollout.jsonl'}:
+            raise ValueError('보관 파일 항목이 올바르지 않습니다.')
+        family = {'members': [{'data': json.loads(files['data.json']), 'rollout': files['rollout.jsonl']}], 'edges': []}
+    else:
+        data = json.loads(files.get('data.json', b'null'))
+        if not isinstance(data, dict) or set(data) != {'members', 'edges'} or not isinstance(data['members'], list) or \
+                not 1 <= len(data['members']) <= MAX_MEMBERS:
+            raise ValueError('보관 파일 항목이 올바르지 않습니다.')
+        names = [f'rollouts/{index:04d}.jsonl' for index in range(len(data['members']))]
+        if set(files) != {'data.json', *names}:
+            raise ValueError('보관 파일 항목이 올바르지 않습니다.')
+        family = {'members': [{'data': item, 'rollout': files[name]} for item, name in zip(data['members'], names)],
+            'edges': data['edges']}
+    family['manifest'] = manifest
+    family['archiveHash'] = sealed
+    validate_family(family)
+    return family
+
+
+def read_member_archive(path):
+    """복구 폴더의 대화 하나. 이전 판의 복구 기록(before.zip, incoming.zip)도 읽는다."""
+    manifest, files, _ = unpack(path)
+    if manifest['format'] != 1 or set(manifest) - {'sessions'} != {'format', 'schema', 'engineVersion', 'hashes'} or \
+            set(files) != {'data.json', 'rollout.jsonl'}:
+        raise ValueError('복구 파일 항목이 올바르지 않습니다.')
+    if manifest['engineVersion'] not in VERSIONS or manifest['schema'] != trusted_schema():
+        raise ValueError('복구 파일의 버전이나 DB 구조가 다릅니다.')
+    sessions = manifest.get('sessions', [])
+    if not isinstance(sessions, list) or len(sessions) > MAX_MEMBERS:
+        raise ValueError('복구 파일의 조상 대화 목록이 올바르지 않습니다.')
+    item = {'data': json.loads(files['data.json']), 'rollout': files['rollout.jsonl']}
+    validate_member(item, [native_id(x) for x in sessions])
+    return item
+
+
+def summary(family):
+    if family is None:
         return None
-    row = snapshot['data']['thread']
+    root = family['members'][0]
+    row = root['data']['thread']
     # 전송 메타데이터는 NUL·줄바꿈을 거부하므로 한 줄 제목으로 바꾼다.
     title = re.sub(r'[\x00\r\n]', ' ', (row['name'] or row['title'])[:1024])
+    children = len(family['members']) - 1
+    # 형식 2 백업은 historyMode 끝에 ;family=하위 대화 수를 붙여, 하위 대화가 빠진 이전 백업과 구분한다.
+    mode = row['history_mode'] + (f';family={children}' if family['manifest']['format'] == 2 else '')
     return {'id': row['id'], 'sessionId': row['id'], 'title': title, 'cwd': row['cwd'], 'sourceCwd': row['cwd'],
-        'updatedAt': datetime.datetime.fromtimestamp(row['updated_at'], datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
-        'cliVersion': snapshot['manifest']['engineVersion'], 'historyMode': row['history_mode'],
-        'recordCount': len(records(snapshot['rollout'], row['id']))}
+        'updatedAt': iso(max(item['data']['thread']['updated_at'] for item in family['members'])),
+        'cliVersion': family['manifest']['engineVersion'], 'historyMode': mode,
+        'recordCount': len(records(root['rollout'], row['id'])), 'children': children}
+
+
+FAMILY_SQL = ('WITH RECURSIVE family(id) AS (SELECT ? UNION SELECT e.child_thread_id FROM thread_spawn_edges e '
+    'JOIN family f ON e.parent_thread_id=f.id) SELECT COUNT(*)-1, MAX(t.updated_at) FROM family f JOIN threads t ON t.id=f.id')
 
 
 def list_sessions(home, search='', offset=0, limit=200):
@@ -321,62 +481,109 @@ def list_sessions(home, search='', offset=0, limit=200):
         raise ValueError('목록 페이지 범위가 올바르지 않습니다.')
     with ro(home / FILES[0]) as db:
         search = '%' + search.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-        where = "WHERE title LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' OR cwd LIKE ? ESCAPE '\\'"
+        # 하위 에이전트 대화(source가 {"subagent":…})는 부모 대화와 함께 옮기므로 목록에 따로 싣지 않는다.
+        where = ("WHERE source NOT LIKE '{\"subagent\":%' AND (title LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
+            "OR id LIKE ? ESCAPE '\\' OR cwd LIKE ? ESCAPE '\\')")
         params = (search, search, search, search)
         db.execute('BEGIN')
         total = db.execute('SELECT COUNT(*) FROM threads ' + where, params).fetchone()[0]
-        # 하위 에이전트 대화(source가 {"subagent":…})는 헤더 session_id가 부모 것이라 따로 내보낼 수 없다. 숨기지 않고 표시만 한다.
-        rows = db.execute("SELECT id,SUBSTR(COALESCE(NULLIF(name,''),title),1,1024) AS title,cwd,updated_at AS updatedAt,history_mode AS historyMode,archived,"
-            """source LIKE '{"subagent":%' AS subagent """
-            'FROM threads ' + where + ' ORDER BY updated_at_ms DESC,id LIMIT ? OFFSET ?', (*params, limit, offset))
-        # GUI 계약: updatedAt은 UTC RFC3339 문자열, archived·subagent는 bool.
-        return {'total': total, 'sessions': [{**dict(row), 'archived': bool(row['archived']), 'subagent': bool(row['subagent']),
-            'updatedAt': datetime.datetime.fromtimestamp(row['updatedAt'], datetime.timezone.utc).isoformat().replace('+00:00', 'Z')}
-            for row in rows]}
+        rows = db.execute("SELECT id,SUBSTR(COALESCE(NULLIF(name,''),title),1,1024) AS title,cwd,history_mode AS historyMode,archived "
+            'FROM threads ' + where + ' ORDER BY updated_at_ms DESC,id LIMIT ? OFFSET ?', (*params, limit, offset)).fetchall()
+        sessions = []
+        for row in rows:
+            children, updated = db.execute(FAMILY_SQL, (row['id'],)).fetchone()
+            # GUI 계약: updatedAt은 묶음에서 가장 늦은 수정 시각(UTC RFC3339), archived는 bool, children은 하위 대화 수.
+            sessions.append({**dict(row), 'archived': bool(row['archived']), 'children': children, 'updatedAt': iso(updated)})
+        return {'total': total, 'sessions': sessions}
 
 
 def inspect(home, archive, cwd, engine=None):
     return inspect_loaded(home, read_archive(archive), cwd, engine)
 
 
-def inspect_loaded(home, incoming, cwd, engine=None):
+REASONS = {'new': '처음 가져오는 세션', 'equal': '동일한 이력', 'incoming_newer': '가져온 이력이 기존 이력의 연장',
+    'local_newer': '현재 PC 이력이 더 이어짐', 'conflict': '같은 ID에서 기록이 갈라짐; 항목별 사용자 선택 필요'}
+CHILD_LABELS = (('new', '새로'), ('incoming_newer', '이어짐'), ('conflict', '갈라짐'), ('local_newer', '이 PC가 더 최신'),
+    ('local_only', '이 PC에만'))
+WRITE = ('new', 'incoming_newer', 'conflict')
+
+
+def history_status(source, target):
+    if source == target:
+        return 'equal'
+    if len(source) > len(target) and source[:len(target)] == target:
+        return 'incoming_newer'
+    if len(target) > len(source) and target[:len(source)] == source:
+        return 'local_newer'
+    return 'conflict'
+
+
+def compare(home, incoming, cwd, engine=None):
+    """이 PC의 같은 묶음과 비교한다. (미리보기 결과, 이 PC 묶음 또는 None, 대화 ID별 상태)를 돌려준다."""
     cwd = absolute(cwd)
     no_reparse(cwd)
     if not cwd.is_dir():
         raise ValueError('가져올 작업 폴더가 없습니다.')
     check_schema(home, allow_missing=True)
-    thread_id = validate(incoming)
+    root = validate_family(incoming)
     # 두 PC의 엔진 버전이 정확히 같을 때만 가져온다. CLI는 항상 이 PC 엔진 버전을 넘긴다(시험 호출만 None).
     if engine is not None and incoming['manifest']['engineVersion'] != engine:
         raise ValueError(f"백업한 PC의 Codex Desktop 엔진({incoming['manifest']['engineVersion']})과 "
             f'이 PC 엔진({engine})이 다릅니다. 두 PC를 같은 버전으로 맞춘 뒤 다시 백업하세요.')
-    if all((home / name).exists() for name in FILES):
-        current = selected(home, thread_id)
-    elif (home / FILES[0]).exists():
+    ids = [item['data']['thread']['id'] for item in incoming['members']]
+    found = set()
+    if (home / FILES[0]).exists():
         with ro(home / FILES[0]) as db:
-            if db.execute('SELECT 1 FROM threads WHERE id=?', (thread_id,)).fetchone():
-                raise ValueError('기존 세션의 이력 DB가 없습니다.')
-        current = None
+            db.execute('BEGIN')
+            found = {x for x in ids if db.execute('SELECT 1 FROM threads WHERE id=?', (x,)).fetchone()}
+    current = None
+    if found:
+        if not (home / FILES[1]).exists():
+            raise ValueError('기존 세션의 이력 DB가 없습니다.')
+        current = selected(home, root)
+    local = {item['data']['thread']['id']: item for item in current['members']} if current else {}
+    if found - set(local):
+        raise ValueError('가져올 하위 대화가 이 PC에서 다른 대화에 연결돼 있습니다.')
+    chains = ancestors(incoming)
+    local_chains = ancestors(current) if current else {}
+    statuses = {}
+    for item, thread_id in zip(incoming['members'], ids):
+        before = local.get(thread_id)
+        if before is None:
+            statuses[thread_id] = 'new'
+            continue
+        if local_chains[thread_id] != chains[thread_id]:
+            raise ValueError('하위 대화 연결이 두 PC에서 다릅니다.')
+        statuses[thread_id] = history_status(canonical(item['rollout'], thread_id, chains[thread_id]),
+            canonical(before['rollout'], thread_id, chains[thread_id]))
+    local_only = len(set(local) - set(ids))
+    # 묶음 상태: 갈라진 대화가 하나라도 있으면 묶음 전체를 갈라짐으로 보고 묶음 단위로 선택받는다.
+    # 적용하면 새 대화·이어진 대화·갈라진 대화만 쓰고, 이 PC가 더 최신이거나 이 PC에만 있는 하위 대화는 그대로 둔다.
+    values = set(statuses.values())
+    if current is None:
+        status = 'new'
+    elif 'conflict' in values:
+        status = 'conflict'
+    elif values & {'new', 'incoming_newer'}:
+        status = 'incoming_newer'
+    elif 'local_newer' in values or local_only:
+        status = 'local_newer'
     else:
-        current = None
-    status = 'new'
-    if current is not None:
-        source = canonical(incoming['rollout'], thread_id)
-        target = canonical(current['rollout'], thread_id)
-        if source == target:
-            status = 'equal'
-        elif len(source) > len(target) and source[:len(target)] == target:
-            status = 'incoming_newer'
-        elif len(target) > len(source) and target[:len(source)] == source:
-            status = 'local_newer'
-        else:
-            status = 'conflict'
+        status = 'equal'
+    counts = {key: sum(1 for x in ids[1:] if statuses[x] == key) for key, _ in CHILD_LABELS[:4]}
+    counts['local_only'] = local_only
+    parts = ', '.join(f'{label} {counts[key]}' for key, label in CHILD_LABELS if counts[key])
+    reason = REASONS[status]
+    if len(ids) > 1 or local_only:
+        reason += f' · 하위 대화 {len(ids) - 1}개' + (f'({parts})' if parts and current is not None else '')
     token = digest(encoded({'archive': incoming['archiveHash'], 'home': str(home),
         'cwd': str(cwd), 'baseline': snapshot_hash(current), 'status': status}))
-    return {'status': status, 'reason': {'new': '처음 가져오는 세션', 'equal': '동일한 이력',
-        'incoming_newer': '가져온 이력이 기존 이력의 연장', 'local_newer': '현재 PC 이력이 더 이어짐',
-        'conflict': '같은 ID에서 기록이 갈라짐; 항목별 사용자 선택 필요'}[status],
-        'token': token, 'source': summary(incoming), 'target': summary(current)}
+    return ({'status': status, 'reason': reason, 'token': token, 'source': summary(incoming), 'target': summary(current)},
+        current, statuses)
+
+
+def inspect_loaded(home, incoming, cwd, engine=None):
+    return compare(home, incoming, cwd, engine)[0]
 
 
 def inspect_many(home, request, engine=None):
@@ -453,8 +660,9 @@ def save_json(path, obj):
     os.replace(temp, path)
 
 
-def mapped(snapshot, cwd, path, current):
-    result = copy.deepcopy(snapshot)
+def mapped(item, cwd, path, current, sessions=()):
+    """가져올 대화 하나를 이 PC의 작업 폴더와 세션 파일 경로로 바꾼다. current는 이 PC의 같은 대화(없으면 None)."""
+    result = copy.deepcopy(item)
     raw = result['rollout']
     row = result['data']['thread']
     row['cwd'], row['rollout_path'] = str(cwd), str(path)
@@ -467,7 +675,7 @@ def mapped(snapshot, cwd, path, current):
         row.update(is_pinned=0, sandbox_policy='{"type":"read-only"}', approval_mode='untrusted',
             memory_mode='disabled', daybreak_enabled=0)
     lines = raw.splitlines(keepends=True)
-    parsed = records(raw, row['id'])
+    parsed = records(raw, row['id'], sessions)
     last_context = next((i for i in range(len(parsed)-1, -1, -1) if parsed[i]['type'] == 'turn_context'), None)
     parsed[0]['payload']['cwd'] = str(cwd)
     if 'runtime_workspace_roots' in parsed[0]['payload']:
@@ -477,7 +685,7 @@ def mapped(snapshot, cwd, path, current):
         context = parsed[last_context]['payload']
         context['cwd'], context['workspace_roots'] = str(cwd), [str(cwd)]
         if current is not None:
-            prior_context = next((obj['payload'] for obj in reversed(records(current['rollout'], row['id']))
+            prior_context = next((obj['payload'] for obj in reversed(records(current['rollout'], row['id'], sessions))
                 if obj['type'] == 'turn_context'), None)
         else:
             prior_context = None
@@ -518,21 +726,29 @@ def mapped(snapshot, cwd, path, current):
             for key in ('rollout_byte_offset', 'rollout_end_byte_offset', 'next_rollout_byte_offset'):
                 if key in item:
                     item[key] = map_offset(item[key])
-    validate(result)
+    validate_member(result, sessions)
     return result
 
 
-def replace_rows(db, snapshot):
-    row = snapshot['data']['thread']
+def replace_rows(db, item):
+    row = item['data']['thread']
     thread_id = row['id']
     for table in TABLES:
         db.execute(f'DELETE FROM history.{table} WHERE thread_id=?', (thread_id,))
-        for item in snapshot['data']['history'][table]:
-            columns = list(item)
-            db.execute(f'INSERT INTO history.{table} ({",".join(columns)}) VALUES ({",".join("?" for x in columns)})', list(item.values()))
+        for entry in item['data']['history'][table]:
+            columns = list(entry)
+            db.execute(f'INSERT INTO history.{table} ({",".join(columns)}) VALUES ({",".join("?" for x in columns)})', list(entry.values()))
     columns = list(row)
     db.execute(f'INSERT INTO threads ({",".join(columns)}) VALUES ({",".join("?" for x in columns)}) '
         'ON CONFLICT(id) DO UPDATE SET ' + ','.join(f'{x}=excluded.{x}' for x in columns if x != 'id'), list(row.values()))
+
+
+def write_stage(path, raw):
+    no_reparse(path)
+    with path.open('xb') as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
@@ -545,23 +761,39 @@ def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
     if pending(home):
         raise ValueError('중단된 가져오기를 먼저 복구하세요.')
     incoming = read_archive(archive)
-    # 실제 guard는 이 PC 엔진 버전을 돌려주고, inspect_loaded가 백업 엔진 버전과 정확히 비교한다.
-    preview = inspect_loaded(home, incoming, cwd, engine)
+    # 실제 guard는 이 PC 엔진 버전을 돌려주고, compare가 백업 엔진 버전과 정확히 비교한다.
+    preview, current, statuses = compare(home, incoming, cwd, engine)
     if token != preview['token']:
         raise ValueError('미리보기 뒤 데이터가 바뀌었습니다. 다시 비교하고 선택하세요.')
     if preview['status'] in ('equal', 'local_newer'):
         return {'status': preview['status']}
-    thread_id = validate(incoming)
-    current = selected(home, thread_id) if all((home / name).exists() for name in FILES) else None
-    if current is not None:
-        path = rollout_path(home, current['data']['thread']['rollout_path'])
-    else:
-        date = datetime.datetime.fromtimestamp(incoming['data']['thread']['created_at'], datetime.timezone.utc)
-        bucket = 'archived_sessions' if incoming['data']['thread']['archived'] else 'sessions'
-        path = rollout_path(home, home / bucket / date.strftime('%Y/%m/%d') / f'rollout-{date:%Y-%m-%dT%H-%M-%S}-{thread_id}.jsonl')
-        if path.exists():
-            raise ValueError('등록되지 않은 같은 이름의 파일이 있습니다.')
-    replacement = mapped(incoming, absolute(cwd), path, current)
+    cwd = absolute(cwd)
+    root = incoming['members'][0]['data']['thread']['id']
+    chains = ancestors(incoming)
+    local = {item['data']['thread']['id']: item for item in current['members']} if current else {}
+    local_edges = {edge['child_thread_id']: edge for edge in current['edges']} if current else {}
+    # 묶음의 모든 하위 대화 작업 폴더도 가져올 작업 폴더로 바꾼다(부모와 다른 폴더에서 돌던 하위 대화도 같음).
+    writes = []
+    for item in incoming['members']:
+        row = item['data']['thread']
+        if statuses[row['id']] not in WRITE:
+            continue
+        before = local.get(row['id'])
+        if before is not None:
+            path = rollout_path(home, before['data']['thread']['rollout_path'])
+        else:
+            date = datetime.datetime.fromtimestamp(row['created_at'], datetime.timezone.utc)
+            bucket = 'archived_sessions' if row['archived'] else 'sessions'
+            path = rollout_path(home, home / bucket / date.strftime('%Y/%m/%d') / f"rollout-{date:%Y-%m-%dT%H-%M-%S}-{row['id']}.jsonl")
+            if path.exists():
+                raise ValueError('등록되지 않은 같은 이름의 파일이 있습니다.')
+        writes.append({'before': before, 'after': mapped(item, cwd, path, before, chains[row['id']]), 'path': path})
+    # 새 하위 대화의 연결을 넣고, 다시 쓰는 하위 대화의 연결 상태(open·closed)를 가져온 값으로 맞춘다.
+    edges = []
+    for edge in incoming['edges']:
+        previous = local_edges.get(edge['child_thread_id'])
+        if statuses[edge['child_thread_id']] in WRITE and (previous is None or previous['status'] != edge['status']):
+            edges.append({**edge, 'previous': None if previous is None else previous['status']})
     run = home / '.ctxhop-desktop-recovery' / uuid.uuid4().hex
     no_reparse(run)
     run.mkdir(parents=True)
@@ -569,23 +801,24 @@ def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
         if engine:
             # 복구 사본으로 되살릴 때(inspect → apply) 이 PC 엔진과 비교되므로 실제 버전을 기록한다.
             current['manifest']['engineVersion'] = engine
+        # 이 PC의 묶음 전체(형식 2). 복구 원본이자, 그대로 inspect → apply로 되살릴 수 있는 보관 파일이다.
         write_archive(current, run / 'before.zip')
-    write_archive(replacement, run / 'incoming.zip')
-    journal = {'status': 'pending', 'home': str(home), 'id': thread_id, 'path': str(path),
-        'before': snapshot_hash(current), 'after': snapshot_hash(replacement),
-        'beforeData': digest(encoded(current['data'])) if current is not None else None,
-        'afterData': digest(encoded(replacement['data'])),
-        'beforeFile': digest(current['rollout']) if current is not None else None,
-        'afterFile': digest(replacement['rollout']), 'createdDb': [name for name in FILES if not (home / name).exists()]}
+    members = []
+    for index, entry in enumerate(writes):
+        after, before = entry['after'], entry['before']
+        thread_id = after['data']['thread']['id']
+        write_member_archive(after, engine or VERSIONS[-1], chains[thread_id], run / f'incoming-{index:04d}.zip')
+        members.append({'id': thread_id, 'path': str(entry['path']),
+            'before': member_hash(before) if before else 'absent', 'after': member_hash(after),
+            'beforeFile': digest(before['rollout']) if before else None, 'afterFile': digest(after['rollout'])})
+    journal = {'version': 2, 'status': 'pending', 'home': str(home), 'id': root, 'before': snapshot_hash(current),
+        'members': members, 'edges': edges, 'createdDb': [name for name in FILES if not (home / name).exists()]}
     save_json(run / 'journal.json', journal)
     for name in journal['createdDb']:
         create_database(home / name, name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stage = run / 'rollout.stage'
-    with stage.open('xb') as stream:
-        stream.write(replacement['rollout'])
-        stream.flush()
-        os.fsync(stream.fileno())
+    for index, entry in enumerate(writes):
+        entry['path'].parent.mkdir(parents=True, exist_ok=True)
+        write_stage(run / f'stage-{index:04d}', entry['after']['rollout'])
     with sqlite3.connect(home / FILES[0], timeout=10) as db:
         db.execute('PRAGMA foreign_keys=ON')
         db.execute('PRAGMA synchronous=FULL')
@@ -596,8 +829,14 @@ def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
         guard()
         if token != inspect(home, archive, cwd, engine)['token']:
             raise ValueError('적용 직전에 데이터가 바뀌었습니다.')
-        replace_rows(db, replacement)
-        os.replace(stage, path)
+        for entry in writes:
+            replace_rows(db, entry['after'])
+        for edge in edges:
+            db.execute('INSERT INTO thread_spawn_edges (parent_thread_id,child_thread_id,status) VALUES (?,?,?) '
+                'ON CONFLICT(child_thread_id) DO UPDATE SET status=excluded.status',
+                (edge['parent_thread_id'], edge['child_thread_id'], edge['status']))
+        for index, entry in enumerate(writes):
+            os.replace(run / f'stage-{index:04d}', entry['path'])
         if failpoint:
             failpoint('file')
         db.commit()
@@ -605,7 +844,7 @@ def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
             failpoint('commit')
     journal['status'] = 'complete'
     save_json(run / 'journal.json', journal)
-    return {'status': 'imported', 'id': thread_id, 'recovery': str(run), 'replaced': current is not None}
+    return {'status': 'imported', 'id': root, 'recovery': str(run), 'replaced': current is not None, 'members': len(writes)}
 
 
 def database_data(home, thread_id):
@@ -630,16 +869,35 @@ def recover(home, run, guard=None):
     journal = json.loads((run / 'journal.json').read_text(encoding='utf-8'))
     if journal['status'] != 'pending' or journal['home'] != str(home):
         raise ValueError('이 저장소의 중단된 작업이 아닙니다.')
-    incoming = read_archive(run / 'incoming.zip')
-    before = read_archive(run / 'before.zip') if journal['before'] != 'absent' else None
-    if snapshot_hash(incoming) != journal['after'] or snapshot_hash(before) != journal['before']:
-        raise ValueError('복구 원본 검증 실패')
-    thread_id = validate(incoming)
-    if journal['id'] != thread_id or before is not None and validate(before) != thread_id:
-        raise ValueError('복구 세션 ID가 다릅니다.')
-    path = rollout_path(home, journal['path'])
-    if path != rollout_path(home, incoming['data']['thread']['rollout_path']):
-        raise ValueError('복구 파일 경로가 다릅니다.')
+    if 'version' not in journal:
+        # 이전 판이 남긴 대화 하나의 기록: before.zip, incoming.zip, 임시 파일 undo.
+        entries = [{key: journal[key] for key in ('id', 'path', 'before', 'after', 'beforeFile', 'afterFile')}]
+        names, edges = [('incoming.zip', 'undo')], []
+    elif journal['version'] == 2:
+        entries, edges = journal['members'], journal['edges']
+        names = [(f'incoming-{index:04d}.zip', f'undo-{index:04d}') for index in range(len(entries))]
+    else:
+        raise ValueError('복구 기록 형식이 다릅니다.')
+    if not 1 <= len(entries) <= MAX_MEMBERS or len({entry['id'] for entry in entries}) != len(entries):
+        raise ValueError('복구 기록의 대화 목록이 올바르지 않습니다.')
+    before_family = read_archive(run / 'before.zip') if journal['before'] != 'absent' else None
+    if before_family is not None:
+        if before_family['members'][0]['data']['thread']['id'] != journal['id']:
+            raise ValueError('복구 세션 ID가 다릅니다.')
+        if 'version' in journal and snapshot_hash(before_family) != journal['before']:
+            raise ValueError('복구 원본 검증 실패')
+    local = {item['data']['thread']['id']: item for item in before_family['members']} if before_family else {}
+    items = []
+    for entry, (incoming_name, undo_name) in zip(entries, names):
+        after = read_member_archive(run / incoming_name)
+        before = local.get(entry['id'])
+        if after['data']['thread']['id'] != entry['id'] or member_hash(after) != entry['after'] or \
+                (member_hash(before) if before else 'absent') != entry['before']:
+            raise ValueError('복구 원본 검증 실패')
+        path = rollout_path(home, entry['path'])
+        if path != rollout_path(home, after['data']['thread']['rollout_path']):
+            raise ValueError('복구 파일 경로가 다릅니다.')
+        items.append({'entry': entry, 'after': after, 'before': before, 'path': path, 'undo': run / undo_name})
     check_schema(home, allow_missing=True)
     for name in FILES:
         if not (home / name).exists():
@@ -647,36 +905,46 @@ def recover(home, run, guard=None):
                 raise ValueError('기존 DB가 없어졌습니다.')
             create_database(home / name, name)
     empty = {'thread': None, 'history': {table: [] for table in TABLES}, 'dynamicTools': []}
-    baseline = before['data'] if before else empty
+    added = {(edge['parent_thread_id'], edge['child_thread_id']) for edge in edges}
     def check():
-        data = database_data(home, thread_id)
-        if data['thread'] not in (baseline['thread'], incoming['data']['thread']):
-            raise ValueError('중단 뒤 세션 메타데이터가 변경됐습니다. 자동 복구를 중단합니다.')
-        if data['dynamicTools'] != baseline['dynamicTools']:
-            raise ValueError('중단 뒤 도구 설정이 변경됐습니다.')
-        for table in TABLES:
-            if data['history'][table] not in (baseline['history'][table], incoming['data']['history'][table]):
-                raise ValueError('중단 뒤 세션 이력이 변경됐습니다. 자동 복구를 중단합니다.')
-        file_hash = digest(path.read_bytes()) if path.exists() else None
-        if file_hash not in (journal['beforeFile'], journal['afterFile']):
-            raise ValueError('중단 뒤 세션 파일이 변경됐습니다. 자동 복구를 중단합니다.')
-        if before is None:
-            with ro(home / FILES[0]) as db:
-                if db.execute('SELECT 1 FROM thread_attachments WHERE thread_id=?', (thread_id,)).fetchone() or db.execute(
-                        'SELECT 1 FROM thread_spawn_edges WHERE parent_thread_id=? OR child_thread_id=?', (thread_id,thread_id)).fetchone():
-                    raise ValueError('새 세션에 다른 작업이 연결됐습니다. 자동 삭제를 중단합니다.')
+        for item in items:
+            thread_id, entry = item['entry']['id'], item['entry']
+            baseline = item['before']['data'] if item['before'] else empty
+            incoming = item['after']['data']
+            data = database_data(home, thread_id)
+            if data['thread'] not in (baseline['thread'], incoming['thread']):
+                raise ValueError('중단 뒤 세션 메타데이터가 변경됐습니다. 자동 복구를 중단합니다.')
+            if data['dynamicTools'] != baseline['dynamicTools']:
+                raise ValueError('중단 뒤 도구 설정이 변경됐습니다.')
+            for table in TABLES:
+                if data['history'][table] not in (baseline['history'][table], incoming['history'][table]):
+                    raise ValueError('중단 뒤 세션 이력이 변경됐습니다. 자동 복구를 중단합니다.')
+            file_hash = digest(item['path'].read_bytes()) if item['path'].exists() else None
+            if file_hash not in (entry['beforeFile'], entry['afterFile']):
+                raise ValueError('중단 뒤 세션 파일이 변경됐습니다. 자동 복구를 중단합니다.')
+            if item['before'] is None:
+                with ro(home / FILES[0]) as db:
+                    linked = {(row[0], row[1]) for row in db.execute('SELECT parent_thread_id,child_thread_id '
+                        'FROM thread_spawn_edges WHERE parent_thread_id=? OR child_thread_id=?', (thread_id, thread_id))}
+                    if db.execute('SELECT 1 FROM thread_attachments WHERE thread_id=?', (thread_id,)).fetchone() or linked - added:
+                        raise ValueError('새 세션에 다른 작업이 연결됐습니다. 자동 삭제를 중단합니다.')
+        with ro(home / FILES[0]) as db:
+            for edge in edges:
+                row = db.execute('SELECT parent_thread_id,status FROM thread_spawn_edges WHERE child_thread_id=?',
+                    (edge['child_thread_id'],)).fetchone()
+                state = None if row is None else tuple(row)
+                if state not in ((edge['parent_thread_id'], edge['status']),
+                        None if edge['previous'] is None else (edge['parent_thread_id'], edge['previous'])):
+                    raise ValueError('중단 뒤 하위 대화 연결이 변경됐습니다. 자동 복구를 중단합니다.')
     check()
-    if before:
-        stage = run / 'undo'
-        no_reparse(stage)
-        if stage.exists():
-            if digest(stage.read_bytes()) != journal['beforeFile']:
-                raise ValueError('복구 임시 파일이 변경됐습니다.')
-        else:
-            with stage.open('xb') as stream:
-                stream.write(before['rollout'])
-                stream.flush()
-                os.fsync(stream.fileno())
+    for item in items:
+        if item['before']:
+            no_reparse(item['undo'])
+            if item['undo'].exists():
+                if digest(item['undo'].read_bytes()) != item['entry']['beforeFile']:
+                    raise ValueError('복구 임시 파일이 변경됐습니다.')
+            else:
+                write_stage(item['undo'], item['before']['rollout'])
     with sqlite3.connect(home / FILES[0], timeout=10) as db:
         db.execute('PRAGMA foreign_keys=ON')
         db.execute('ATTACH DATABASE ? AS history', (str(home / FILES[1]),))
@@ -684,19 +952,27 @@ def recover(home, run, guard=None):
         guard()
         check_schema(home)  # 엔진 버전을 보지 않으므로 쓰기 잠금 안에서 구조를 다시 확인한다.
         check()
-        if before:
-            replace_rows(db, before)
-            os.replace(stage, path)
-        else:
-            for table in TABLES:
-                db.execute(f'DELETE FROM history.{table} WHERE thread_id=?', (thread_id,))
-            db.execute('DELETE FROM threads WHERE id=?', (thread_id,))
+        for edge in edges:
+            if edge['previous'] is None:
+                db.execute('DELETE FROM thread_spawn_edges WHERE parent_thread_id=? AND child_thread_id=?',
+                    (edge['parent_thread_id'], edge['child_thread_id']))
+            else:
+                db.execute('UPDATE thread_spawn_edges SET status=? WHERE child_thread_id=?', (edge['previous'], edge['child_thread_id']))
+        for item in items:
+            if item['before']:
+                replace_rows(db, item['before'])
+                os.replace(item['undo'], item['path'])
+            else:
+                for table in TABLES:
+                    db.execute(f'DELETE FROM history.{table} WHERE thread_id=?', (item['entry']['id'],))
+                db.execute('DELETE FROM threads WHERE id=?', (item['entry']['id'],))
         db.commit()
-    if before is None and path.exists():
-        path.unlink()  # 확인한 선택 세션 파일 하나만 삭제. 복구 기록과 DB는 보존.
+    for item in items:
+        if item['before'] is None and item['path'].exists():
+            item['path'].unlink()  # 확인한 새 세션 파일만 삭제. 복구 기록과 DB는 보존.
     journal['status'] = 'rolled_back'
     save_json(run / 'journal.json', journal)
-    return {'status': 'rolled_back', 'id': thread_id, 'recovery': str(run)}
+    return {'status': 'rolled_back', 'id': journal['id'], 'recovery': str(run), 'members': len(items)}
 
 
 def main():
