@@ -20,7 +20,7 @@ function Find-Executable([string]$Name) {
 function Assert-RestoreRuntime {
     $exe=Find-Executable 'ctxhop'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $script:RestoreBinarySHA256) { throw (T 'WkRestoreBinaryHash') }
-    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.2') { throw (T 'WkRestoreBinaryVersion') }
+    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.3') { throw (T 'WkRestoreBinaryVersion') }
 }
 function Assert-FrozenFile([string]$Path,[string]$Pin) {
     if ($Pin -notmatch '^[a-fA-F0-9]{64}$' -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw (T 'WkComponentMissing' $Path) }

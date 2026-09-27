@@ -215,7 +215,7 @@ try {
     $script:Pending=$null
     # 작업 취소는 GUI가 띄운 작업 창과 그 하위 프로세스만 끝낸다. 이름으로 찾아 끄지 않으므로 Codex·Claude 앱은 건드리지 않는다.
     Assert ($source -notmatch 'Stop-Process\s+-Name|Get-Process|\.Kill\(|taskkill') 'GUI never kills processes by name, so the Codex and Claude apps are never force-closed'
-    Assert ([regex]::Matches($source,'Stop-Process ').Count -eq 1 -and [regex]::Matches($source,'Stop-ProcessTree \$pending\.process\.Id').Count -eq 1 -and $source -match "action -in @\('Restore','Open'\)\) \{ return \}") 'GUI stops only the worker tree it started, and never during Restore or Open'
+    Assert ([regex]::Matches($source,'Stop-Process ').Count -eq 1 -and [regex]::Matches($source,'Stop-ProcessTree \$pending\.process\.Id').Count -eq 1 -and $source -match "action -in @\('Restore','Open','MoveStore'\)\) \{ return \}") 'GUI stops only the worker tree it started, and never during Restore, Open or MoveStore'
     # 부모보다 먼저 생긴 "자식"은 끝난 프로세스의 PID를 물려받은 다른 프로그램(예: 런처가 띄운 앱)이므로 끝내지 않는다. 부모부터 끝낸다.
     $stopped = & {
         function Get-CimInstance {

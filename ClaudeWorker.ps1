@@ -3,7 +3,7 @@
 param([string]$RequestFile, [string]$ResultFile, [switch]$LibraryOnly)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Strings.ps1')
-$script:RestoreBinarySHA256='15CE00DC32BE07ECF089F5D49154469A4B259E1B7EB0ED0123C0FE57152BFC2B'
+$script:RestoreBinarySHA256='45186B1017A0F8969DFC27D248351C275ACB0DFEBF21276AD968E03DC84E650B'
 function Find-Executable([string]$Name) {
     $paths = if ($Name -eq 'ctxhop') {
         @((Join-Path $PSScriptRoot 'bin\ctxhop.exe'), (Join-Path $env:USERPROFILE '.ctxhop\bin\ctxhop.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\CtxHop\bin\ctxhop.exe'))
@@ -31,6 +31,71 @@ function Normalize-ProjectPath([string]$Value) {
     if ($full.StartsWith('\\?\UNC\',[StringComparison]::OrdinalIgnoreCase)) { $full='\\'+$full.Substring(8) }
     elseif ($full.StartsWith('\\?\')) { $full=$full.Substring(4) }
     return $full.TrimEnd('\')
+}
+function Get-StoreRealPath([string]$Path) {
+    # 정션·심볼릭 링크·subst 드라이브를 모두 따라간 실제 위치. 같은 폴더를 다른 이름으로 가리키는지 확인할 때 쓴다.
+    # Resolve는 읽기 권한 없이 폴더도 열 수 있게 연다(FILE_FLAG_BACKUP_SEMANTICS).
+    # IsLink는 다른 곳을 가리키는 재분석 지점(정션, 심볼릭 링크)만 링크로 본다. OneDrive 자리표시자 같은 다른 재분석 지점은 링크가 아니다.
+    if (-not ('CtxHopStorePath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class CtxHopStorePath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint size, uint flags);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct FindData {
+        public uint Attributes, Created1, Created2, Accessed1, Accessed2, Written1, Written2, SizeHigh, SizeLow, Tag, Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string ShortName;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindFirstFileW(string name, out FindData data);
+    [DllImport("kernel32.dll")]
+    static extern bool FindClose(IntPtr handle);
+    public static string Resolve(string path) {
+        using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new Win32Exception();
+            StringBuilder buffer = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+            if (length == 0 || length >= buffer.Capacity) throw new Win32Exception();
+            return buffer.ToString();
+        }
+    }
+    public static bool IsLink(string path) {
+        FindData data;
+        IntPtr handle = FindFirstFileW(path, out data);
+        if (handle == new IntPtr(-1)) throw new Win32Exception();
+        FindClose(handle);
+        return (data.Attributes & 0x400) != 0 && (data.Tag & 0x20000000) != 0;
+    }
+}
+'@
+    }
+    try { return Normalize-ProjectPath ([CtxHopStorePath]::Resolve($Path)) }
+    catch { throw (T 'CwMoveStoreResolve' $Path $_.Exception.GetBaseException().Message) }
+}
+function Test-StoreOverlap([string]$Left, [string]$Right) {
+    # 같은 폴더이거나 한쪽이 다른 쪽 안에 있는지. 두 값 모두 실제 위치여야 한다.
+    $l = $Left.TrimEnd('\') + '\'; $r = $Right.TrimEnd('\') + '\'
+    return $l.StartsWith($r, [StringComparison]::OrdinalIgnoreCase) -or $r.StartsWith($l, [StringComparison]::OrdinalIgnoreCase)
+}
+function Assert-StoreLinkFree([string]$Root) {
+    # 복사는 저장소 안의 파일만 다뤄야 하므로 폴더 자체나 그 안에 링크·정션이 있으면 아무것도 복사하지 않는다.
+    # ponytail: 검사한 뒤 복사가 끝나기 전에 누군가 링크를 새로 만드는 경우는 막지 않는다.
+    $stack = [Collections.Generic.Stack[IO.FileSystemInfo]]::new()
+    $top = [IO.DirectoryInfo]::new($Root)
+    if ([int]$top.Attributes -ne -1) { $stack.Push($top) }
+    while ($stack.Count) {
+        $item = $stack.Pop()
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and [CtxHopStorePath]::IsLink($item.FullName)) { throw (T 'CwMoveStoreLinked' $item.FullName) }
+        if ($item.Attributes -band [IO.FileAttributes]::Directory) { foreach ($child in ([IO.DirectoryInfo]$item).EnumerateFileSystemInfos()) { $stack.Push($child) } }
+    }
 }
 function Get-CtxFailureReason([string]$Command, [datetimeoffset]$Since) {
     # ctxhop은 실패 이유를 작업 창에만 쓰고 창은 바로 닫히므로, 같은 명령이 남긴 로그 줄에서 이유를 읽는다.
@@ -66,6 +131,30 @@ function Invoke-Ctx([string[]]$Arguments, [switch]$Json) {
         throw $message
     }
     if ($Json) { return ($output -join "`n" | ConvertFrom-Json) }
+}
+function Copy-StoreFiles([string]$From, [string]$To) {
+    # 옛 저장소 파일 중 새 폴더에 없는 것만 복사한다(다른 PC가 먼저 옮겼거나 Drive가 일부만 받았을 때도 같은 동작).
+    # 같은 이름인데 내용이 다른 파일이 하나라도 있으면 아무것도 복사하지 않는다. 파일마다 옆의 임시 파일에 복사하고 해시가 같을 때만 제자리로 옮긴다.
+    $plan=@(); $same=0; $conflicts=@()
+    if ([IO.Directory]::Exists($From)) {
+        foreach ($file in [IO.Directory]::EnumerateFiles($From,'*','AllDirectories')) {
+            $relative=$file.Substring($From.Length).TrimStart('\')
+            $target=Join-Path $To $relative
+            if (-not [IO.File]::Exists($target)) { $plan+=,@($file,$target,$relative); continue }
+            if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) { $same++ } else { $conflicts+=$relative }
+        }
+    }
+    if ($conflicts.Count) { throw (T 'CwMoveStoreConflict' $conflicts.Count (@($conflicts | Select-Object -First 5) -join ', ')) }
+    foreach ($item in $plan) {
+        $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($item[1]))
+        $part="$($item[1]).ctxhop-$([guid]::NewGuid().ToString('N')).part"
+        try {
+            [IO.File]::Copy($item[0],$part,$false)
+            if ((Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $item[0] -Algorithm SHA256).Hash) { throw (T 'CwMoveStoreCopyMismatch' $item[2]) }
+            [IO.File]::Move($part,$item[1])
+        } finally { if ([IO.File]::Exists($part)) { [IO.File]::Delete($part) } }
+    }
+    return @{copied=$plan.Count; same=$same}
 }
 function Assert-Project([object]$Job) {
     if (-not $Job.projectPath -or -not (Test-Path -LiteralPath $Job.projectPath -PathType Container)) { throw (T 'CwSelectProjectFolder') }
@@ -206,14 +295,14 @@ function Get-CtxVersion {
 }
 function Assert-CtxVersion {
     $version=Get-CtxVersion
-    if ($version -notin @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1','ctxhop 0.2.0-gui.2')) { throw (T 'CwCtxVersionUnsupported' $version) }
+    if ($version -notin @('ctxhop 0.2.0','ctxhop 0.2.0-gui.1','ctxhop 0.2.0-gui.2','ctxhop 0.2.0-gui.3')) { throw (T 'CwCtxVersionUnsupported' $version) }
 }
 function Assert-RestoreRuntime {
     $exe=Find-Executable 'ctxhop'
     $bundled=Join-Path $PSScriptRoot 'bin\ctxhop.exe'
     if ([IO.Path]::GetFullPath($exe) -ne [IO.Path]::GetFullPath($bundled)) { throw (T 'CwRestoreNeedsBundled') }
     if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $script:RestoreBinarySHA256) { throw (T 'CwRestoreHashMismatch') }
-    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.2') { throw (T 'CwRestoreVersionUnverified') }
+    if ((Get-CtxVersion) -ne 'ctxhop 0.2.0-gui.3') { throw (T 'CwRestoreVersionUnverified') }
 }
 function Assert-ListSchema([object]$Report) {
     if ($Report.scope -ne 'project' -or -not ($Report.PSObject.Properties.Name -contains 'sessions') -or $null -eq $Report.sessions -or $Report.sessions -isnot [array]) { throw (T 'CwUnknownListResponse') }
@@ -299,6 +388,26 @@ function Invoke-JobCore([object]$Job) {
             Invoke-Ctx @('version')
             $config = Read-Config
             return @{ device=$config.device.name; backend=$config.remote.type; store=$config.remote.path; syncConfig=$config.syncConfig; message=(T 'CwStatusDone') }
+        }
+        MoveStore {
+            # 저장소 폴더를 바꾼다. 옛 저장소를 새 폴더로 복사한 뒤, ctxhop이 새 폴더에서 같은 연결과 이 PC의 권한을 확인해야만 연결이 바뀐다.
+            $config = Read-Config
+            if ($config.remote.type -ne 'dir') { throw (T 'CwMoveStoreNotDir') }
+            if (-not $Job.store -or -not (Test-Path -LiteralPath $Job.store -PathType Container)) { throw (T 'CwStoreFolderMissing') }
+            $old = Normalize-ProjectPath ([string]$config.remote.path)
+            $new = Normalize-ProjectPath ([string]$Job.store)
+            # 정션이나 드라이브 별칭으로 같은 폴더를 다른 이름으로 고를 수 있으므로, 복사하기 전에 실제 위치끼리 비교하고 링크가 없는지 확인한다.
+            $newReal = Get-StoreRealPath $new
+            $oldReal = if ([IO.Directory]::Exists($old)) { Get-StoreRealPath $old } else { $old }
+            if ($newReal -ieq $oldReal) { throw (T 'CwMoveStoreSame' $old) }
+            if (Test-StoreOverlap $newReal $oldReal) { throw (T 'CwMoveStoreNested') }
+            if (Test-StoreOverlap $newReal (Get-StoreRealPath (Get-ConfigRoot))) { throw (T 'CwMoveStoreConfig' (Get-ConfigRoot)) }
+            Assert-StoreLinkFree (Join-Path $oldReal 'v1'); Assert-StoreLinkFree (Join-Path $newReal 'v1')
+            $copy = Copy-StoreFiles (Join-Path $oldReal 'v1') (Join-Path $newReal 'v1')
+            Invoke-Ctx @('remote','relocate','--path',$new)
+            $moved = [string](Read-Config).remote.path
+            if ((Normalize-ProjectPath $moved) -ine $new) { throw (T 'CwMoveStoreNotApplied') }
+            return @{ store=$moved; copied=$copy.copied; same=$copy.same; message=(T 'CwMoveStoreDone' $moved $copy.copied $copy.same) }
         }
         Bind {
             $null = Read-Config
