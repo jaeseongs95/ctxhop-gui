@@ -153,6 +153,9 @@ function Update-Selection {
     $desktop=$agent.SelectedIndex -eq 1
     $script:SessionButtons[1].Enabled=($null -ne $selected -and -not $script:Pending -and $(if ($desktop) {@($grid.SelectedRows | Where-Object { -not $_.Tag.local -and $_.Tag.remoteId -and -not $_.Tag.blockedReason }).Count -eq $grid.SelectedRows.Count} else {$selected.recordCount -gt 0}))
     $script:SessionButtons[2].Enabled=($null -ne $selected -and $selected.local -and -not $desktop -and -not $script:Pending)
+    # 작업이 끝나면 모든 버튼을 다시 켜므로 페이지 버튼도 여기서 넘길 페이지가 있을 때만 켠다.
+    $prevButton.Enabled=($script:Page -gt 0 -and -not $script:Pending)
+    $nextButton.Enabled=(($script:Page+1)*$script:PageSize -lt $script:Filtered.Count -and -not $script:Pending)
     $selectionLabel.Text=if ($grid.SelectedRows.Count -gt 1) { T 'GuiSelectionMany' $grid.SelectedRows.Count }
         elseif ($selected) { (T 'GuiSelectionInfo' ((@($selected.title,$selected.nativeId) | Where-Object { $_ }) -join ' · ')) + $(if ($selected.blockedReason) {(T 'GuiSelectionBlocked' $selected.blockedReason)} else {''}) }
         else { (T 'GuiNoSelectionHint') + $(if ($desktop) {T 'GuiMultiSelectHint'} else {''}) }
@@ -449,8 +452,8 @@ $dateFilter=New-Control ComboBox 630 136 175 28 '' $main; $dateFilter.DropDownSt
 $countLabel=New-Control Label 16 172 440 24 (T 'GuiCountInitial') $main
 $projectOnly=New-Control CheckBox 466 169 330 28 (T 'GuiProjectOnly') $main; $projectOnly.Checked=$true
 $projectOnly.Add_CheckedChanged({ $script:Page=0; Apply-Filter })
-$null=New-Button 806 164 82 (T 'GuiPrevPage') $main { if ($script:Page -gt 0) { $script:Page--; Apply-Filter } }
-$null=New-Button 902 164 82 (T 'GuiNextPage') $main { $script:Page++; Apply-Filter }
+$prevButton=New-Button 806 164 82 (T 'GuiPrevPage') $main { if ($script:Page -gt 0) { $script:Page--; Apply-Filter } }
+$nextButton=New-Button 902 164 82 (T 'GuiNextPage') $main { $script:Page++; Apply-Filter }
 $grid=New-Control DataGridView 16 205 988 174 '' $main
 $grid.ReadOnly=$true; $grid.AllowUserToAddRows=$false; $grid.AllowUserToDeleteRows=$false
 $grid.RowHeadersVisible=$false; $grid.SelectionMode='FullRowSelect'; $grid.MultiSelect=$false

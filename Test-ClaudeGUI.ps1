@@ -166,6 +166,7 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Write-Output "5000-session initial filter/render: $($watch.ElapsedMilliseconds)ms"
     Assert ($script:Sessions.Count -eq 5000 -and $script:Filtered.Count -eq 5000 -and $grid.Rows.Count -eq 200) '5000 sessions must keep the full cache and render only 200 rows.'
     Assert ($script:Page -eq 0 -and $countLabel.Text -like '*1/25') 'Initial pagination should show page 1 of 25.'
+    Assert (-not $prevButton.Enabled -and $nextButton.Enabled) 'The first of several pages must allow only Next.'
     Assert ($grid.SelectedRows.Count -eq 0 -and -not ($script:SessionButtons | Where-Object Enabled)) 'Loading must require explicit selection.'
     ($script:Buttons | Where-Object Text -eq '다음').PerformClick()
     Assert ($script:Page -eq 1 -and $grid.Rows[0].Tag.nativeId -eq $script:Filtered[200].nativeId) 'Next page must render the next 200 metadata records.'
@@ -173,6 +174,7 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Assert ($script:Page -eq 0) 'Previous page should return to the first page.'
     $script:Page = 24
     Apply-Filter
+    Assert ($prevButton.Enabled -and -not $nextButton.Enabled) 'The last page must allow only Previous.'
     ($script:Buttons | Where-Object Text -eq '다음').PerformClick()
     Assert ($script:Page -eq 24 -and $grid.Rows.Count -eq 200) 'Next at the final page must stay within bounds.'
     $search.Text = '로그인'
@@ -184,6 +186,7 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     $search.Text = '000000004321'
     Wait-Filter
     Assert ($script:Filtered.Count -eq 1 -and $grid.Rows[0].Tag.nativeId -like '*000000004321') 'Native session ID search must find the exact fixture.'
+    Assert (-not $prevButton.Enabled -and -not $nextButton.Enabled) 'A single page must disable both page buttons.'
     $search.Text = ''
     Wait-Filter
     $view.SelectedIndex = 1
@@ -241,6 +244,7 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Finish-Job
     Assert ($null -eq $script:Pending -and $status.Text -like '*취소했습니다*' -and $script:Errors.Count -eq 0) 'Cancelled List should return to idle without an error dialog.'
     Assert ($grid.Rows.Count -eq 2 -and -not $cancelButton.Enabled -and $projectPicker.Enabled -and -not (Test-Path -LiteralPath $cancelRequest)) 'List cancellation must preserve rows, restore controls, and remove fixture request files.'
+    Assert (-not $prevButton.Enabled -and -not $nextButton.Enabled) 'Finishing a task must not re-enable page buttons on a single page.'
     $statusJob = Base-Job 'Status'
     $statusJob.fixtureDelay = 20000
     Start-Job $statusJob
