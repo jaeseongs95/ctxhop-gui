@@ -63,9 +63,12 @@ try {
     Assert ($row[0].historyMode -eq 'paginated' -and $row[0].children -eq 0) 'native fixture is paginated and has no subagents'
     $found=Invoke-JobCore @{action='List';agent='codex-desktop';home=$fixtureHome;search=$thread.Substring(0,13)}
     Assert (@($found.sessions).Count -eq 1) 'search is passed to backend'
+    $dash=Invoke-JobCore @{action='List';agent='codex-desktop';home=$fixtureHome;search='-x'}
+    Assert (@($dash.sessions).Count -eq 0) 'search starting with - is a value, not a backend option'
 
     $failure=$null; try { Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread} } catch { $failure=$_ }
-    Assert ($null -ne $failure -and $failure.Exception.Message -match '종료|엔진' -and $failure.Exception.Message -notmatch '종료 코드') 'export block reason must reach the GUI'
+    # 백업은 앱 종료를 보지 않는다. Codex 앱이 켜져 있어도 격리한 LOCALAPPDATA에 엔진이 없다는 이유로만 멈춰야 한다.
+    Assert ($null -ne $failure -and $failure.Exception.Message -match '엔진' -and $failure.Exception.Message -notmatch '종료') "export stops only for the engine, never for a running app: $($failure.Exception.Message)"
     Assert (-not @(Get-ChildItem -LiteralPath (Join-Path $testDirectory 'CtxHopGUI\staging') -Recurse -Filter 'session.archive' -File)) 'blocked export writes no archive'
     Throws {Invoke-JobCore @{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=('peer-fixture/'+('c'*32))}} '엔진'
     Assert (-not @(Get-ChildItem -LiteralPath $receiver -Force)) 'preview without a known engine never writes the receiver store'

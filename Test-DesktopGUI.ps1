@@ -138,10 +138,20 @@ try {
     Finish-Fake $script:StartedJobs[0] @{ok=$true;data=@{message='합성 백업 완료'}}
     Assert ($script:StartedJobs.Count -eq 2 -and $script:StartedJobs[1].nativeId -ne $script:StartedJobs[0].nativeId) 'next conversation starts after one finishes'
     Finish-Fake $script:StartedJobs[1] @{ok=$false;error='합성 실패 이유'}
-    Assert ($null -eq $script:Bulk -and $script:Errors.Count -eq 1 -and $script:Errors[0] -like '*성공 1 · 건너뜀 2 · 실패 1 · 하지 않음 0*' -and $script:Errors[0] -like '*합성 실패 이유*') "failures are summarized once at the end: $($script:Errors -join '|')"
+    Assert ($null -eq $script:Bulk -and $script:Errors.Count -eq 1 -and $script:Errors[0] -like '*성공 1 · 건너뜀 2 · 진행 중 0 · 실패 1 · 하지 않음 0*' -and $script:Errors[0] -like '*합성 실패 이유*') "failures are summarized once at the end: $($script:Errors -join '|')"
     Assert ($script:StartedJobs.Count -eq 3 -and $script:StartedJobs[2].action -eq 'List') 'the list reloads so new backups count as up to date'
     Finish-Fake $script:StartedJobs[2] @{ok=$true;data=@{sessions=@();excluded=0;message='합성 목록'}}
     Assert ($status.Text -like '전체 백업 끝*' -and -not $script:BulkSummary) 'summary stays visible after the reload'
+    # 진행 중인 대화(백엔드 busy)는 실패가 아니라 따로 세고, 연속 실패에도 넣지 않는다.
+    Fill-Sessions @(foreach ($n in 0..3) { Row $ids[$n] 'D:\codex\AI논문' $true $t1 })
+    $script:StartedJobs=@(); $script:Errors=@()
+    Start-BulkBackup
+    foreach ($n in 0..1) { Finish-Fake $script:StartedJobs[$n] @{ok=$false;error='합성 실패'} }
+    Finish-Fake $script:StartedJobs[2] @{ok=$false;error='이 대화나 하위 대화가 지금 진행 중입니다.';backendResult=@{status='busy';reason='진행 중'}}
+    Assert ($script:Bulk -and $script:Bulk.busy.Count -eq 1 -and $script:Bulk.failed.Count -eq 2 -and $script:StartedJobs.Count -eq 4) 'a busy conversation is not a failure and does not add to the failure streak'
+    Finish-Fake $script:StartedJobs[3] @{ok=$true;data=@{message='합성 백업 완료'}}
+    Assert ($null -eq $script:Bulk -and $script:Errors.Count -eq 1 -and $script:Errors[0] -like '*성공 1 · 건너뜀 0 · 진행 중 1 · 실패 2 · 하지 않음 0*' -and $log.Text -like '*진행 중이라 건너뜀: 합성 *') "busy conversations are counted apart in the summary: $($script:Errors -join '|')"
+    Finish-Fake $script:StartedJobs[4] @{ok=$true;data=@{sessions=@();excluded=0;message='합성 목록'}}
     # 같은 이유로 연속 3번 실패하면(예: 앱이 켜져 있음) 남은 대화를 시도하지 않는다. 성공이 없으면 목록도 다시 불러오지 않는다.
     Fill-Sessions @(foreach ($n in 0..4) { Row $ids[$n] 'D:\codex\AI논문' $true $t1 })
     $script:StartedJobs=@(); $script:Errors=@()
@@ -167,7 +177,7 @@ try {
     }
     Assert ($script:Bulk.stop -and -not $script:Killed.Count -and $status.Text -like '*지금 대화를 마친 뒤*') 'first cancel lets the current conversation finish'
     Finish-Fake $script:StartedJobs[0] @{ok=$true;data=@{message='합성 백업 완료'}}
-    Assert ($null -eq $script:Bulk -and $script:StartedJobs.Count -eq 2 -and $script:StartedJobs[1].action -eq 'List' -and $status.Text -like '*성공 1 · 건너뜀 0 · 실패 0 · 하지 않음 2*취소해서*') "cancel stops before the next conversation: $($status.Text)"
+    Assert ($null -eq $script:Bulk -and $script:StartedJobs.Count -eq 2 -and $script:StartedJobs[1].action -eq 'List' -and $status.Text -like '*성공 1 · 건너뜀 0 · 진행 중 0 · 실패 0 · 하지 않음 2*취소해서*') "cancel stops before the next conversation: $($status.Text)"
     # 두 번째 취소는 확인 뒤 이 작업 창만 끝내고, 전체 백업은 목록을 다시 읽지 않고 요약만 남긴다(끊긴 대화는 하지 않음).
     Fill-Sessions @(foreach ($n in 0..2) { Row $ids[$n] 'D:\codex\AI논문' $true $t1 })
     $script:StartedJobs=@(); $script:Errors=@(); $script:Killed=@()
@@ -183,7 +193,7 @@ try {
     }
     Assert ($script:Killed -join ',' -eq '2147483000' -and $script:Pending.cancelled) 'second cancel stops only this worker after confirmation'
     $worker.HasExited=$true; Finish-Job
-    Assert ($null -eq $script:Bulk -and $null -eq $script:Pending -and $script:StartedJobs.Count -eq 1 -and $status.Text -like '*성공 0 · 건너뜀 0 · 실패 0 · 하지 않음 3*취소해서*') "second cancel ends the run without a reload: $($status.Text)"
+    Assert ($null -eq $script:Bulk -and $null -eq $script:Pending -and $script:StartedJobs.Count -eq 1 -and $status.Text -like '*성공 0 · 건너뜀 0 · 진행 중 0 · 실패 0 · 하지 않음 3*취소해서*') "second cancel ends the run without a reload: $($status.Text)"
     # 전체 백업 뒤 목록 다시 읽기가 실패하거나 취소되면 요약을 지워 다음 목록에 남지 않게 한다.
     foreach ($outcome in @(@{ok=$false;error='합성 목록 실패'},'cancel')) {
         $script:BulkSummary='전체 백업 끝: 합성'
@@ -191,6 +201,15 @@ try {
         else { Finish-Fake @{agent='codex-desktop';action='List'} $outcome }
         Assert (-not $script:BulkSummary -and $status.Text -notlike '전체 백업 끝*') "a failed or cancelled reload drops the bulk summary: $($status.Text)"
     }
+    $script:Pending=$null
+    # 한 대화 백업: Codex Desktop은 앱 종료를 묻지 않고, 진행 중(busy)이면 복구 기록 없이 이유만 보인다.
+    Fill-Sessions @(Row $ids[0] 'D:\codex\AI논문' $true $t1)
+    $grid.ClearSelection(); $grid.Rows[0].Selected=$true; Update-Selection
+    $script:StartedJobs=@(); $script:Errors=@(); $script:Asked=''
+    $backupButton.PerformClick()
+    Assert ($script:StartedJobs.Count -eq 1 -and $script:Asked -like '*Codex 앱은 켜 둬도*' -and $script:Asked -notlike '*종료했나요*') "a Codex Desktop backup does not ask to quit the app: $script:Asked"
+    Finish-Fake $script:StartedJobs[0] @{ok=$false;error='이 대화나 하위 대화가 지금 진행 중입니다.';backendResult=@{status='busy';reason='진행 중'}}
+    Assert ($script:Errors.Count -eq 1 -and $script:Errors[0] -like '*진행 중입니다*' -and $script:Errors[0] -notlike '*복구 기록*') "a busy single backup shows only the reason: $($script:Errors -join '|')"
     $script:Pending=$null
     # 작업 취소는 GUI가 띄운 작업 창과 그 하위 프로세스만 끝낸다. 이름으로 찾아 끄지 않으므로 Codex·Claude 앱은 건드리지 않는다.
     Assert ($source -notmatch 'Stop-Process\s+-Name|Get-Process|\.Kill\(|taskkill') 'GUI never kills processes by name, so the Codex and Claude apps are never force-closed'

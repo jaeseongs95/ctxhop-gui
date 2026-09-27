@@ -213,7 +213,8 @@ function Finish-Job {
         if (-not $result.ok) {
             $script:DesktopApplyQueue=@()
             $errorMessage=[string]$result.error
-            if ($result.backendResult) { $errorMessage+="`r`n" + (T 'GuiRecoveryRecord' ($result.backendResult | ConvertTo-Json -Depth 15 -Compress)) }
+            # 진행 중(busy)은 복구할 것이 없으므로 이유만 보인다.
+            if ($result.backendResult -and $result.backendResult.status -ne 'busy') { $errorMessage+="`r`n" + (T 'GuiRecoveryRecord' ($result.backendResult | ConvertTo-Json -Depth 15 -Compress)) }
             throw $errorMessage
         }
         $status.Text=$result.data.message
@@ -349,12 +350,12 @@ function Start-BulkBackup {
     $current=$local.Count-$blocked-$ready.Count
     if (-not $ready.Count) { throw (T 'GuiBulkNothing' $local.Count $current $blocked) }
     if (-not (Confirm (T 'GuiBulkConfirm' $ready.Count $current $blocked "`r`n"))) { return }
-    $script:Bulk=@{items=$ready;next=0;done=0;failed=@();streak=0;stop=$false;skipped=$current+$blocked}
+    $script:Bulk=@{items=$ready;next=0;done=0;failed=@();busy=@();streak=0;stop=$false;skipped=$current+$blocked}
     Continue-BulkBackup
 }
 function Continue-BulkBackup {
     $bulk=$script:Bulk
-    # 앱이 켜져 있거나 저장소에 쓸 수 없으면 모든 대화가 같은 이유로 실패하므로 연속 3번 실패하면 멈춘다.
+    # 저장소에 쓸 수 없는 경우처럼 모든 대화가 같은 이유로 실패하면 연속 3번 실패한 뒤 멈춘다.
     if ($bulk.stop -or $bulk.streak -ge 3 -or $bulk.next -ge $bulk.items.Count) { End-BulkBackup; return }
     $item=$bulk.items[$bulk.next]; $bulk.next++
     $job=Base-Job 'Backup'; $job.nativeId=$item.nativeId; $job.remoteId=''; $job.title=$item.title
@@ -364,6 +365,11 @@ function Continue-BulkBackup {
 function Step-BulkBackup([hashtable]$Job,[object]$Result) {
     $bulk=$script:Bulk
     if ($Result.ok) { $bulk.done++; $bulk.streak=0; $log.AppendText("$($Result.data.message)`r`n") }
+    elseif ($Result.backendResult.status -eq 'busy') {
+        # 지금 진행 중인 대화는 실패가 아니라 건너뜀이다. 연속 실패에도 넣지 않고, 턴이 끝난 뒤 다시 누르면 백업된다.
+        $bulk.busy+="$($Job.title) · $($Job.nativeId)"
+        $log.AppendText("$(T 'GuiBulkItemBusy' $Job.title $Job.nativeId)`r`n")
+    }
     else {
         $reason=if ($Result.error) {[string]$Result.error} else {T 'GuiWorkerAborted'}
         $bulk.failed+="$($Job.title) · $($Job.nativeId): $reason"; $bulk.streak++
@@ -373,7 +379,7 @@ function Step-BulkBackup([hashtable]$Job,[object]$Result) {
 }
 function End-BulkBackup {
     $bulk=$script:Bulk; $script:Bulk=$null
-    $summary=T 'GuiBulkSummary' $bulk.done $bulk.skipped $bulk.failed.Count ($bulk.items.Count-$bulk.done-$bulk.failed.Count)
+    $summary=T 'GuiBulkSummary' $bulk.done $bulk.skipped $bulk.busy.Count $bulk.failed.Count ($bulk.items.Count-$bulk.done-$bulk.busy.Count-$bulk.failed.Count)
     if ($bulk.streak -ge 3) { $summary+=(T 'GuiBulkStreakStop') } elseif ($bulk.stop) { $summary+=(T 'GuiBulkStopped') }
     $status.Text=$summary; $log.AppendText("$summary`r`n")
     if ($bulk.failed.Count) { Show-Error ("$summary`r`n`r`n" + (@($bulk.failed | Select-Object -First 10) -join "`r`n")) }
@@ -468,7 +474,8 @@ $grid.Columns['id'].MinimumWidth=300; $grid.Columns['updated'].MinimumWidth=135
 $selectionLabel=New-Control Label 16 384 988 24 (T 'GuiNoSelection') $main; $selectionLabel.Anchor='Bottom,Left,Right'
 $backupButton=New-Button 16 411 220 (T 'GuiBackupSelected') $main {
     $job=Selected-Job 'Backup'
-    if (Confirm "$(T 'GuiFieldSession' $job.title)`r`n$(T 'GuiFieldAgent' $job.agent)`r`nID: $($job.nativeId)`r`n$(T 'GuiFieldProject' $job.identity)`r`n`r`n$(T 'GuiBackupConfirm')") { Start-Job $job }
+    $question=if ($job.agent -eq 'codex-desktop') { T 'GuiBackupConfirmDesktop' } else { T 'GuiBackupConfirm' }
+    if (Confirm "$(T 'GuiFieldSession' $job.title)`r`n$(T 'GuiFieldAgent' $job.agent)`r`nID: $($job.nativeId)`r`n$(T 'GuiFieldProject' $job.identity)`r`n`r`n$question") { Start-Job $job }
 }
 $restoreButton=New-Button 252 411 220 (T 'GuiPreviewRestore') $main { if ($agent.SelectedIndex -eq 1) { Start-DesktopPreview } else { Start-Job (Selected-Job 'Preview') } }
 $openButton=New-Button 488 411 200 (T 'GuiOpenSelected') $main { Start-Job (Selected-Job 'Open') }

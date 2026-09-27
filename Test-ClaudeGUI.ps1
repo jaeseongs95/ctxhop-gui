@@ -70,6 +70,7 @@ try {
     }
     function Confirm([string]$Message) {
         Assert ($script:Answers.Count -gt 0) 'Unexpected confirmation dialog.'
+        $script:LastConfirm = $Message
         $answer = $script:Answers[0]
         $script:Answers = @($script:Answers | Select-Object -Skip 1)
         # 확인 창이 떠 있는 동안 일어나는 일은 스크립트 블록 답으로 흉내 낸다.
@@ -115,6 +116,10 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Assert ($job.projectPath -eq $project.Text -and $job.identity -eq $identity.Text) 'Selected job should preserve project fields.'
     Apply-Filter
     Assert ($grid.SelectedRows.Count -eq 1 -and $grid.SelectedRows[0].Tag.nativeId -eq $job.nativeId) 'Filtering should preserve an explicitly selected visible session.'
+    # Claude Code 백업은 Codex Desktop과 달리 계속 에이전트 종료를 확인한다(취소로 답해 작업은 띄우지 않는다).
+    $script:Answers = @($false); $launchesBefore = @($script:Launches).Count
+    $script:SessionButtons[0].PerformClick()
+    Assert ($script:LastConfirm -like '*종료했나요*' -and $script:Answers.Count -eq 0 -and @($script:Launches).Count -eq $launchesBefore) "A Claude Code backup still asks whether the agent was quit: $script:LastConfirm"
     $grid.ClearSelection()
     $grid.Rows[1].Selected = $true
     Assert (-not $script:SessionButtons[0].Enabled -and $script:SessionButtons[1].Enabled -and -not $script:SessionButtons[2].Enabled) 'A remote-only session should allow restore but disable local backup and open.'

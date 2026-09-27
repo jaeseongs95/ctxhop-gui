@@ -30,7 +30,7 @@ foreach ($pair in @(@('--id',$Id),@('--archive',$Archive),@('--cwd',$Cwd),@('--o
 }
 if ($Action -eq 'list') {
     $nativeArgs += '--offset',[string]$Offset,'--limit',[string]$Limit
-    if ($Search) { $nativeArgs += '--search',$Search }
+    if ($Search) { $nativeArgs += "--search=$Search" }
 }
 if ($Action -eq 'apply') { $nativeArgs += '--choice',$Choice }
 try {

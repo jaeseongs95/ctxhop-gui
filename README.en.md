@@ -9,7 +9,7 @@ Back up Claude Code and Codex Desktop conversations from one window and restore 
 ## What you need
 
 - Windows with Windows PowerShell 5.1.
-- A folder that both PCs can see, such as a Google Drive folder. The GUI keeps the encrypted backups there.
+- A folder that both PCs can see, such as a Google Drive folder. The GUI keeps the encrypted backups there. Anyone who can write to this folder can plant backups or make later backups readable to them, so use a folder of your own that you do not share (see the security review in `verification.md`).
 - For **Codex Desktop**:
   - Codex Desktop engine `0.158.0-alpha.2` or `0.158.0-alpha.2.1`. The PC that made a backup and the PC that restores it must run **exactly the same** engine version. Otherwise the restore is blocked before anything is written.
   - Python from the Codex Desktop install (`%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`). To use another Python 3.10 or later, put `{"pythonPath":"absolute path"}` in `backend\runtime.json` on that PC. The GUI does not use Python from PATH and does not install one.
@@ -90,15 +90,16 @@ The list loads all projects, archived conversations, and shared backups. You can
 
 ### Back up
 
-1. Quit the Codex app yourself.
-2. Select one local conversation and click **Back up selected**.
+1. Select one local conversation and click **Back up selected**. The Codex app may stay open.
+
+A backup only reads, so you do not need to quit the Codex app. If that conversation or one of its subagent conversations is in progress right now (its last turn has not finished and something was written in the last 15 minutes), it is skipped so that a half-written record is never backed up. Try again after the turn finishes. A conversation that changes while it is being backed up is skipped for the same reason. A conversation whose turn was cut off, for example when the app was forced to quit, is backed up once 15 minutes have passed.
 
 Each backup is a separate encrypted snapshot that holds the parent conversation and all of its subagent conversations. Several backups with the same UUID appear as separate rows. The GUI never picks one by date and never overwrites one.
 
 **Back up all filtered** backs up, one by one, every conversation on this PC that matches the current filter (This project only, search, view, date), across all pages.
-- It first shows how many it will back up and skip and asks you to confirm. Keep the Codex app closed until it finishes. Each conversation takes a few seconds.
+- It first shows how many it will back up and skip and asks you to confirm. The Codex app may stay open; conversations in progress are counted as **in progress** and skipped. Each conversation takes a few seconds.
 - Conversations that already have a shared backup with the same UUID and modification time are skipped, so running it again uploads only conversations that changed. The modification time is the latest one in the group, so a change in a subagent conversation alone also triggers a new backup. `Older format` backups have no subagent conversations and do not count as up to date.
-- If one conversation fails, it moves on to the next and shows the done, skipped and failed counts with the reasons at the end. It stops after 3 failures in a row, for example when the app is running.
+- If one conversation fails, it moves on to the next and shows the done, skipped, in progress and failed counts with the reasons at the end. It stops after 3 failures in a row, for example when the store cannot be written. Conversations skipped as in progress do not count as failures.
 - Click **Cancel task** once to stop after the current conversation, or again to stop the task window right away.
 - If anything was backed up, the list reloads to show the new backups.
 
