@@ -302,11 +302,17 @@ function Continue-DesktopApply {
         Start-Job $next
     } else { $status.Text=(T 'GuiApplyDone') }
 }
+# 빈 칸·공백·잘못된 문자는 Test-Path가 예외를 내거나 현재 폴더로 풀므로 폴더가 아닌 것으로 본다.
+function Test-Folder([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try { return (Test-Path -LiteralPath $Path -PathType Container) } catch { return $false }
+}
+function Show-Dialog([object]$Dialog) { return $Dialog.ShowDialog($form) }
 function Browse-Folder([object]$Target) {
     $dialog=[Windows.Forms.FolderBrowserDialog]::new()
     $dialog.Description=(T 'GuiFolderDialog')
-    if (Test-Path -LiteralPath $Target.Text) { $dialog.SelectedPath=$Target.Text }
-    if ($dialog.ShowDialog($form) -eq 'OK') { $Target.Text=$dialog.SelectedPath }
+    if (Test-Folder $Target.Text) { $dialog.SelectedPath=$Target.Text }
+    if ((Show-Dialog $dialog) -eq 'OK') { $Target.Text=$dialog.SelectedPath }
     $dialog.Dispose()
 }
 $form=[Windows.Forms.Form]::new()
@@ -411,8 +417,8 @@ $null=New-Button 22 225 240 (T 'GuiSetupJoin') $settings { Start-Job (Base-Job '
 $null=New-Button 278 225 200 (T 'GuiCheckConnection') $settings { Start-Job (Base-Job 'Status') }
 $null=New-Button 494 225 238 (T 'GuiCreateInvite') $settings {
     $d=[Windows.Forms.SaveFileDialog]::new(); $d.Filter=(T 'GuiInviteFilter'); $d.FileName='ctxhop-invite.json'
-    if (Test-Path -LiteralPath $store.Text) { $d.InitialDirectory=$store.Text }
-    if ($d.ShowDialog($form) -eq 'OK') { $job=Base-Job 'Invite'; $job.output=$d.FileName; Start-Job $job }; $d.Dispose()
+    if (Test-Folder $store.Text) { $d.InitialDirectory=$store.Text }
+    if ((Show-Dialog $d) -eq 'OK') { $job=Base-Job 'Invite'; $job.output=$d.FileName; Start-Job $job }; $d.Dispose()
 }
 $null=New-Control Label 22 278 150 25 (T 'GuiCodexDataFolder') $settings
 $desktopHome=New-Control TextBox 182 274 640 28 $script:Prefs.home $settings

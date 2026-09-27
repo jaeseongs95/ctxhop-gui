@@ -283,6 +283,29 @@ if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$j
     Assert ($script:Pending.job.action -eq 'Open') 'Accepted restore completion should start Open.'
     Finish-Fixture
     Assert ($null -eq $script:Pending) 'Open completion should return to idle.'
+    # 빈 칸·공백·잘못된 경로에서 폴더 선택과 초대 만들기를 눌러도 오류 없이 대화 상자를 연다.
+    $script:Dialogs = @()
+    function Show-Dialog([object]$Dialog) {
+        $script:Dialogs += [pscustomobject]@{start=$(if ($Dialog -is [Windows.Forms.FolderBrowserDialog]) {$Dialog.SelectedPath} else {$Dialog.InitialDirectory})}
+        return 'Cancel'
+    }
+    $browseButtons = @($script:Buttons | Where-Object Text -eq '폴더 선택')
+    $inviteButton = $script:Buttons | Where-Object Text -eq '다른 PC용 초대 만들기'
+    Assert ($browseButtons.Count -eq 3 -and $null -ne $inviteButton) 'Three folder buttons and the invite button should exist.'
+    foreach ($value in @('', '   ', 'a|b')) {
+        $project.Text = $value; $store.Text = $value; $desktopHome.Text = $value
+        $tabs.SelectedTab = $main; [Windows.Forms.Application]::DoEvents()
+        $browseButtons[0].PerformClick()
+        $tabs.SelectedTab = $settings; [Windows.Forms.Application]::DoEvents()
+        $browseButtons[1].PerformClick(); $browseButtons[2].PerformClick(); $inviteButton.PerformClick()
+    }
+    Assert ($script:Dialogs.Count -eq 12 -and -not ($script:Dialogs | Where-Object start)) ("Empty, blank and invalid paths must open every dialog without a start folder: $($script:Dialogs.Count) dialogs [" + (($script:Dialogs | ForEach-Object start) -join '|') + '] errors: ' + ($script:Errors -join ', '))
+    $project.Text = $fixtureRoot; $store.Text = $fixtureRoot
+    $tabs.SelectedTab = $main; [Windows.Forms.Application]::DoEvents(); $browseButtons[0].PerformClick()
+    $tabs.SelectedTab = $settings; [Windows.Forms.Application]::DoEvents(); $inviteButton.PerformClick()
+    $tabs.SelectedTab = $main
+    Assert ($script:Dialogs.Count -eq 14 -and $script:Dialogs[12].start -eq $fixtureRoot -and $script:Dialogs[13].start -eq $fixtureRoot) 'An existing folder should become the dialog start folder.'
+    Assert ($project.Text -eq $fixtureRoot) 'A cancelled folder dialog must keep the box text.'
     Assert ($script:Errors.Count -eq 0) ('Unexpected UI errors: ' + ($script:Errors -join ', '))
     Assert ([Convert]::ToBase64String([IO.File]::ReadAllBytes($fixturePrefsFile)) -eq $fixturePrefsBytes) 'Preferences must never be saved during fixture tests.'
     Write-Output "PASS: $script:Checks GUI assertions; $($script:Launches.Count) isolated fixture worker processes; screenshot $script:FixtureScreenshotPath"

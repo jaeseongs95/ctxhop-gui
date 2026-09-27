@@ -16,11 +16,25 @@ Back up Claude Code and Codex Desktop conversations from one window and restore 
 
 ## Install
 
-1. Download `CtxHop-GUI-vNext-<date>.zip` from [Releases](https://github.com/jaeseongs95/ctxhop/releases) and check the SHA256 shown on the release page.
-2. **Unblock the zip before extracting it.** Right-click the zip → **Properties** → check **Unblock**, or run `Unblock-File .\CtxHop-GUI-vNext-<date>.zip`. If you skip this, Windows blocks the extracted `.ps1` files and the GUI silently does not open. If you already extracted it, delete that folder and extract the unblocked zip again.
-3. Extract the zip and run `ctxhop-gui-vnext\Run-CtxHop-GUI-vNext.cmd`.
+Download either the installer or the zip from [Releases](https://github.com/jaeseongs95/ctxhop/releases); both contain the same GUI. First check that the file matches the SHA256 shown on the release page.
 
-The zip includes `bin\ctxhop.exe` and `bin\ctxhop-claude.exe`. These builds are not in the repository. See [Integrity checks](#integrity-checks).
+**Installer (recommended)**
+
+1. Run `CtxHop-GUI-vNext-<date>-setup.exe`. The installer is unsigned, so Windows may show **Windows protected your PC**; click **More info** → **Run anyway**.
+2. It installs without admin rights to `%LOCALAPPDATA%\Programs\CtxHop GUI vNext` and adds a **CtxHop GUI vNext** shortcut to the Start menu and, if you keep that option, the desktop. Installed files need no unblocking.
+3. Start it from the last setup page or later from the shortcut.
+
+- Install a newer build over the old one with its installer.
+- While a GUI task (list, backup, restore, setup) is running, setup and uninstall ask you to wait until it finishes, then continue.
+- To remove it, go to Windows **Settings** → **Apps** → **Installed apps** and uninstall **CtxHop GUI vNext**. GUI settings and job folders in `%LOCALAPPDATA%\CtxHopGUI` and the ctxhop configuration are left in place. A `backend\runtime.json` you created stays in the install folder.
+- The installer is built from [`installer/CtxHop-GUI-vNext.iss`](installer/CtxHop-GUI-vNext.iss) (Inno Setup 6.7).
+
+**Zip**
+
+1. **Unblock the zip before extracting it.** Right-click the zip → **Properties** → check **Unblock**, or run `Unblock-File .\CtxHop-GUI-vNext-<date>.zip`. If you skip this, Windows blocks the extracted `.ps1` files and the GUI silently does not open. If you already extracted it, delete that folder and extract the unblocked zip again.
+2. Extract the zip and run `ctxhop-gui-vnext\Run-CtxHop-GUI-vNext.cmd`.
+
+The installer and the zip include `bin\ctxhop.exe` and `bin\ctxhop-claude.exe`. These builds are not in the repository. See [Integrity checks](#integrity-checks).
 
 ## First-time setup
 
@@ -81,7 +95,7 @@ Each backup is a separate encrypted snapshot. Several backups with the same UUID
 
 ### The GUI does not open
 
-The zip was probably extracted without being unblocked. Delete the extracted folder, unblock the zip (see [Install](#install)), and extract it again.
+If you used the zip, it was probably extracted without being unblocked. Delete the extracted folder, unblock the zip (see [Install](#install)), and extract it again. The installer does not have this problem; try the shortcut again, and if the GUI still does not open, run the installer again to reinstall over it.
 
 ### A task fails or seems stuck
 

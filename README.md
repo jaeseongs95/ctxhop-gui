@@ -16,11 +16,25 @@ Claude Code와 Codex Desktop 대화를 한 창에서 백업하고 다른 PC에�
 
 ## 설치
 
-1. [Releases](https://github.com/jaeseongs95/ctxhop/releases)에서 `CtxHop-GUI-vNext-<날짜>.zip`을 받고, 릴리스 페이지의 SHA256과 같은지 확인합니다.
-2. **압축을 풀기 전에 차단을 해제합니다.** zip을 오른쪽 클릭 → **속성** → **차단 해제**를 체크하거나 `Unblock-File .\CtxHop-GUI-vNext-<날짜>.zip`을 실행합니다. 이 단계를 건너뛰면 Windows가 풀린 `.ps1`을 막아 GUI가 아무 표시 없이 뜨지 않습니다. 이미 풀었다면 그 폴더를 지우고 차단을 해제한 zip으로 다시 풉니다.
-3. 압축을 풀고 `ctxhop-gui-vnext\Run-CtxHop-GUI-vNext.cmd`를 실행합니다.
+[Releases](https://github.com/jaeseongs95/ctxhop/releases)에서 설치 파일이나 zip 중 하나를 받습니다. 두 파일에 든 GUI는 같습니다. 받은 파일이 릴리스 페이지의 SHA256과 같은지 먼저 확인합니다.
 
-zip에는 저장소에 없는 `bin\ctxhop.exe`와 `bin\ctxhop-claude.exe`가 들어 있습니다. [무결성 검사](#무결성-검사)를 참고하세요.
+**설치 파일(추천)**
+
+1. `CtxHop-GUI-vNext-<날짜>-setup.exe`를 실행합니다. 서명 없는 설치 파일이라 **Windows의 PC 보호** 창이 뜰 수 있습니다. 그러면 **추가 정보** → **실행**을 누릅니다.
+2. 관리자 권한 없이 `%LOCALAPPDATA%\Programs\CtxHop GUI vNext`에 설치되고, 시작 메뉴와 바탕화면(설치 중 선택)에 **CtxHop GUI vNext** 바로가기가 생깁니다. 설치된 파일은 차단을 해제할 필요가 없습니다.
+3. 마지막 화면에서 바로 실행하거나, 나중에 바로가기로 실행합니다.
+
+- 새 판은 같은 설치 파일 방식으로 덮어 설치합니다.
+- GUI 작업(목록·백업·복원·설정)이 진행 중이면 설치와 제거가 그 작업이 끝날 때까지 기다리라고 안내합니다. 작업이 끝난 뒤 계속합니다.
+- 지울 때는 Windows **설정** → **앱** → **설치된 앱**에서 **CtxHop GUI vNext**를 제거합니다. `%LOCALAPPDATA%\CtxHopGUI`의 GUI 설정·작업 폴더와 ctxhop 설정은 지우지 않습니다. 직접 만든 `backend\runtime.json`은 설치 폴더에 남습니다.
+- 설치 파일을 만드는 스크립트는 [`installer/CtxHop-GUI-vNext.iss`](installer/CtxHop-GUI-vNext.iss)(Inno Setup 6.7)입니다.
+
+**zip**
+
+1. **압축을 풀기 전에 차단을 해제합니다.** zip을 오른쪽 클릭 → **속성** → **차단 해제**를 체크하거나 `Unblock-File .\CtxHop-GUI-vNext-<날짜>.zip`을 실행합니다. 이 단계를 건너뛰면 Windows가 풀린 `.ps1`을 막아 GUI가 아무 표시 없이 뜨지 않습니다. 이미 풀었다면 그 폴더를 지우고 차단을 해제한 zip으로 다시 풉니다.
+2. 압축을 풀고 `ctxhop-gui-vnext\Run-CtxHop-GUI-vNext.cmd`를 실행합니다.
+
+설치 파일과 zip에는 저장소에 없는 `bin\ctxhop.exe`와 `bin\ctxhop-claude.exe`가 들어 있습니다. [무결성 검사](#무결성-검사)를 참고하세요.
 
 ## 처음 설정
 
@@ -81,7 +95,7 @@ zip에는 저장소에 없는 `bin\ctxhop.exe`와 `bin\ctxhop-claude.exe`가 들
 
 ### GUI가 뜨지 않을 때
 
-zip을 차단 해제하지 않고 풀었을 가능성이 큽니다. 풀린 폴더를 지우고, zip을 차단 해제한 뒤([설치](#설치) 참고) 다시 풉니다.
+zip으로 설치했다면 zip을 차단 해제하지 않고 풀었을 가능성이 큽니다. 풀린 폴더를 지우고, zip을 차단 해제한 뒤([설치](#설치) 참고) 다시 풉니다. 설치 파일로 설치했다면 이 문제가 생기지 않습니다. 바로가기를 다시 눌러 보고, 그래도 뜨지 않으면 설치 파일을 다시 실행해 덮어 설치합니다.
 
 ### 작업이 실패하거나 멈춘 것 같을 때
 
