@@ -21,8 +21,11 @@ New-Item -ItemType Directory -Path $Out | Out-Null
 $Out = (Resolve-Path -LiteralPath $Out).Path
 "repo HEAD: $(git -C $repo rev-parse HEAD)"
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-exes.ps1') -Out (Join-Path $Out 'exes') -GoExe $GoExe -TempDir $TempDir -GoWork $GoWork
-if ($LASTEXITCODE -ne 0) { throw 'the rebuilt exes differ from the pinned hashes' }
+# Empty values are left out: powershell.exe -File drops an empty argument and the parameter would miss its value.
+$exeArgs = @('-Out', (Join-Path $Out 'exes'), '-GoExe', $GoExe, '-TempDir', $TempDir)
+if ($GoWork) { $exeArgs += @('-GoWork', $GoWork) }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-exes.ps1') @exeArgs
+if ($LASTEXITCODE -ne 0) { throw "build-exes.ps1 failed (exit $($LASTEXITCODE)): exes that differ from the pins, or a build error" }
 
 # Committed bytes only: no autocrlf conversion, nothing from the working tree.
 $pkg = Join-Path $Out 'ctxhop-gui-vnext'

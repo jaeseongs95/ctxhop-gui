@@ -37,14 +37,20 @@ function Invoke-Native([string]$Exe, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Exe $($Arguments -join ' ') exited $LASTEXITCODE" }
 }
 
+# Relative paths are taken from the current location once, before the builds change it.
+$full = { param($p) $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($p) }
+$Out = & $full $Out; $TempDir = & $full $TempDir
+if ($GoWork) { $GoWork = & $full $GoWork }
+if ($GoExe -match '[\\/]') { $GoExe = & $full $GoExe }   # a bare name is looked up in PATH
 if (Test-Path -LiteralPath $Out) { throw "output exists: $Out" }
 New-Item -ItemType Directory -Path $Out | Out-Null
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 $env:TMP = $TempDir; $env:TEMP = $TempDir; $env:GOTMPDIR = $TempDir
 if ($GoWork) { $env:GOPATH = Join-Path $GoWork 'gopath'; $env:GOCACHE = Join-Path $GoWork 'gocache' }
-# The exact bytes also depend on these; clear anything a caller's environment could add.
+# Build settings that change the output bytes are fixed here. Module download settings (GOPROXY, GOSUMDB,
+# GONOSUMDB, GOPRIVATE, GOINSECURE) and the cache locations are left to the caller; go.sum still pins every module.
 foreach ($v in 'GOFLAGS', 'GOEXPERIMENT', 'GOFIPS140', 'GOROOT', 'GOMODCACHE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
-$env:GOENV = 'off'; $env:GOTOOLCHAIN = 'local'; $env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:GOAMD64 = 'v1'
+$env:GOENV = 'off'; $env:GOWORK = 'off'; $env:GOTOOLCHAIN = 'local'; $env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:GOAMD64 = 'v1'
 $goVersion = & $GoExe version
 if ($goVersion -ne 'go version go1.27.1 windows/amd64') { throw "need go1.27.1 windows/amd64, got: $goVersion" }
 $goVersion
