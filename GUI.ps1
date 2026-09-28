@@ -334,7 +334,8 @@ function Finish-Job {
                 $p=$result.data.preview
                 $summary="$(T 'GuiFieldSession' $pending.job.title)`r`n$(T 'GuiFieldSessionId' $p.session)`r`n$(T 'GuiFieldAgent' $p.agent)`r`n$(T 'GuiFieldProject' $pending.job.identity)`r`n$(T 'GuiFieldWorkspace' $p.workspace)`r`n$(T 'GuiFieldDifferences' $p.differences)`r`n$(Format-ProjectPreview $result.data.project)`r`n`r`n$(T 'GuiPreviewConfirm')"
                 if (Confirm $summary) {
-                    $job=$pending.job; $job.action='Restore'
+                    # 미리보기의 receipt·token을 그대로 돌려줘야 Worker가 프로젝트 미리보기와 짝을 확인한다.
+                    $job=$pending.job; $job.action='Restore'; $job.receipt=[string]$result.data.receipt; $job.token=[string]$result.data.token
                     Select-ProjectTargets $job $result.data.project
                     Start-Job $job
                 }

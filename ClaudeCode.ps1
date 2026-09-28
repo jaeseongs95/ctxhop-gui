@@ -50,8 +50,9 @@ $script:ClaudeCodeOps=@{
     }
     preview={ param($R)
         $shown=Invoke-ClaudeCore $R 'Preview'
-        # 복원할 때 ClaudeWorker가 미리보기를 다시 검사하므로 receipt·token은 쓰지 않는다.
-        return @{state='ready';choices=@('incoming');receipt='';token='';view=$shown.preview;message=[string]$shown.message}
+        # 복원할 때 ClaudeWorker가 대화 미리보기를 다시 검사하므로 receipt는 쓰지 않는다. token은 이 미리보기를 가리키는 일회용 값이고,
+        # Worker가 프로젝트 파일 미리보기와 짝을 맞출 때만 쓴다.
+        return @{state='ready';choices=@('incoming');receipt='';token=[guid]::NewGuid().ToString();view=$shown.preview;message=[string]$shown.message}
     }
     restore={ param($R)
         if ($R.choice -cne 'incoming') { throw (T 'WkChoiceRequired') }

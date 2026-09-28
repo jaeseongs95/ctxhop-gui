@@ -226,6 +226,7 @@ $script:StringTable=@{
     WkImplOpUnsupported=@('이 구현은 {0} 작업을 지원하지 않습니다.','This implementation does not support {0}.')
     WkImplResponseTooLarge=@('{0} 응답이 16MiB를 넘어 보내지 않았습니다.','The {0} response is over 16 MiB and was not sent.')
     WkSourceChanged=@('확인한 뒤 대화의 작업 폴더가 바뀌어 아무것도 올리지 않았습니다. 다시 백업하세요.','The conversation''s project folders changed after they were checked, so nothing was uploaded. Back it up again.')
+    WkProjectGrewUnapproved=@('확인한 뒤 200MB를 넘게 커졌는데 허락받지 않은 폴더라 올리지 않음','grew past 200 MB after it was checked and was not approved, so it was not uploaded')
     WkDesktopHomeMissing=@('Codex 데이터 폴더가 없습니다. 실제 폴더를 선택하세요.','Codex data folder not found. Select an existing folder.')
     WkTargetFolderRequired=@('복원할 실제 작업 폴더를 선택하세요.','Select an existing project folder to restore into.')
     WkBadBundleId=@('잘못된 공유 백업 ID입니다.','Invalid shared backup ID.')

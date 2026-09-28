@@ -279,7 +279,7 @@ function Get-ProjectPlan([object]$Job,[string]$Start,[string[]]$Cwds,[string[]]$
         }
         $folders+=,$entry
     }
-    return @{folders=$folders;skipped=@($picked.skipped);outside=@($picked.outside);ask=$ask}
+    return @{folders=$folders;skipped=@($picked.skipped);outside=@($picked.outside);ask=$ask;approved=$approved}
 }
 function New-ProjectQuestion([hashtable]$Plan) {
     # 대화도 올리지 않고 돌려준다. GUI가 보류했다가 사용자가 고르면 projectApproved를 넣어 다시 실행한다.
@@ -293,13 +293,21 @@ function Save-ProjectBackup([hashtable]$Plan,[string]$Agent,[string]$SessionId,[
         $entry=$Plan.folders[$i]
         if ($entry.status -ne 'pending') { continue }
         $zip=Join-Path $Stage "project-$i.zip"
+        # 계획을 세운 뒤에도 파일이 커질 수 있으므로 실제로 읽는 압축 전 총량을 제한한다. 허락받은 폴더는 받는 쪽 한도(16GiB)까지,
+        # 묻지 않은 폴더는 묻는 기준(200MB) 아래까지만 읽고, 넘으면 그 폴더는 올리지 않는다(대화 백업은 그대로).
+        $approved=@($Plan.approved) -icontains $entry.sourcePath
+        $limit=if ($approved) {$script:ProjectMaxBytes} else {$script:ProjectAskBytes-1}
+        $overReason=if ($approved) {'tooLarge'} else {T 'WkProjectGrewUnapproved'}
         try {
-            $manifest=Get-ProjectManifest $entry.list; $hash=$manifest.hash; $missed=$manifest.unreadable.Count
+            $manifest=Get-ProjectManifest $entry.list $limit
+            if ($manifest.overLimit) { $entry.status='skipped'; $entry.reason=$overReason; continue }
+            $hash=$manifest.hash; $missed=$manifest.unreadable.Count
             $found=@($bundles | Where-Object { $_.metadata.historyMode -ceq "project-files;v1;$hash" })
             $snapshot=$null
             if (-not $found.Count) {
                 # 해시를 구한 뒤 바뀐 파일이 있을 수 있으므로 실제로 넣은 내용의 해시로 다시 찾는다.
-                $snapshot=New-ProjectSnapshot $entry.list $zip
+                $snapshot=New-ProjectSnapshot $entry.list $zip $limit
+                if ($snapshot.overLimit) { $entry.status='skipped'; $entry.reason=$overReason; continue }
                 $hash=$snapshot.hash; $missed=$snapshot.unreadable.Count; $entry.files=$snapshot.files; $entry.bytes=$snapshot.bytes
                 $found=@($bundles | Where-Object { $_.metadata.historyMode -ceq "project-files;v1;$hash" })
             }
@@ -337,8 +345,9 @@ function Read-ProjectLink([string]$File,[string]$Agent,[string]$SessionId,[strin
     }
     return $link
 }
-function Get-ProjectPreview([string]$Agent,[string]$SessionId,[string]$Conversation,[string]$Target,[string]$Stage) {
+function Get-ProjectPreview([string]$Agent,[string]$SessionId,[string]$Conversation,[string]$Target,[string]$Stage,[hashtable]$Pair) {
     # 이 대화 백업에 이어진 프로젝트 파일을 받아 복원할 폴더와 비교한다. 이 PC에 없는 추가 폴더는 GUI가 고르도록 needsFolder로 둔다.
+    # $Pair는 같은 미리보기의 대화 쪽 값(대상 홈, 벤더 receipt·token)이다. 복원할 때 이 기록과 짝이 맞아야 한다(Assert-ProjectPairing).
     $links=@(Get-ProjectBundles | Where-Object { $_.metadata.historyMode -ceq "project-link;v1;$Agent" -and $_.metadata.sessionId -eq $SessionId -and $_.metadata.title -ceq $Conversation } | Sort-Object { [datetimeoffset]::Parse($_.metadata.updatedAt) } -Descending)
     if (-not $links.Count) { return @{state='none'} }
     $linkFile=Join-Path $Stage 'project-link.json'
@@ -363,12 +372,12 @@ function Get-ProjectPreview([string]$Agent,[string]$SessionId,[string]$Conversat
         $folders+=,$entry
     }
     $receipt=Join-Path $Stage 'project-receipt.json'
-    [IO.File]::WriteAllText($receipt,(ConvertTo-Json -InputObject ([ordered]@{agent=$Agent;sessionId=$SessionId;conversation=$Conversation;linkId=$links[0].id;folders=$folders}) -Depth 8),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($receipt,(ConvertTo-Json -InputObject ([ordered]@{agent=$Agent;sessionId=$SessionId;conversation=$Conversation;home=[string]$Pair.home;target=$Target;receipt=[string]$Pair.receipt;token=[string]$Pair.token;linkId=$links[0].id;folders=$folders}) -Depth 8),[Text.UTF8Encoding]::new($false))
     return @{state='found';receipt=$receipt;createdAt=[string]$link.createdAt;folders=$folders;skipped=@($link.skipped);outside=@($link.outside)}
 }
-function Get-ProjectPreviewSafe([string]$Agent,[string]$SessionId,[string]$Conversation,[string]$Target,[string]$Stage) {
+function Get-ProjectPreviewSafe([string]$Agent,[string]$SessionId,[string]$Conversation,[string]$Target,[string]$Stage,[hashtable]$Pair) {
     # 프로젝트 파일을 읽지 못해도 대화 미리보기는 그대로 보인다.
-    try { return (Get-ProjectPreview $Agent $SessionId $Conversation $Target $Stage) } catch { return @{state='error';reason=$_.Exception.Message} }
+    try { return (Get-ProjectPreview $Agent $SessionId $Conversation $Target $Stage $Pair) } catch { return @{state='error';reason=$_.Exception.Message} }
 }
 function Read-ProjectReceipt([string]$Path,[string]$Agent,[string]$SessionId,[string]$Conversation) {
     $root=[IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'CtxHopGUI\staging')).TrimEnd('\')
@@ -382,6 +391,13 @@ function Read-ProjectReceipt([string]$Path,[string]$Agent,[string]$SessionId,[st
     }
     return $record
 }
+function Assert-ProjectPairing([object]$Job) {
+    # 프로젝트 미리보기가 이번 복원과 같은 미리보기에서 나왔는지 대화를 쓰기 전에 확인한다: 벤더·대화 ID, 대상 홈, 복원 폴더,
+    # 벤더 receipt·token이 모두 같아야 한다. 틀리면 아무것도 쓰거나 지우지 않고 멈춘다.
+    $record=Read-ProjectReceipt $Job.projectReceipt ([string]$Job.agent) ([string]$Job.nativeId) ([string]$Job.remoteId)
+    $target=Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path
+    if ($record.home -isnot [string] -or $record.home -cne [string]$Job.home -or $record.target -ne $target -or $record.receipt -cne [string]$Job.receipt -or $record.token -cne [string]$Job.token) { throw (T 'WkProjectReceiptInvalid') }
+}
 function Restore-ProjectFolders([object]$Job,[string]$Receipt,[string]$Agent,[string]$SessionId,[string]$Conversation,[string]$StartTarget) {
     # 미리보기에서 받은 프로젝트 파일을 복원한다. 시작 폴더는 이번 복원 폴더에, 추가 폴더는 원래 경로나 GUI가 고른 폴더에 쓴다. 빈 값은 건너뜀.
     if (-not $Job.projectRestore -or -not $Receipt) { return $null }
@@ -390,8 +406,9 @@ function Restore-ProjectFolders([object]$Job,[string]$Receipt,[string]$Agent,[st
         $recovery=$null; $results=@()
         foreach ($folder in $record.folders) {
             if ($folder.state -notin @('ready','needsFolder')) { continue }
-            $override=if ($Job.projectTargets) { $Job.projectTargets.PSObject.Properties[[string]$folder.index] } else { $null }
-            $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {[string]$override.Value} else {[string]$folder.target}
+            # 미리보기 뒤에 고르는 폴더는 이 PC에 원래 경로가 없던 추가 폴더(needsFolder)만 받는다. 절대 경로가 아니면 건너뛴다.
+            $override=if ($Job.projectTargets -and $folder.state -eq 'needsFolder') { $Job.projectTargets.PSObject.Properties[[string]$folder.index] } else { $null }
+            $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {$(if ([IO.Path]::IsPathRooted([string]$override.Value)) {[string]$override.Value} else {''})} else {[string]$folder.target}
             $entry=[ordered]@{index=$folder.index;role=$folder.role;sourcePath=$folder.sourcePath;target=$target;state='skipped';written=0;backedUp=0;same=0;failed=@();error=''}
             if ($target) {
                 # 한 폴더가 실패해도(받은 파일이 바뀜, 쓸 수 없는 위치) 다른 폴더는 복원하고 기록을 남긴다. 실패한 폴더에는 쓰기 전에 멈춘다.
@@ -470,7 +487,8 @@ function Invoke-ConversationJob([object]$Job) {
             # 복원을 고를 수 있는 대화만 프로젝트 파일을 받아 비교한다. 프로젝트 파일을 읽지 못해도 대화 미리보기는 그대로 보인다.
             if ($Job.projectRestore -and @($preview.choices) -ccontains 'incoming') {
                 $stage=New-DesktopStage
-                $result.project=Get-ProjectPreviewSafe $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $stage
+                $pair=@{home=[string]$Job.home;receipt=[string]$preview.receipt;token=[string]$preview.token}
+                $result.project=Get-ProjectPreviewSafe $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $stage $pair
                 if ($result.project.state -ne 'found') { $null=Remove-DesktopStage $stage }
             }
             return $result
@@ -478,6 +496,7 @@ function Invoke-ConversationJob([object]$Job) {
         Restore {
             # GUI는 복원(incoming)만 작업으로 보낸다. 건너뛰기·유지는 작업을 만들지 않는다.
             $choice=if ($Job.choice) {[string]$Job.choice} else {'incoming'}
+            if ($Job.projectReceipt) { Assert-ProjectPairing $Job }
             $restored=Invoke-Vendor $Job 'restore' ($ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$choice})
             $result=@{message=[string]$restored.message;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$null}
             if ($Job.projectReceipt) {
@@ -511,6 +530,10 @@ try {
 } catch {
     $result=@{ok=$false;error=$_.Exception.Message}
     if ($_.Exception.Data.Contains('backendResult')) { $result.backendResult=$_.Exception.Data['backendResult'] }
+    # 벤더 계약의 실패 정보: 구현이 답한 status·reasonCode·recovery와, 응답이 없어 결과를 알 수 없는지.
+    $vendor=$_.Exception.Data['vendorResult']
+    if ($vendor) { $result.vendor=[ordered]@{status=[string]$vendor.status;reasonCode=[string]$vendor.reasonCode;recovery=[string]$vendor.recovery} }
+    if ($_.Exception.Data.Contains('vendorOutcome')) { $result.vendorOutcome=[string]$_.Exception.Data['vendorOutcome'] }
     $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $ResultFile -Encoding UTF8
     exit 1
 }

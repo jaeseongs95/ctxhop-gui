@@ -376,16 +376,92 @@ try {
         try { $inTemp=Invoke-JobCore $claude } finally { $env:TMP=Join-Path $testDirectory 'fake-temp'; $env:TEMP=$env:TMP }
         Assert ($inTemp.project.folders[0].state -eq 'ready' -and $inTemp.project.folders[1].state -eq 'needsFolder' -and $inTemp.project.folders[1].target -eq '') 'an extra folder whose original path is under temp or settings is never picked automatically'
         $null=Remove-DesktopStage (Split-Path -Parent $inTemp.project.receipt)
-        $claude.action='Restore'; $claude.projectReceipt=$cp.project.receipt
-        $cr=Invoke-JobCore $claude
+        # GUI처럼 미리보기의 receipt·token을 돌려준다. 원래 경로가 있는 추가 폴더(ready)는 다른 폴더를 골라 보내도 원래 경로에 쓴다.
+        $notAllowed=Join-Path $testDirectory 'not-allowed'
+        $claude.action='Restore'; $claude.receipt=$cp.receipt; $claude.token=$cp.token; $claude.projectReceipt=$cp.project.receipt; $claude.projectTargets=@{'1'=$notAllowed}
+        $cr=Invoke-JobCore ($claude | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
         Assert ([IO.File]::ReadAllText("$claudeTarget\src\app.py") -eq 'claude v2' -and $cr.message -match '^복원 완료\. 프로젝트 폴더 2개 복원' -and -not (Test-Path -LiteralPath (Split-Path -Parent $cp.project.receipt))) "Claude restore writes the latest backup: $($cr.message)"
-        # 다른 벤더의 같은 UUID: Codex 대화에서 받은 프로젝트 미리보기를 같은 UUID의 Claude 복원에 넘겨도 파일을 쓰지 않는다.
+        Assert (-not (Test-Path -LiteralPath $notAllowed) -and $cr.project.folders[1].target -eq $projB) 'a folder picked after the preview is used only for a folder that needed one'
+        $claude.Remove('projectTargets')
+
+        # 미리보기 짝: 같은 벤더·같은 ID의 서로 다른 미리보기(복원 폴더·대상 홈이 다르거나, 같은 폴더를 다시 본 것)를 섞으면
+        # 대화 복원 전에 멈춘다. 대화·파일을 쓰지 않고, 어느 미리보기 사본도 지우지 않는다.
+        $pairA=Join-Path $testDirectory 'pair-a'; $pairB=Join-Path $testDirectory 'pair-b'
+        foreach ($dir in $pairA,$pairB) { $null=New-Item -ItemType Directory -Path $dir }
+        function New-CodexPreview([string]$Target,[string]$HomePath) { Invoke-JobCore @{action='Preview';agent='codex-desktop';home=$HomePath;projectPath=$Target;nativeId=$script:Id;remoteId=$first.remoteId;projectRestore=$true} }
+        function New-ClaudePreview([string]$Target) { Invoke-JobCore @{action='Preview';agent='claude-code';projectPath=$Target;nativeId=$claudeId;remoteId=$claudeRemote;projectRestore=$true} }
+        $xa=New-CodexPreview $pairA $desktopRoot; $xb=New-CodexPreview $pairB $desktopRoot; $xc=New-CodexPreview $pairA $desktopRoot; $xh=New-CodexPreview $pairA $otherHome
+        $ca=New-ClaudePreview $pairA; $cb=New-ClaudePreview $pairB; $cc=New-ClaudePreview $pairA
+        $previews=@($xa,$xb,$xc,$xh,$ca,$cb,$cc)
+        Assert (-not @($previews | Where-Object { $_.project.state -ne 'found' }).Count -and $xa.token -ceq $xc.token -and $ca.token -cne $cc.token) 'pairing fixture: every preview found project files; Codex tokens repeat, Claude tokens do not'
+        $applies=@($script:Calls | Where-Object { $_.kind -eq 'backend' -and $_.arguments[0] -eq 'apply' }).Count; $pushes=@($script:ClaudeCalls).Count
+        $mixes=@(
+            @{agent='codex-desktop';home=$desktopRoot;target=$pairB;conv=$xb;project=$xa},   # 다른 복원 폴더
+            @{agent='codex-desktop';home=$desktopRoot;target=$pairA;conv=$xc;project=$xa},   # 같은 폴더를 다시 본 미리보기
+            @{agent='codex-desktop';home=$desktopRoot;target=$pairA;conv=$xa;project=$xh},   # 다른 대상 홈
+            @{agent='claude-code';home='';target=$pairB;conv=$cb;project=$ca},
+            @{agent='claude-code';home='';target=$pairA;conv=$cc;project=$ca}
+        )
+        foreach ($mix in $mixes) {
+            $ids=if ($mix.agent -eq 'codex-desktop') {@{nativeId=$script:Id;remoteId=$first.remoteId}} else {@{nativeId=$claudeId;remoteId=$claudeRemote}}
+            $job=@{action='Restore';agent=$mix.agent;home=$mix.home;projectPath=$mix.target;nativeId=$ids.nativeId;remoteId=$ids.remoteId;receipt=[string]$mix.conv.receipt;token=[string]$mix.conv.token;choice='incoming';projectRestore=$true;projectReceipt=$mix.project.project.receipt}
+            Throws {Invoke-JobCore $job} '미리보기 기록'
+        }
+        Assert (@($script:Calls | Where-Object { $_.kind -eq 'backend' -and $_.arguments[0] -eq 'apply' }).Count -eq $applies -and @($script:ClaudeCalls).Count -eq $pushes) 'mixed previews stop before any conversation write (no apply, no resume)'
+        Assert (-not @(Get-ChildItem -LiteralPath $pairA,$pairB -Force).Count) 'mixed previews write no project files'
+        Assert (-not @($previews | Where-Object { -not (Test-Path -LiteralPath (Split-Path -Parent $_.project.receipt)) -or ($_.receipt -and -not (Test-Path -LiteralPath (Split-Path -Parent $_.receipt))) }).Count) 'mixed previews delete no preview copies'
+        # 짝이 맞는 조합은 그대로 복원한다.
+        $okCodex=Invoke-JobCore @{action='Restore';agent='codex-desktop';home=$desktopRoot;projectPath=$pairA;nativeId=$script:Id;remoteId=$first.remoteId;receipt=$xc.receipt;token=$xc.preview.token;choice='incoming';projectRestore=$true;projectReceipt=$xc.project.receipt}
+        $okClaude=Invoke-JobCore @{action='Restore';agent='claude-code';projectPath=$pairB;nativeId=$claudeId;remoteId=$claudeRemote;receipt=$cb.receipt;token=$cb.token;projectRestore=$true;projectReceipt=$cb.project.receipt}
+        Assert ($okCodex.effect -eq 'restored' -and $okClaude.effect -eq 'restored' -and (Test-Path -LiteralPath "$pairA\src\app.py") -and [IO.File]::ReadAllText("$pairB\src\app.py") -eq 'claude v2') 'the matching preview pair restores'
+        foreach ($left in $xa,$xb,$xh,$ca,$cc) { $null=Remove-DesktopStage (Split-Path -Parent $left.project.receipt); if ($left.receipt) { $null=Remove-DesktopStage (Split-Path -Parent $left.receipt) } }
+
+        # 다른 벤더의 같은 UUID: Codex 대화에서 받은 프로젝트 미리보기를 같은 UUID의 Claude 복원에 넘기면 대화 복원 전에 멈춘다.
         $restore.action='Preview'; $restore.projectRestore=$true; $cxp=Invoke-JobCore $restore
         Assert ($cxp.project.state -eq 'found') 'Codex project preview for the cross-vendor check'
-        [IO.File]::WriteAllText("$claudeTarget\src\app.py",'cross check')
-        $cross=Invoke-JobCore @{action='Restore';agent='claude-code';projectPath=$claudeTarget;nativeId=$script:Id;remoteId=$claudeRemote;projectRestore=$true;projectReceipt=$cxp.project.receipt}
-        Assert ($cross.effect -eq 'restored' -and $cross.message -match '미리보기 기록' -and [IO.File]::ReadAllText("$claudeTarget\src\app.py") -eq 'cross check' -and -not (Test-Path -LiteralPath (Split-Path -Parent $cxp.project.receipt))) "a project preview of another vendor's conversation with the same UUID is never restored: $($cross.message)"
-        $null=Remove-DesktopStage (Split-Path -Parent $cxp.receipt)
+        [IO.File]::WriteAllText("$claudeTarget\src\app.py",'cross check'); $pushes=@($script:ClaudeCalls).Count
+        Throws {Invoke-JobCore @{action='Restore';agent='claude-code';projectPath=$claudeTarget;nativeId=$script:Id;remoteId=$claudeRemote;token=$cxp.token;projectRestore=$true;projectReceipt=$cxp.project.receipt}} '미리보기 기록'
+        Assert (@($script:ClaudeCalls).Count -eq $pushes -and [IO.File]::ReadAllText("$claudeTarget\src\app.py") -eq 'cross check' -and (Test-Path -LiteralPath (Split-Path -Parent $cxp.project.receipt))) "a project preview of another vendor's conversation with the same UUID is refused before anything is written"
+        $null=Remove-DesktopStage (Split-Path -Parent $cxp.receipt); $null=Remove-DesktopStage (Split-Path -Parent $cxp.project.receipt)
+
+        # 실제 스냅숏 크기: 계획을 세운 뒤 폴더가 커지면(대화 백업 뒤, 또는 해시와 압축 사이) 허락과 한도를 실제로 읽은 양으로 다시 본다.
+        # 대화 백업(remoteId)은 그대로 두고 그 폴더만 올리지 않는다. 두 벤더가 같은 Worker 경로를 쓴다.
+        $grow=Join-Path $projects 'grow'; $null=New-Item -ItemType Directory -Path $grow
+        $realBundles=${function:Get-ProjectBundles}; $realManifest=${function:Get-ProjectManifest}; $realRead=${function:Read-ClaudeWorkData}
+        function Get-ProjectBundles { if ($script:GrowTo) { [IO.File]::WriteAllText("$grow\data.txt",$script:GrowTo); $script:GrowTo=$null }; & $realBundles }
+        function Get-ProjectManifest([object]$List,[long]$Limit=[long]::MaxValue) {
+            $manifest=& $realManifest $List $Limit
+            if ($script:GrowAfterManifest -and @($List.files | Where-Object { $_.full -like "$grow\*" }).Count) { [IO.File]::WriteAllText("$grow\data.txt",$script:GrowAfterManifest); $script:GrowAfterManifest=$null }
+            $manifest
+        }
+        function Read-ClaudeWorkData([string[]]$Files) { [pscustomobject]@{cwds=@($projA,$grow);edits=@()} }
+        $savedCwds=$script:Cwds; $savedEdits=$script:Edits; $script:Cwds=@($grow); $script:Edits=@()
+        $script:ProjectAskBytes=100; $script:ProjectMaxBytes=1000
+        try {
+            $cases=@(
+                @{name='grew past the question size, not approved';approved=$false;grow=('b'*200);after=$null;status='skipped';reason=(T 'WkProjectGrewUnapproved')},
+                @{name='approved but over the uncompressed limit (compresses well)';approved=$true;grow=('a'*5000);after=$null;status='skipped';reason='tooLarge'},
+                @{name='approved and within the limit';approved=$true;grow=('c'*500);after=$null;status='uploaded';reason=''},
+                @{name='grew between the hash and the zip';approved=$false;grow=$null;after=('d'*200);status='skipped';reason=(T 'WkProjectGrewUnapproved')}
+            )
+            foreach ($vendor in 'codex-desktop','claude-code') {
+                foreach ($case in $cases) {
+                    [IO.File]::WriteAllText("$grow\data.txt",('s'+[guid]::NewGuid().ToString('N')))
+                    $job=if ($vendor -eq 'codex-desktop') {@{action='Backup';agent=$vendor;home=$desktopRoot;projectPath=$target;nativeId=$script:Id;remoteId='';projectBackup=$true}} else {@{action='Backup';agent=$vendor;projectPath=$projA;nativeId=$claudeId;remoteId=$claudeRemote;projectBackup=$true}}
+                    if ($case.approved) { $job.projectApproved=@($grow) }
+                    # 올리는 사례는 벤더마다 내용을 달리한다(같은 내용이면 앞 벤더가 올린 백업에 연결만 한다).
+                    $script:GrowTo=if ($case.status -eq 'uploaded') {('c'*500)+$vendor} else {$case.grow}; $script:GrowAfterManifest=$case.after
+                    $before=@(Get-Stored 'project-files;*' | Where-Object { $_.metadata.sourceCwd -eq $grow }).Count
+                    $result=Invoke-JobCore $job
+                    $entry=@($result.project.folders | Where-Object { $_.sourcePath -eq $grow })
+                    $added=@(Get-Stored 'project-files;*' | Where-Object { $_.metadata.sourceCwd -eq $grow }).Count-$before
+                    Assert ($result.remoteId -and -not $result.needsProjectConfirm -and $entry.Count -eq 1 -and $entry[0].status -eq $case.status -and $entry[0].reason -eq $case.reason -and $added -eq [int]($case.status -eq 'uploaded') -and -not $script:GrowTo -and -not $script:GrowAfterManifest -and (Test-StagingClean)) "$vendor, $($case.name): $($entry | ConvertTo-Json -Compress)"
+                }
+            }
+        } finally {
+            ${function:Get-ProjectBundles}=$realBundles; ${function:Get-ProjectManifest}=$realManifest; ${function:Read-ClaudeWorkData}=$realRead
+            $script:Cwds=$savedCwds; $script:Edits=$savedEdits; $script:ProjectAskBytes=200MB; $script:ProjectMaxBytes=16GB
+        }
         $claude.projectRestore=$false; $claude.action='Preview'; $cp=Invoke-JobCore $claude
         Assert ($cp.project.state -eq 'off') 'Claude preview skips project files when the option is off'
         Assert (Test-StagingClean) 'no plaintext project copy remains in staging'
@@ -397,6 +473,7 @@ try {
     Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $result)) 'Worker process must write its result file for the GUI'
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($answer.ok -eq $false -and $answer.error -match 'Codex Desktop') 'Worker process reports the job error in the result file'
+    Assert ($answer.vendor.status -eq 'unsupported' -and $answer.vendor.reasonCode -eq 'open_manually' -and $null -eq $answer.vendorOutcome) 'the result file keeps the contract status and reason code for the GUI'
     Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal
