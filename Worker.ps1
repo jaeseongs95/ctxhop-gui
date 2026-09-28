@@ -79,6 +79,64 @@ function Invoke-Bundle([string[]]$Arguments) {
     Assert-FrozenFile $exe $script:DesktopTransportSHA256
     Invoke-JsonNative $exe (@('bundle') + $Arguments)
 }
+# 벤더 계약 v1(docs\contract-v1.md). impls.json의 명령 배열 뒤에 <op> --request <파일> --response <파일>을 붙여 실행한다.
+# impl은 콘솔을 물려받는다(ctxhop 암호 입력). 결과는 응답 파일 하나로만 받는다.
+$script:ImplsFile=Join-Path $PSScriptRoot 'impls.json'
+$script:ContractStatus=@{
+    probe=@('ok','unsupported','failed'); list=@('ok','unsupported','failed'); describe=@('ok','unsupported','failed'); open=@('ok','unsupported','failed')
+    backup=@('done','busy','question','failed'); recover=@('ok','failed')
+    preview=@('new','equal','incoming_newer','local_newer','conflict','unsupported','busy','failed')
+    restore=@('complete','partial','unsupported','busy','failed')
+}
+# ponytail: 암호 입력을 기다릴 수 있는 op는 시간 제한 없이 GUI 취소에 맡긴다.
+$script:ContractTimeoutSec=@{probe=120;list=1800;describe=1800}
+$script:ContractMaxBytes=16MB
+function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
+    $allowed=$script:ContractStatus[$Op]
+    if (-not $allowed) { throw (T 'WkImplBadOp' $Op) }
+    $map=Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $command=@($map.$Vendor)
+    if (-not $command.Count -or @($command | Where-Object { $_ -isnot [string] -or -not $_ }).Count) { throw (T 'WkImplUnknown' $Vendor) }
+    # 실행 파일은 PATH에서 찾지 않는다. powershell.exe는 System32 것을, 나머지는 impls.json 폴더 기준 경로를 쓴다.
+    $base=Split-Path -Parent $script:ImplsFile
+    $program=if ($command[0] -eq 'powershell.exe') { Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe' } else { Join-Path $base $command[0] }
+    if (-not (Test-Path -LiteralPath $program -PathType Leaf)) { throw (T 'WkImplUnknown' $Vendor) }
+    $id=[guid]::NewGuid().ToString()
+    $dir=Join-Path $JobDir "$Op-$id"
+    $null=New-Item -ItemType Directory -Path $dir
+    $requestFile=Join-Path $dir 'request.json'; $responseFile=Join-Path $dir 'response.json'
+    $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
+    foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
+    [IO.File]::WriteAllText($requestFile,($body | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
+    $start=[Diagnostics.ProcessStartInfo]::new()
+    $start.FileName=$program; $start.WorkingDirectory=$base; $start.UseShellExecute=$false
+    $start.Arguments=(@(@($command | Select-Object -Skip 1) + @($Op,'--request',$requestFile,'--response',$responseFile) | ForEach-Object {Quote-NativeArgument $_}) -join ' ')
+    $process=[Diagnostics.Process]::Start($start)
+    try {
+        $limit=$script:ContractTimeoutSec[$Op]
+        if ($limit) {
+            if (-not $process.WaitForExit($limit*1000)) {
+                $null=& (Join-Path $env:WINDIR 'System32\taskkill.exe') /T /F /PID $process.Id 2>&1
+                throw (T 'WkImplTimeout' $Vendor $Op $limit)
+            }
+        } else { $process.WaitForExit() }
+        $code=$process.ExitCode
+    } finally { $process.Dispose() }
+    # 응답은 크기·JSON·요청 짝·허용 status를 모두 맞춰야 쓴다. exit 0이어도 하나라도 어긋나면 실패다.
+    $response=$null
+    if ((Test-Path -LiteralPath $responseFile -PathType Leaf) -and (Get-Item -LiteralPath $responseFile).Length -le $script:ContractMaxBytes) {
+        try { $response=[IO.File]::ReadAllText($responseFile,[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json } catch { $response=$null }
+        if ($response -and ($response.protocolVersion -isnot [int] -or $response.protocolVersion -ne 1 -or $response.requestId -cne $id -or $response.op -cne $Op -or [string]$response.status -cnotin $allowed)) { $response=$null }
+    }
+    if ($code -eq 2) { throw (T 'WkImplRequestInvalid' $Vendor $Op) }
+    if ($code -ne 0) {
+        $exception=[InvalidOperationException]::new($(if ($response.reason) {[string]$response.reason} else {T 'WkImplFailed' $Vendor $Op $code}))
+        if ($response) { $exception.Data['vendorResult']=$response }
+        throw $exception
+    }
+    if (-not $response) { throw (T 'WkImplBadResponse' $Vendor $Op) }
+    return $response
+}
 function Get-DesktopHome([object]$Job) {
     $path=if ($Job.home) {[string]$Job.home} elseif ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $env:USERPROFILE '.codex'}
     if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Container)) { throw (T 'WkDesktopHomeMissing') }
