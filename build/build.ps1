@@ -35,6 +35,11 @@ if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
 Remove-Item -LiteralPath $tar
 New-Item -ItemType Directory -Path (Join-Path $pkg 'bin') | Out-Null
 foreach ($exe in 'ctxhop.exe', 'ctxhop-claude.exe') { Copy-Item -LiteralPath (Join-Path $Out "exes\$exe") -Destination (Join-Path $pkg "bin\$exe") }
+# What this package was built from: this repository's commit, the upstream commit, patch and exe hashes, Go.
+$info = Get-Content -LiteralPath (Join-Path $Out 'exes\build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$info | Add-Member -NotePropertyName repository -NotePropertyValue 'https://github.com/jaeseongs95/ctxhop-gui'
+$info | Add-Member -NotePropertyName commit -NotePropertyValue (git -C $repo rev-parse HEAD)
+[IO.File]::WriteAllText((Join-Path $pkg 'build-info.json'), ($info | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
 "package files: $(@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Force).Count)"
 
 # Zip entries are ctxhop-gui-vnext/<path> with forward slashes and no directory entries; every entry is checked.

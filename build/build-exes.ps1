@@ -51,6 +51,7 @@ $goVersion
 "upstream: $Upstream $Commit"
 
 $failed = 0
+$info = [ordered]@{ upstream = $Upstream; upstreamCommit = $Commit; go = "$goVersion"; exes = @() }
 foreach ($t in $targets) {
     $src = Join-Path $Out ('src-' + [IO.Path]::GetFileNameWithoutExtension($t.Name))
     Invoke-Native git @('init', '-q', $src)
@@ -70,5 +71,8 @@ foreach ($t in $targets) {
     $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
     if ($hash -eq $t.Sha256) { $verdict = 'MATCH' } else { $verdict = "MISMATCH, pinned $($t.Sha256)"; $failed++ }
     '{0}  {1}  {2}' -f $hash, $t.Name, $verdict
+    $info.exes += [ordered]@{ name = $t.Name; sha256 = $hash; ldflags = $t.LdFlags
+        patches = @($t.Patches | ForEach-Object { [ordered]@{ name = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $patches $_)).Hash } }) }
 }
+[IO.File]::WriteAllText((Join-Path $Out 'build-info.json'), ($info | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
 exit $failed
