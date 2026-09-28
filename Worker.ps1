@@ -521,6 +521,8 @@ function Test-DoneRecord([Collections.IDictionary]$Marker) {
 function Close-Marker([Collections.IDictionary]$Marker,[string]$Outcome,[string]$VendorState,[hashtable]$Project) {
     # 자손이 모두 끝난 뒤, 종료 기록을 먼저 쓰고 확인한 다음 표지를 지운다(S3 명세 2.2·2.4절).
     if ((Wait-WorkerJobAlone) -ne 'alone') { $null=Set-MarkerAttention $Marker (T 'WkWorkerHelpersLeft'); throw (T 'WkWorkerHelpersLeft') }
+    # 표지 없던 프로젝트 기록은 그 폴더에 resolved.json(기록 해시)을 남겨 목록에서 뺀다.
+    if ($Marker.recordKind -eq 'project' -and -not (Test-ProjectRecordResolved ([string]$Marker.recordRef))) { Save-ProjectJson (Join-Path $Marker.recordRef 'resolved.json') ([ordered]@{version=1;operationId=$Marker.operationId;outcome=$Outcome;sha256=(Get-ProjectRecordSha ([string]$Marker.recordRef));at=(Get-ProjectStamp)}) }
     $dir=Join-Path (Get-JournalDir) 'done'; $null=[IO.Directory]::CreateDirectory($dir)
     Save-ProjectJson (Join-Path $dir "$($Marker.operationId).json") ([ordered]@{version=1;operationId=$Marker.operationId;agent=$Marker.agent;home=$Marker.home;recordRef=$Marker.recordRef;outcome=$Outcome;vendorState=$VendorState;project=$Project;at=(Get-ProjectStamp)})
     if (-not (Test-DoneRecord $Marker)) { return (Set-MarkerAttention $Marker (T 'WkJournalDoneMismatch')) }
@@ -601,7 +603,7 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
         if ($Auto -and $state -eq 'complete') {
             try { Enter-Marker $marker; if ((Resolve-Marker $marker 'journal' @() $state $false) -eq 'completed') { continue } } catch { }
         }
-        $files=@(); $canRollback=$state -in @('absent','rolled_back','pending','resolved','none')
+        $files=@(); $canRollback=$state -in @('absent','rolled_back','pending','resolved','none') -and ($marker.recordKind -ne 'project' -or [IO.File]::Exists((Join-Path $marker.recordRef 'restore-plan.json')))
         try { $plan=Read-ProjectPlan ([string]$marker.projectRecovery); if ($plan) { $files=@(Get-ProjectUndoView @($plan.files)) } } catch { $canRollback=$false }
         $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
         $rows.Add($row); $byRef["$($marker.agent)/$(Get-MarkerRef $marker)"]=$row
@@ -624,7 +626,7 @@ function Assert-JournalClear([object]$Job) {
     # 미해결 항목이 있거나 조회가 실패하면 복원·백업·열기를 모두 막는다(S3 명세 4.3절). 목록·미리보기와 되돌리기·닫기는 막지 않는다.
     # ponytail: 무관한 대화까지 막는 전체 차단. 겹침을 증명하는 검사는 필요해지면 더한다.
     $journal=Get-JournalRows $Job -Auto
-    if ($journal.rows.Count -or $journal.failed.Count) { throw (T 'WkJournalOpen' ($journal.rows.Count+$journal.failed.Count)) }
+    if ($journal.rows.Count -or $journal.failed.Count) { $exception=[InvalidOperationException]::new((T 'WkJournalOpen' ($journal.rows.Count+$journal.failed.Count))); $exception.Data['journalOpen']=$true; throw $exception }
 }
 function Get-TargetMarker([object]$Job) {
     # Rollback·CloseJournal의 대상: 공통 표지(operationId), 표지 없는 벤더 기록(agent+recordId), 표지 없는 프로젝트 기록(projectRecord).
@@ -650,6 +652,8 @@ function Get-TargetMarker([object]$Job) {
 function Invoke-JournalRollback([object]$Job) {
     # 사용자가 되돌리기를 누름(S3 명세 4.3절). 결정표의 되돌리기 행만 한다.
     $marker=Get-TargetMarker $Job
+    # 예전 판 프로젝트 기록에는 계획이 없어 되돌릴 수 없다. 닫기만 된다.
+    if ($marker.recordKind -eq 'project' -and -not [IO.File]::Exists((Join-Path $marker.recordRef 'restore-plan.json'))) { throw (T 'WkRecordNotPending' 'failed') }
     Enter-Marker $marker
     $outcome=Resolve-Marker $marker 'rollback' @($Job.confirmedUnknown | Where-Object { $_ }) (Get-VendorState $marker) $false
     if ($outcome -ceq 'waiting') { $outcome=Set-MarkerAttention $marker (T 'WkJournalVendorUnreadable' 'complete') }
@@ -665,7 +669,6 @@ function Invoke-JournalClose([object]$Job) {
     if ($marker.recordKind -eq 'project') {
         $folder=[string]$marker.recordRef; $sha=Get-ProjectRecordSha $folder
         if (-not $sha -or $sha -cne [string]$Job.sha256) { throw (T 'WkRecordChanged') }
-        if (-not (Test-ProjectRecordResolved $folder)) { Save-ProjectJson (Join-Path $folder 'resolved.json') ([ordered]@{version=1;operationId=$marker.operationId;sha256=$sha;at=(Get-ProjectStamp)}) }
     } elseif ($state -in @('pending','unreadable')) {
         $null=Invoke-Vendor (Get-MarkerJob $marker) 'recover' @{mode='resolve';recordId=(Get-MarkerRef $marker);sha256=[string]$Job.sha256}
         $state='resolved'
@@ -989,6 +992,8 @@ try {
     $vendor=$_.Exception.Data['vendorResult']
     if ($vendor) { $result.vendor=[ordered]@{status=[string]$vendor.status;reasonCode=[string]$vendor.reasonCode;recovery=[string]$vendor.recovery} }
     if ($_.Exception.Data.Contains('vendorOutcome')) { $result.vendorOutcome=[string]$_.Exception.Data['vendorOutcome'] }
+    # GUI는 이 표시를 보고 중단된 복원 창을 연다.
+    if ($_.Exception.Data['journalOpen']) { $result.journalOpen=$true }
     $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $ResultFile -Encoding UTF8
     exit 1
 }

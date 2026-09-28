@@ -166,9 +166,12 @@ With **Also back up and restore project files** on the **Backup · Restore** tab
 - Files of the start folder go to the folder chosen for this restore (the working folder for Codex, the project folder for Claude). Another folder goes to its original path if that path exists on this PC; otherwise you choose a folder or skip it when you approve.
 - If that original path is a temporary folder or an agent settings folder (or inside one), a drive root, or the user folder itself or anything above it, it is not used automatically even if it exists on this PC; you choose a folder or skip it, as for a missing folder.
 - Nothing is restored inside an agent settings folder (`.claude`, `.codex`, `.agents`, `.ctxhop`), to a drive root, or to the user folder itself or anything above it, even if you chose that folder yourself.
-- Nothing is deleted. Files only on this PC stay, and before a file is replaced its original is kept under `%LOCALAPPDATA%\CtxHopGUI\project-recovery\<unique ID>\<folder number>` with the same relative path. The restore record is `restore-log.json` in the same folder.
-- Before anything is written, the file list of a downloaded backup (paths, sizes and hash format) and every restore path are checked. If any path is absolute, contains `..` or `.git`, has a secret file name or one of the names above that cannot be restored, or goes through a link or junction, or if the restore folder itself or a folder above it is a link or junction, nothing is written to that folder. When one folder fails this way, the other folders are still restored and the result names the failed folder and the reason. The content hash of each file is checked while it is written to a temporary file next to it, and only a matching file becomes a new file or replaces the old one. A file whose hash does not match is not written and is reported as failed; the other files in that folder are still restored.
-- For Codex, project files are restored only when the conversation was imported or was already the same. If the conversation on this PC is newer, its files stay as they are.
+- Nothing is deleted. Files only on this PC stay, and before a file is replaced its original is kept under `%LOCALAPPDATA%\CtxHopGUI\project-recovery\<operation ID>\<folder number>` with the same relative path. The plan is `restore-plan.json` and the result is `restore-log.json` in the same folder.
+- Before anything is written, the file list of a downloaded backup (paths, sizes and hash format) and every restore path are checked. If any path is absolute, contains `..` or `.git`, has a secret file name or one of the names above that cannot be restored, or goes through a link or junction, or if the restore folder itself or a folder above it is a link or junction, nothing is written. Restore folders that overlap each other, the Codex data folder, an agent settings folder or `%LOCALAPPDATA%\CtxHopGUI` are refused too.
+- **Files are restored first and the conversation last.** Before any write, the plan for every folder (`restore-plan.json`) is saved and the originals of files that will change are copied. Right before each write the file is checked against the plan again, and it is replaced only after its content hash matches in a temporary file next to it.
+- If any file cannot be written (a hash mismatch, a file that changed after the plan, and so on), the remaining files are not written, **the conversation is not restored**, and the files already written are rolled back.
+- A conversation whose preview said this PC is newer writes no files. If the conversation on this PC changes after the preview and the conversation cannot be restored, the files already written are rolled back automatically.
+- If a rollback cannot finish, it stays as an [interrupted restore](#a-restore-stopped-partway-interrupted-restores).
 - To restore only the conversation, clear the option before the preview.
 
 **The design trusts the shared folder**: anyone who can write to it can forge backups ([What you need](#what-you-need)), and restoring a forged folder backup writes files of their choosing to the restore locations (for the start folder, the folder chosen for this restore; for other folders, the original path in the link record or a folder you chose). Check each folder's target path in the preview and confirmation windows. Use a folder only you can write to, and after a restore check the changes with `git status` and `git diff`. The originals of replaced files are in the recovery folder above.
@@ -185,8 +188,21 @@ If you used the zip, it was probably extracted without being unblocked. Delete t
 
 - **Failure reason**: when a ctxhop command fails, the error window shows the exit code and the reason ctxhop logged, such as overlapping project registrations or a password mismatch. The GUI reads the reason from that day's log in `%USERPROFILE%\.ctxhop\logs` (or `logs` under `CTXHOP_CONFIG_DIR`).
 - **Settings sync is on**: if a backup says settings sync was turned on (Y) at setup, close the GUI and task windows. Then change `"syncConfig"` to `"disabled"` in the `config.json` that the message names, and try again.
-- **Cancel task**: click **Cancel task** at the bottom. It stops only the task window the GUI started and the ctxhop or Python process inside it. The Codex and Claude apps are not touched. If you cancelled a backup, back up again. **Restore and Open cannot be cancelled.** Wait for a restore to finish, and close an opened conversation yourself.
+- **Cancel task**: click **Cancel task** at the bottom. It stops only the task window the GUI started and the ctxhop or Python process inside it. The Codex and Claude apps are not touched. If you cancelled a backup, back up again. **Restore, Open, and Roll back or Resolved in the interrupted restores window cannot be cancelled.** Wait for a restore to finish, and close an opened conversation yourself.
 - **Forgot or want to change the password**: on **Connection · Invite**, **Change password** asks for the current password, then the new one twice. **Reset password with recovery key** asks for the recovery key from setup, then the new password twice. Both run in a task window, and the recovery key does not change.
+
+### A restore stopped partway (interrupted restores)
+
+If a restore does not finish, the GUI keeps a record and **pauses restore, backup and open** until it is handled (list and preview still work). The **Interrupted restores** window opens when something is blocked, and the **Interrupted restores** button on **Connection · Invite** opens it too.
+
+- Each row shows the conversation, the target folders, the state, the file counts (as before / written by this restore / unknown / cannot roll back) and the record folder.
+- **Roll back**: returns to the state before the restore. Project files written by this restore are rolled back first, then the conversation if its recovery record is still there. Every file that is moved aside is kept as a copy in the record folder.
+- **Roll back unknown files too**: files changed by someone unknown are rolled back only while they still match what the window showed. Claude conversation files always show as unknown, so use this button for them.
+- **Resolved**: closes the record after you checked and cleaned up yourself. Remaining files stay as they are and the record folder is kept. Once closed, it cannot be rolled back again.
+- If a rollback cannot finish, the row stays and the same button continues it. If another job is still writing that record, nothing is changed and you are asked to wait.
+- Roll back and Resolved cannot be cancelled.
+
+The two sections below are the manual checks for when the window cannot be used.
 
 ### A Claude restore was interrupted
 
@@ -240,7 +256,8 @@ This apply also saves the history it replaces in a new recovery folder. The reco
   - When a backup upload or a restore succeeds, the GUI deletes that job's plaintext copy.
   - Folders from failed or cancelled jobs and from skipped previews stay behind for the restore token and failure evidence. Delete them yourself when you no longer need them.
   - Do not upload the plaintext conversations and project files in this folder to Drive.
-- Originals of files replaced by a project restore: `%LOCALAPPDATA%\CtxHopGUI\project-recovery\<unique ID>`
+- Originals, plans and rollback records of project restores: `%LOCALAPPDATA%\CtxHopGUI\project-recovery\<operation ID>`
+- Restore markers and end records (read by the interrupted restores window): `%LOCALAPPDATA%\CtxHopGUI\journal`
 - Claude recovery records: `%LOCALAPPDATA%\CtxHopGUI\recovery`
 - Codex recovery records: `<Codex data folder>\.ctxhop-desktop-recovery`
 - ctxhop settings and logs: `%USERPROFILE%\.ctxhop` (or `CTXHOP_CONFIG_DIR`)
