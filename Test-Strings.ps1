@@ -7,7 +7,7 @@ function Get-ThrownMessage([scriptblock]$Body) { try { & $Body | Out-Null } catc
 $hangul='[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]'
 # 번역하지 않는 한글: 글꼴 이름, 기본 Drive 경로, 두 언어로 쓴 언어 선택 표시.
 $allowed=@('맑은 고딕','G:\내 드라이브\세션연동','Language / 언어','한국어')
-$sources=@('GUI.ps1','Worker.ps1','ClaudeWorker.ps1','ProjectFiles.ps1')
+$sources=@('GUI.ps1','Worker.ps1','ClaudeWorker.ps1','ProjectFiles.ps1','CodexDesktop.ps1','ClaudeCode.ps1')
 . (Join-Path $PSScriptRoot 'Strings.ps1')
 
 # 1) 표 형식: 두 언어가 모두 있고 자리표시자가 같으며 영어에 한글이 없다.
@@ -34,10 +34,10 @@ foreach ($name in $sources) {
 foreach ($key in $used.Keys) { Assert ($script:StringTable.ContainsKey($key)) "missing string key: $key" }
 foreach ($key in $script:StringTable.Keys) { Assert ($used.ContainsKey($key)) "unused string key: $key" }
 
-# 3) 작업 메시지: 선택한 언어로 오류를 돌려준다.
-. (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
+# 3) 작업 메시지: 선택한 언어로 오류를 돌려준다(Worker와 벤더 구현).
+. (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
 Set-Language 'en'
-foreach ($body in @({Assert-BundleId 'x'},{Assert-NativeId 'x'},{Assert-RemoteId 'x'},{Invoke-DesktopJob @{action='Open';home=$PSScriptRoot}})) {
+foreach ($body in @({Assert-BundleId 'x'},{Assert-NativeId 'x'},{Assert-RemoteId 'x'},{& $script:CodexDesktopOps.restore ([pscustomobject]@{receipt=''})})) {
     $message=Get-ThrownMessage $body
     Assert ($message -and $message -notmatch $hangul) "English worker message expected, got $message"
 }

@@ -2,9 +2,20 @@
 # 고정한 실제 Python 백엔드를 Worker로 호출한다. 대화 fixture는 설치된 Codex Desktop 엔진이 격리 폴더에 새로 만들고,
 # 암호화 bundle 전송만 mock이다. 실제 사용자 저장소와 공유 Drive는 읽거나 쓰지 않는다.
 $ErrorActionPreference='Stop'
-. (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
+. (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
+# 벤더 계약 경계: Codex 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
+# 이 시험의 전송 mock과 백엔드 shim이 구현에도 적용되게 한다. 프로세스 경계는 Test-Contract.ps1이 확인한다.
+function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
+    Assert ($Vendor -ceq 'codex-desktop') 'only the Codex Desktop implementation is under test'
+    $id=[guid]::NewGuid().ToString()
+    $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
+    foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
+    $response=ConvertTo-Json -InputObject (Invoke-ImplOp $script:CodexDesktopOps (ConvertTo-Json -InputObject $body -Depth 30 | ConvertFrom-Json)) -Depth 40 | ConvertFrom-Json
+    Assert (Test-VendorResponse $response $id $Op) "contract response for $Op"
+    return $response
+}
 function Throws([scriptblock]$Body,[string]$Pattern) {
     $errorRecord=$null; try { & $Body | Out-Null } catch { $errorRecord=$_ }
     Assert ($null -ne $errorRecord) 'operation must fail'
@@ -92,9 +103,9 @@ try {
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $stages=@(Get-ChildItem -LiteralPath $staging -Directory).Count
     $backup=Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread}
-    Assert ($backup.bundle.id -like 'peer-fixture/*') 'backup exports and publishes one bundle'
+    Assert ($backup.remoteId -like 'peer-fixture/*') 'backup exports and publishes one bundle'
     Assert (@(Get-ChildItem -LiteralPath $staging -Directory).Count -eq $stages) 'uploaded plaintext backup copy is removed'
-    $restore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.bundle.id}
+    $restore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.remoteId}
     $p=Invoke-JobCore $restore
     Assert ($p.preview.status -eq 'new' -and $p.preview.source.sessionId -eq $thread) 'receiver previews the downloaded backup as new with the same UUID'
     Assert ($p.preview.source.cliVersion -eq $env:CTXHOP_TEST_ENGINE -and $p.preview.source.children -eq 0) 'backup records the engine version and its subagent count'
@@ -109,43 +120,43 @@ try {
 
     $script:UseShim=$true
     $done=Invoke-JobCore $restore
-    Assert ($done.applied.status -eq 'imported' -and $done.message -match '복원 완료') 'restore imports and reports completion'
+    Assert ($done.restored.status -eq 'imported' -and $done.effect -eq 'restored' -and $done.message -match '복원 완료') 'restore imports and reports completion'
     Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $restore.receipt))) 'successful restore removes its plaintext staging copy'
     $manual=& (Join-Path $PSScriptRoot 'backend\Invoke-Desktop.ps1') -Action pending -HomePath $receiver | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 0 -and @($manual.pending).Count -eq 0) 'manual entry point runs the pinned backend'
     $manual=& (Join-Path $PSScriptRoot 'backend\Invoke-Desktop.ps1') -Action pending -HomePath ($target+'\') | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 0 -and @($manual.pending).Count -eq 0) 'manual entry point passes a spaced path with a trailing backslash intact'
     $copy=Join-Path $testDirectory 'tampered-package'; $null=New-Item -ItemType Directory -Path (Join-Path $copy 'backend')
-    foreach ($name in @('Worker.ps1','ClaudeWorker.ps1','Strings.ps1','ProjectFiles.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
+    foreach ($name in @('CodexDesktop.ps1','Worker.ps1','ClaudeWorker.ps1','Strings.ps1','ProjectFiles.ps1','backend\Invoke-Desktop.ps1','backend\desktop_sessions.py','backend\schema.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $copy $name) }
     [IO.File]::AppendAllText((Join-Path $copy 'backend\desktop_sessions.py'),"`n# tampered`n")
     $manual=& (Join-Path $copy 'backend\Invoke-Desktop.ps1') -Action pending -HomePath $receiver | Out-String | ConvertFrom-Json
     Assert ($LASTEXITCODE -eq 1 -and $manual.reason -match '다릅니다') 'manual entry point refuses a changed backend'
     $listed=@((Invoke-JobCore @{action='List';agent='codex-desktop';home=$receiver;search=''}).sessions | Where-Object nativeId -eq $thread)
     Assert ($listed.Count -eq 1 -and $listed[0].local) 'imported session is listed on the receiver'
-    $again=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.bundle.id}
+    $again=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.remoteId}
     $q=Invoke-JobCore $again
     Assert ($q.preview.status -eq 'equal') 'same backup is equal after restore'
     $again.action='Restore'; $again.receipt=$q.receipt; $again.token=$q.preview.token; $again.choice='incoming'
     $unchanged=Invoke-JobCore $again
-    Assert ($unchanged.applied.status -eq 'equal' -and $unchanged.message -match '변경 없음') 'unchanged restore is not reported as completed'
+    Assert ($unchanged.restored.status -eq 'equal' -and $unchanged.effect -eq 'equal' -and $unchanged.message -match '변경 없음') 'unchanged restore is not reported as completed'
     # 3) 프로젝트 파일: 실제 export가 돌려준 작업 폴더(이 fixture 대화는 CODEX_HOME에서 시작)로 폴더 백업과 연결 기록을 올리고,
     #    미리보기·복원으로 다른 폴더에 되돌린다. git이 임시 폴더 위쪽 저장소를 찾지 않게 한다.
     $env:GIT_CEILING_DIRECTORIES=$testDirectory; $script:ListStored=$true
     $withFiles=Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread;projectBackup=$true}
     $startFolder=@($withFiles.project.folders)[0]
     Assert ($startFolder.role -eq 'start' -and $startFolder.status -eq 'uploaded' -and $startFolder.files -gt 0 -and (ConvertTo-ProjectPath $startFolder.sourcePath) -eq (ConvertTo-ProjectPath $fixtureHome)) "the real export names the conversation folder and it is uploaded: $($withFiles.project.folders | ConvertTo-Json -Compress)"
-    Assert (@($script:Stored.Values | Where-Object { $_.metadata.historyMode -ceq 'project-link;v1;codex-desktop' -and $_.metadata.title -ceq $withFiles.bundle.id }).Count -eq 1) 'a link record names the conversation backup'
+    Assert (@($script:Stored.Values | Where-Object { $_.metadata.historyMode -ceq 'project-link;v1;codex-desktop' -and $_.metadata.title -ceq $withFiles.remoteId }).Count -eq 1) 'a link record names the conversation backup'
     $projectTarget=Join-Path $testDirectory '프로젝트 복원 폴더'; $null=New-Item -ItemType Directory -Path $projectTarget
-    $withRestore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$projectTarget;nativeId=$thread;remoteId=$withFiles.bundle.id;projectRestore=$true}
+    $withRestore=@{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$projectTarget;nativeId=$thread;remoteId=$withFiles.remoteId;projectRestore=$true}
     $pp=Invoke-JobCore $withRestore
     Assert ($pp.project.state -eq 'found' -and $pp.project.folders[0].state -eq 'ready' -and $pp.project.folders[0].compare.new -eq $startFolder.files) "preview finds the linked folder backup: $($pp.project | ConvertTo-Json -Depth 4 -Compress)"
-    $withRestore.action='Restore'; $withRestore.receipt=$pp.receipt; $withRestore.token=$pp.preview.token; $withRestore.choice='incoming'
+    $withRestore.action='Restore'; $withRestore.receipt=$pp.receipt; $withRestore.token=$pp.preview.token; $withRestore.choice='incoming'; $withRestore.projectReceipt=$pp.project.receipt
     $pr=Invoke-JobCore $withRestore
     Assert ($pr.project.folders[0].written -eq $startFolder.files -and [IO.File]::ReadAllText((Join-Path $projectTarget 'probe.json')) -eq [IO.File]::ReadAllText((Join-Path $fixtureHome 'probe.json'))) "project files are restored into the chosen folder: $($pr.message)"
-    Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $withRestore.receipt))) 'the project preview staging copy is removed after restore'
+    Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $withRestore.receipt)) -and -not (Test-Path -LiteralPath (Split-Path -Parent $withRestore.projectReceipt))) 'the conversation and project preview staging copies are removed after restore'
     $env:GIT_CEILING_DIRECTORIES=$oldCeiling; $script:ListStored=$false
     $env:CTXHOP_TEST_ENGINE='0.158.0-alpha.2'
-    Throws {Invoke-JobCore @{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.bundle.id}} '엔진'
+    Throws {Invoke-JobCore @{action='Preview';agent='codex-desktop';home=$receiver;projectPath=$target;nativeId=$thread;remoteId=$backup.remoteId}} '엔진'
     Write-Output "PASS: $script:Checks real-backend integration assertions. Engine $($engine.FullName); bundle transport mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal; [Console]::OutputEncoding=$oldEncoding; $env:GIT_CEILING_DIRECTORIES=$oldCeiling

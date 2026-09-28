@@ -10,8 +10,7 @@ $RequestFile=$script:VNextRequestFile; $ResultFile=$script:VNextResultFile
 $script:ClaudeJobCore=${function:Invoke-JobCore}
 $script:ClaudeFindExecutable=${function:Find-Executable}
 . (Join-Path $PSScriptRoot 'ProjectFiles.ps1')
-# Release integration replaces these pins only after reviewing the final candidate.
-$script:DesktopBackendSHA256='C987065CD25BA3988DAA30F185D2D7F29317C9232AC301AB0EF69B98CB304ECB'
+# Release integration replaces this pin only after reviewing the final candidate.
 $script:DesktopTransportSHA256='9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006'
 function Find-Executable([string]$Name) {
     if ($Name -eq 'ctxhop') { return (Join-Path $PSScriptRoot 'bin\ctxhop-claude.exe') }
@@ -25,21 +24,6 @@ function Assert-RestoreRuntime {
 function Assert-FrozenFile([string]$Path,[string]$Pin) {
     if ($Pin -notmatch '^[a-fA-F0-9]{64}$' -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw (T 'WkComponentMissing' $Path) }
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Pin) { throw (T 'WkComponentHash' $Path) }
-}
-function Get-DesktopRuntime {
-    $backend=Join-Path $PSScriptRoot 'backend\desktop_sessions.py'
-    Assert-FrozenFile $backend $script:DesktopBackendSHA256
-    # Python은 Codex Desktop이 설치·갱신하는 런타임이라 PC마다 SHA가 달라 고정하지 않는다(claude/codex 실행 파일과 같은 취급).
-    # PATH는 쓰지 않는다. 다른 위치는 이 PC의 backend\runtime.json {"pythonPath":"절대경로"}로만 지정한다.
-    $python=Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
-    $settings=Join-Path $PSScriptRoot 'backend\runtime.json'
-    if (Test-Path -LiteralPath $settings -PathType Leaf) {
-        $runtime=Get-Content -LiteralPath $settings -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($runtime.pythonPath -isnot [string] -or -not [IO.Path]::IsPathRooted($runtime.pythonPath)) { throw (T 'WkPythonPathNotAbsolute') }
-        $python=$runtime.pythonPath
-    }
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw (T 'WkPythonMissing' $python) }
-    return @{backend=$backend;python=$python}
 }
 function Quote-NativeArgument([string]$Value) {
     # Windows CreateProcess quoting: doubles backslashes only before quotes and the final quote.
@@ -70,30 +54,66 @@ function Invoke-JsonNative([string]$Executable,[string[]]$Arguments) {
         return $report
     } finally { $process.Dispose() }
 }
-function Invoke-DesktopBackend([string[]]$Arguments) {
-    $runtime=Get-DesktopRuntime
-    Invoke-JsonNative $runtime.python (@('-I','-B','-u',$runtime.backend) + $Arguments)
-}
 function Invoke-Bundle([string[]]$Arguments) {
     $exe=Join-Path $PSScriptRoot 'bin\ctxhop.exe'
     Assert-FrozenFile $exe $script:DesktopTransportSHA256
     Invoke-JsonNative $exe (@('bundle') + $Arguments)
 }
-# 벤더 계약 v1(docs\contract-v1.md). impls.json의 명령 배열 뒤에 <op> --request <파일> --response <파일>을 붙여 실행한다.
-# impl은 콘솔을 물려받는다(ctxhop 암호 입력). 결과는 응답 파일 하나로만 받는다.
+# 벤더 계약 v1(docs\contract-v1.md). Worker는 impls.json의 명령 배열 뒤에 <op> --request <파일> --response <파일>을 붙여 벤더 구현을 실행한다.
+# 구현(CodexDesktop.ps1, ClaudeCode.ps1)은 이 파일을 라이브러리로 불러 Invoke-Impl로 요청을 읽고 op 처리기를 부른다.
+# 구현은 콘솔을 물려받는다(ctxhop 암호 입력, 대화 열기). 결과는 응답 파일 하나로만 받는다.
 $script:ImplsFile=Join-Path $PSScriptRoot 'impls.json'
 $script:ContractStatus=@{
-    probe=@('ok','unsupported','failed'); list=@('ok','unsupported','failed'); describe=@('ok','unsupported','failed'); open=@('ok','unsupported','failed')
-    backup=@('done','busy','question','failed'); recover=@('ok','failed')
-    preview=@('new','equal','incoming_newer','local_newer','conflict','unsupported','busy','failed')
-    restore=@('complete','partial','unsupported','busy','failed')
+    probe=@('ok','failed'); list=@('ok','unsupported','failed'); open=@('ok','unsupported','failed'); recover=@('ok','unsupported','failed')
+    describe=@('ok','busy','unsupported','failed'); backup=@('ok','busy','changed','unsupported','failed')
+    preview=@('ok','unsupported','failed'); restore=@('ok','unsupported','failed')
 }
-# ponytail: 암호 입력을 기다릴 수 있는 op는 시간 제한 없이 GUI 취소에 맡긴다.
+# status가 ok일 때 있어야 하는 필드와 형식. 그 밖의 필드는 선택이고 Worker는 해석하지 않고 넘긴다.
+$script:ContractFields=@{
+    probe=@{capabilities='array'}; list=@{sessions='array'}; open=@{}; recover=@{}
+    describe=@{sourceCwd='string';cwds='array';edits='array';sourceStamp='string'}; backup=@{remoteId='string'}
+    preview=@{state='string';choices='array';receipt='string';token='string'}; restore=@{effect='string';nativeId='string'}
+}
+# ponytail: 암호 입력·대화 열기를 기다릴 수 있는 op(backup·preview·restore·open·recover)는 시간 제한 없이 GUI 취소(프로세스 트리 종료)에 맡긴다.
 $script:ContractTimeoutSec=@{probe=120;list=1800;describe=1800}
 $script:ContractMaxBytes=16MB
+function Test-VendorRow([object]$Row) {
+    # 목록 행의 공통 필드. nativeId가 GUID가 아니면 blockedReason이 있어야 한다(확인하지 못한 백업).
+    $count=$Row.recordCount
+    if ($Row.nativeId -isnot [string] -or $Row.remoteId -isnot [string] -or $Row.title -isnot [string] -or $Row.local -isnot [bool] -or ($count -isnot [int] -and $count -isnot [long]) -or $count -lt 0) { return $false }
+    if ($null -ne $Row.blockedReason) { return ($Row.blockedReason -is [string]) }
+    $guid=[guid]::Empty
+    return [guid]::TryParseExact($Row.nativeId,'D',[ref]$guid)
+}
+function Test-VendorResponse([object]$Response,[string]$Id,[string]$Op) {
+    # 요청 짝(requestId·op), 프로토콜 판, 그 op에 허용된 status가 맞고, ok면 op별 필드 형식까지 맞아야 쓴다.
+    if ($null -eq $Response -or $Response.protocolVersion -isnot [int] -or $Response.protocolVersion -ne 1 -or $Response.requestId -cne $Id -or $Response.op -cne $Op -or [string]$Response.status -cnotin $script:ContractStatus[$Op]) { return $false }
+    foreach ($name in 'reasonCode','reason','message') { if ($null -ne $Response.$name -and $Response.$name -isnot [string]) { return $false } }
+    if ($Response.status -cne 'ok') { return $true }
+    $fields=$script:ContractFields[$Op]
+    foreach ($name in $fields.Keys) {
+        $value=$Response.$name
+        if (($fields[$name] -eq 'string' -and $value -isnot [string]) -or ($fields[$name] -eq 'array' -and $value -isnot [array])) { return $false }
+    }
+    $strings={ param($Items) -not @($Items | Where-Object { $_ -isnot [string] }).Count }
+    switch ($Op) {
+        probe { return (& $strings $Response.capabilities) }
+        list { return (-not @($Response.sessions | Where-Object { -not (Test-VendorRow $_) }).Count) }
+        describe { return ((& $strings $Response.cwds) -and (& $strings $Response.edits)) }
+        backup { return [bool]$Response.remoteId }
+        preview { return (-not @($Response.choices | Where-Object { $_ -cne 'incoming' }).Count) }
+        restore { return ($Response.effect -cin @('restored','equal','local_newer')) }
+    }
+    return $true
+}
+function New-VendorError([string]$Message,[object]$Response) {
+    # 유효한 응답이 없으면 구현이 어디까지 했는지 모른다(이미 올렸거나 썼을 수 있다).
+    $exception=[InvalidOperationException]::new($Message)
+    if ($Response) { $exception.Data['vendorResult']=$Response } else { $exception.Data['vendorOutcome']='unknown' }
+    return $exception
+}
 function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
-    $allowed=$script:ContractStatus[$Op]
-    if (-not $allowed) { throw (T 'WkImplBadOp' $Op) }
+    if (-not $script:ContractStatus[$Op]) { throw (T 'WkImplBadOp' $Op) }
     $map=Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json
     $command=@($map.$Vendor)
     if (-not $command.Count -or @($command | Where-Object { $_ -isnot [string] -or -not $_ }).Count) { throw (T 'WkImplUnknown' $Vendor) }
@@ -105,46 +125,81 @@ function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$R
     $dir=Join-Path $JobDir "$Op-$id"
     $null=New-Item -ItemType Directory -Path $dir
     $requestFile=Join-Path $dir 'request.json'; $responseFile=Join-Path $dir 'response.json'
-    $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
-    foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
-    [IO.File]::WriteAllText($requestFile,($body | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
-    $start=[Diagnostics.ProcessStartInfo]::new()
-    $start.FileName=$program; $start.WorkingDirectory=$base; $start.UseShellExecute=$false
-    $start.Arguments=(@(@($command | Select-Object -Skip 1) + @($Op,'--request',$requestFile,'--response',$responseFile) | ForEach-Object {Quote-NativeArgument $_}) -join ' ')
-    $process=[Diagnostics.Process]::Start($start)
     try {
-        $limit=$script:ContractTimeoutSec[$Op]
-        if ($limit) {
-            if (-not $process.WaitForExit($limit*1000)) {
+        $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
+        foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
+        [IO.File]::WriteAllText($requestFile,($body | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
+        $start=[Diagnostics.ProcessStartInfo]::new()
+        $start.FileName=$program; $start.WorkingDirectory=$base; $start.UseShellExecute=$false
+        $start.Arguments=(@(@($command | Select-Object -Skip 1) + @($Op,'--request',$requestFile,'--response',$responseFile) | ForEach-Object {Quote-NativeArgument $_}) -join ' ')
+        $process=[Diagnostics.Process]::Start($start)
+        try {
+            $limit=$script:ContractTimeoutSec[$Op]
+            if ($limit -and -not $process.WaitForExit($limit*1000)) {
+                # 구현과 그 자식(엔진·전송)을 부모-자식 관계로만 끝낸다. 이름으로 찾아 끝내지 않는다.
                 $null=& (Join-Path $env:WINDIR 'System32\taskkill.exe') /T /F /PID $process.Id 2>&1
-                throw (T 'WkImplTimeout' $Vendor $Op $limit)
+                throw (New-VendorError (T 'WkImplTimeout' $Vendor $Op $limit) $null)
             }
-        } else { $process.WaitForExit() }
-        $code=$process.ExitCode
-    } finally { $process.Dispose() }
-    # 응답은 크기·JSON·요청 짝·허용 status를 모두 맞춰야 쓴다. exit 0이어도 하나라도 어긋나면 실패다.
-    $response=$null
-    if ((Test-Path -LiteralPath $responseFile -PathType Leaf) -and (Get-Item -LiteralPath $responseFile).Length -le $script:ContractMaxBytes) {
-        try { $response=[IO.File]::ReadAllText($responseFile,[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json } catch { $response=$null }
-        if ($response -and ($response.protocolVersion -isnot [int] -or $response.protocolVersion -ne 1 -or $response.requestId -cne $id -or $response.op -cne $Op -or [string]$response.status -cnotin $allowed)) { $response=$null }
+            $process.WaitForExit(); $code=$process.ExitCode
+        } finally { $process.Dispose() }
+        $response=$null
+        if ((Test-Path -LiteralPath $responseFile -PathType Leaf) -and (Get-Item -LiteralPath $responseFile).Length -le $script:ContractMaxBytes) {
+            try { $response=[IO.File]::ReadAllText($responseFile,[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json } catch { $response=$null }
+            if (-not (Test-VendorResponse $response $id $Op)) { $response=$null }
+        }
+    } finally {
+        # 요청·응답에는 제목·경로가 들어 있으므로 이 호출의 파일을 지운다. 모르는 파일이 있으면 폴더는 남는다.
+        foreach ($name in 'request.json','response.json','response.json.tmp') { $file=Join-Path $dir $name; if ([IO.File]::Exists($file)) { [IO.File]::Delete($file) } }
+        try { [IO.Directory]::Delete($dir,$false) } catch { }
     }
+    # 종료 코드 2는 구현이 요청을 읽기 전에 거절했다는 뜻이라 아무것도 하지 않았다.
     if ($code -eq 2) { throw (T 'WkImplRequestInvalid' $Vendor $Op) }
-    if ($code -ne 0) {
-        $exception=[InvalidOperationException]::new($(if ($response.reason) {[string]$response.reason} else {T 'WkImplFailed' $Vendor $Op $code}))
-        if ($response) { $exception.Data['vendorResult']=$response }
-        throw $exception
-    }
-    if (-not $response) { throw (T 'WkImplBadResponse' $Vendor $Op) }
+    if ($code -ne 0) { throw (New-VendorError $(if ($response.reason) {[string]$response.reason} else {T 'WkImplFailed' $Vendor $Op $code}) $response) }
+    if (-not $response) { throw (New-VendorError (T 'WkImplBadResponse' $Vendor $Op) $null) }
     return $response
 }
-function Get-DesktopHome([object]$Job) {
-    $path=if ($Job.home) {[string]$Job.home} elseif ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $env:USERPROFILE '.codex'}
-    if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Container)) { throw (T 'WkDesktopHomeMissing') }
-    Normalize-ProjectPath (Resolve-Path -LiteralPath $path).Path
+function Invoke-ImplOp([hashtable]$Ops,[object]$Request) {
+    # 구현 쪽: 요청 하나를 op 처리기에 넘겨 응답을 만든다. 처리기가 status를 돌려주면 그 값을 쓰고, 던진 오류는 failed가 된다.
+    # 예외의 backendResult는 detail로, reasonCode·recovery는 같은 이름으로 옮긴다.
+    $op=[string]$Request.op
+    $response=[ordered]@{protocolVersion=1;requestId=[string]$Request.requestId;op=$op;status='ok';reasonCode='';reason=''}
+    if ($op -eq 'probe') { $response.capabilities=@(@('probe')+@($Ops.Keys | Sort-Object)); return $response }
+    if (-not $Ops.ContainsKey($op)) { $response.status='unsupported'; $response.reasonCode='op_unsupported'; $response.reason=(T 'WkImplOpUnsupported' $op); return $response }
+    try {
+        $result=& $Ops[$op] $Request
+        foreach ($key in $result.Keys) { $response[$key]=$result[$key] }
+    } catch {
+        $response.status='failed'; $response.reason=$_.Exception.Message
+        foreach ($key in 'reasonCode','recovery') { if ($_.Exception.Data.Contains($key)) { $response[$key]=[string]$_.Exception.Data[$key] } }
+        if ($_.Exception.Data.Contains('backendResult')) { $response.detail=$_.Exception.Data['backendResult'] }
+    }
+    return $response
 }
-function Assert-DesktopTarget([object]$Job) {
-    if (-not $Job.projectPath -or -not (Test-Path -LiteralPath $Job.projectPath -PathType Container)) { throw (T 'WkTargetFolderRequired') }
-    Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path
+function Invoke-Impl([hashtable]$Ops,[object[]]$Arguments) {
+    # 구현 진입점: <op> --request <파일> --response <파일>. 요청을 읽거나 검사하지 못하면 아무것도 하지 않고 종료 코드 2로 끝낸다.
+    try {
+        if ($Arguments.Count -ne 5 -or $Arguments[1] -cne '--request' -or $Arguments[3] -cne '--response' -or -not $script:ContractStatus[[string]$Arguments[0]] -or (Get-Item -LiteralPath $Arguments[2]).Length -gt $script:ContractMaxBytes) { throw 'usage' }
+        $request=[IO.File]::ReadAllText($Arguments[2],[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+        $guid=[guid]::Empty
+        if ($request.protocolVersion -isnot [int] -or $request.protocolVersion -ne 1 -or $request.op -cne $Arguments[0] -or -not [guid]::TryParseExact([string]$request.requestId,'D',[ref]$guid)) { throw 'request' }
+    } catch { exit 2 }
+    Set-Language ([string]$request.language)
+    $response=Invoke-ImplOp $Ops $request
+    $json=ConvertTo-Json -InputObject $response -Depth 40
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt $script:ContractMaxBytes) {
+        # 잘라서 보내지 않고 실패로 알린다.
+        $json=ConvertTo-Json -InputObject ([ordered]@{protocolVersion=1;requestId=$response.requestId;op=$response.op;status='failed';reasonCode='response_too_large';reason=(T 'WkImplResponseTooLarge' $response.op)})
+    }
+    $file=[string]$Arguments[4]
+    [IO.File]::WriteAllText("$file.tmp",$json,[Text.UTF8Encoding]::new($false))
+    [IO.File]::Move("$file.tmp",$file)
+    exit 0
+}
+function Get-SourceStamp([string]$SourceCwd,[string[]]$Cwds,[string[]]$Edits) {
+    # 백업할 작업 폴더를 정하는 입력(시작 폴더·작업 폴더·고친 파일)의 SHA-256. describe와 backup 사이에 바뀌었는지 비교한다.
+    $text=ConvertTo-Json -InputObject ([ordered]@{sourceCwd=$SourceCwd;cwds=@($Cwds | Sort-Object);edits=@($Edits | Sort-Object)}) -Compress
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try { return (Get-ProjectHex ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text)))) } finally { $sha.Dispose() }
 }
 function Assert-BundleId([string]$Id) {
     if ($Id -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/[a-f0-9]{32}$' -or $Id.Split('/')[0] -in @('.','..')) { throw (T 'WkBadBundleId') }
@@ -183,56 +238,6 @@ function Remove-DesktopStage([string]$Stage) {
         [IO.Directory]::Delete($path,$false)
         return ''
     } catch { return (T 'WkStageCleanupFailed' $Stage) }
-}
-function Assert-DesktopInspect([object]$Report) {
-    if ($Report.status -notin @('new','equal','incoming_newer','local_newer','conflict','blocked') -or $Report.reason -isnot [string]) { throw (T 'WkInspectStatusInvalid') }
-    if ($Report.status -ne 'blocked' -and ($Report.token -isnot [string] -or -not $Report.token)) { throw (T 'WkInspectTokenMissing') }
-    foreach ($field in @('source','target')) { if ($Report.PSObject.Properties.Name -notcontains $field) { throw (T 'WkInspectFieldMissing' $field) } }
-}
-function Get-DesktopSessions([object]$Job,[string]$DesktopRoot) {
-    $offset=0; $items=@()
-    do {
-        $page=Invoke-DesktopBackend @('list','--home',$DesktopRoot,"--search=$($Job.search)",'--offset',[string]$offset,'--limit','200')
-        if (($page.total -isnot [int] -and $page.total -isnot [long]) -or $page.total -lt 0 -or $page.sessions -isnot [array] -or $page.sessions.Count -gt 200) { throw (T 'WkListResponseInvalid') }
-        foreach ($row in $page.sessions) {
-            Assert-NativeId $row.id
-            if ($row.cwd -isnot [string] -or $row.title -isnot [string] -or $row.historyMode -isnot [string] -or $row.archived -isnot [bool] -or ($row.children -isnot [int] -and $row.children -isnot [long]) -or $row.children -lt 0) { throw (T 'WkListMetadataInvalid') }
-            # 하위 에이전트 대화는 백엔드가 목록에서 빼고 부모 대화와 한 묶음으로 옮긴다. children은 그 묶음의 하위 대화 수다.
-            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$row.id;remoteId='';title=$row.title;updatedAt=$row.updatedAt;local=$true;recordCount=0;sourceCwd=$row.cwd;historyMode=$row.historyMode;archived=$row.archived;children=[int]$row.children;blockedReason=$null}
-        }
-        $offset+=$page.sessions.Count
-        if ($page.sessions.Count -eq 0 -and $offset -lt $page.total) { throw (T 'WkListPageStalled') }
-    } while ($offset -lt $page.total)
-    $remote=Invoke-Bundle @('list','--json')
-    if ($remote.bundles -isnot [array]) { throw (T 'WkBundleListInvalid') }
-    foreach ($bundle in $remote.bundles) {
-        try {
-            Assert-BundleId $bundle.id; Assert-BundleMetadata $bundle.metadata
-            $m=$bundle.metadata
-            # 프로젝트 파일과 그 연결 기록은 대화가 아니므로 목록에 넣지 않는다.
-            if ($m.historyMode -like 'project-*') { continue }
-            if ($Job.search -and ($m.title+' '+$m.sessionId+' '+$m.sourceCwd).IndexOf([string]$Job.search,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-            # 묶음 형식 백업은 historyMode 끝에 ;family=하위 대화 수가 있다. 없으면 하위 대화가 빠졌을 수 있는 이전 형식이다($null).
-            $children=if ($m.historyMode -match ';family=(\d{1,4})$') {[int]$Matches[1]} else {$null}
-            $items += [pscustomobject]@{agent='codex-desktop';nativeId=$m.sessionId;remoteId=$bundle.id;title=$m.title;updatedAt=$m.updatedAt;local=$false;recordCount=$m.recordCount;sourceCwd=$m.sourceCwd;historyMode=$m.historyMode;archived=$false;children=$children}
-        } catch {
-            $items += [pscustomobject]@{agent='codex-desktop';nativeId='';remoteId=[string]$bundle.id;title=(T 'WkUnverifiedBundleTitle');updatedAt='';local=$false;recordCount=0;blockedReason=$_.Exception.Message}
-        }
-    }
-    return @{sessions=@($items);message=(T 'WkListLoaded')}
-}
-function Read-DesktopReceipt([object]$Job) {
-    if ($Job.receipt -isnot [string] -or -not $Job.receipt) { throw (T 'WkReceiptMissing') }
-    $root=[IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'CtxHopGUI\staging')).TrimEnd('\')+'\'
-    $receipt=[IO.Path]::GetFullPath($Job.receipt)
-    if (-not $receipt.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($receipt) -ne 'inspect.json') { throw (T 'WkReceiptPathInvalid') }
-    $record=Get-Content -LiteralPath $receipt -Raw -Encoding UTF8 | ConvertFrom-Json
-    $archive=Join-Path (Split-Path -Parent $receipt) 'session.archive'
-    if ($record.archive -ne $archive -or $record.bundleId -cne $Job.remoteId -or $record.nativeId -cne $Job.nativeId -or $record.home -ne (Get-DesktopHome $Job) -or $record.cwd -ne (Assert-DesktopTarget $Job) -or $record.token -cne $Job.token) { throw (T 'WkReceiptMismatch') }
-    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $record.sha256) { throw (T 'WkArchiveChanged') }
-    Assert-DesktopInspect $record.preview
-    if ($record.token -cne $record.preview.token) { throw (T 'WkReceiptTokenMismatch') }
-    return $record
 }
 function Get-BundleFile([string]$Id,[string]$Output) {
     Assert-BundleId $Id
@@ -407,138 +412,92 @@ function Restore-ProjectFolders([object]$Job,[string]$Receipt,[string]$Agent,[st
         return @{message=$message;folders=$results;recovery=$recovery}
     } catch { return @{message=(T 'WkProjectRestoreFailed' $_.Exception.Message);folders=@();recovery=$null} }
 }
-function Get-ClaudeSessionFiles([string]$Id) {
-    # Claude Code 대화 파일과, 있으면 그 옆 폴더의 하위 에이전트 대화 파일.
-    foreach ($file in @(Get-NativeFiles 'claude-code' $Id)) {
-        $file.FullName
-        $subagents=Join-Path $file.DirectoryName "$Id\subagents"
-        if (Test-Path -LiteralPath $subagents -PathType Container) { Get-ChildItem -LiteralPath $subagents -Filter '*.jsonl' -File | ForEach-Object FullName }
-    }
+function Invoke-Vendor([object]$Job,[string]$Op,[hashtable]$Request) {
+    # 작업의 벤더 구현을 계약으로 부른다. ok가 아니면 그 이유로 실패시킨다.
+    # 공통 문맥: 대상 홈(Codex), GUI의 프로젝트 폴더, Claude 등록 이름. 비밀정보는 넣지 않는다.
+    $body=@{home=[string]$Job.home;projectPath=[string]$Job.projectPath;identity=[string]$Job.identity}
+    foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
+    $jobs=Join-Path $env:LOCALAPPDATA 'CtxHopGUI\jobs'
+    $null=New-Item -ItemType Directory -Path $jobs -Force
+    $response=Invoke-VendorOp ([string]$Job.agent) $Op $body $jobs
+    if ($response.status -ceq 'ok') { return $response }
+    $exception=[InvalidOperationException]::new($(if ($response.reason) {[string]$response.reason} else {T 'WkImplStatus' $Job.agent $Op $response.status}))
+    $exception.Data['vendorResult']=$response
+    # GUI는 backendResult.status가 busy면 건너뜀으로 세고, 그 밖에는 복구 기록으로 보여 준다.
+    if ($response.detail) { $exception.Data['backendResult']=$response.detail }
+    elseif ($response.status -ceq 'busy') { $exception.Data['backendResult']=[pscustomobject]@{status='busy';reason=[string]$response.reason} }
+    throw $exception
 }
-function Invoke-ClaudeProjectJob([object]$Job) {
-    # Claude Code 대화의 백업·미리보기·복원에 프로젝트 파일을 덧붙인다. 대화 작업은 ClaudeWorker가 그대로 한다.
+function Invoke-ConversationJob([object]$Job) {
+    # 대화 목록·백업·미리보기·복원·열기는 벤더 구현이 하고, 프로젝트 파일은 Worker가 벤더와 상관없이 덧붙인다.
+    $ids=@{nativeId=[string]$Job.nativeId;remoteId=[string]$Job.remoteId}
     switch ($Job.action) {
+        List {
+            $listed=Invoke-Vendor $Job 'list' @{search=[string]$Job.search}
+            # 행의 벤더는 구현이 아니라 부른 쪽이 정한다(다른 벤더의 같은 UUID를 섞지 않는다).
+            $rows=@($listed.sessions | ForEach-Object { $_ | Add-Member -NotePropertyName agent -NotePropertyValue ([string]$Job.agent) -Force -PassThru })
+            return @{sessions=$rows;excluded=[int]$listed.excluded;message=[string]$listed.message}
+        }
         Backup {
-            $plan=$null; $planError=''
-            if ($Job.projectBackup -and $Job.projectPath -and (Test-Path -LiteralPath $Job.projectPath -PathType Container)) {
-                Assert-NativeId $Job.nativeId
-                # 폴더를 고르다 실패해도 대화 백업은 막지 않고 이유만 덧붙인다.
+            # 프로젝트 파일을 함께 올리면 먼저 작업 폴더를 받아 큰 폴더를 묻는다. 그사이 작업 폴더가 바뀌면 backup이 changed로 멈춘다.
+            $plan=$null; $planError=''; $stamp=''
+            if ($Job.projectBackup) {
                 try {
-                    $work=Read-ClaudeWorkData @(Get-ClaudeSessionFiles $Job.nativeId)
-                    $plan=Get-ProjectPlan $Job (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $work.cwds $work.edits
-                } catch { $planError=$_.Exception.Message }
+                    $described=Invoke-Vendor $Job 'describe' @{nativeId=$ids.nativeId}
+                    $plan=Get-ProjectPlan $Job $described.sourceCwd @($described.cwds) @($described.edits); $stamp=$described.sourceStamp
+                } catch {
+                    # 진행 중인 대화는 대화 백업도 건너뛴다. 다른 실패는 대화 백업을 막지 않고 이유만 덧붙인다.
+                    if ($_.Exception.Data['vendorResult'].status -ceq 'busy') { throw }
+                    $planError=$_.Exception.Message
+                }
                 if ($plan.ask.Count) { return (New-ProjectQuestion $plan) }
             }
-            $result=& $script:ClaudeJobCore $Job
+            $backup=Invoke-Vendor $Job 'backup' ($ids+@{sourceStamp=$stamp})
+            $result=@{message=[string]$backup.message;remoteId=$backup.remoteId;project=$null}
             if ($planError) { $result.message+=T 'WkProjectFailed' $planError }
             if ($plan) {
+                # 대화 백업이 끝난 뒤 올린다. 실패해도 대화 백업(remoteId)은 그대로이고 이유만 덧붙인다.
                 $stage=New-DesktopStage
-                try { $result.project=Save-ProjectBackup $plan 'claude-code' $Job.nativeId $Job.remoteId $stage; $result.message+=$result.project.message }
+                try { $result.project=Save-ProjectBackup $plan $Job.agent $ids.nativeId $backup.remoteId $stage; $result.message+=$result.project.message }
                 catch { $result.message+=T 'WkProjectFailed' $_.Exception.Message }
                 $result.message+=Remove-DesktopStage $stage
             }
             return $result
         }
         Preview {
-            $result=& $script:ClaudeJobCore $Job
-            if (-not $Job.projectRestore) { return $result }
-            $stage=New-DesktopStage
-            $result.project=Get-ProjectPreviewSafe 'claude-code' $Job.nativeId $Job.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $stage
-            if ($result.project.state -ne 'found') { $null=Remove-DesktopStage $stage }
+            $preview=Invoke-Vendor $Job 'preview' $ids
+            $result=@{message=[string]$preview.message;preview=$preview.view;receipt=$preview.receipt;token=$preview.token;project=@{state='off'}}
+            # 복원을 고를 수 있는 대화만 프로젝트 파일을 받아 비교한다. 프로젝트 파일을 읽지 못해도 대화 미리보기는 그대로 보인다.
+            if ($Job.projectRestore -and @($preview.choices) -ccontains 'incoming') {
+                $stage=New-DesktopStage
+                $result.project=Get-ProjectPreviewSafe $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $stage
+                if ($result.project.state -ne 'found') { $null=Remove-DesktopStage $stage }
+            }
             return $result
         }
         Restore {
-            $result=& $script:ClaudeJobCore $Job
+            # GUI는 복원(incoming)만 작업으로 보낸다. 건너뛰기·유지는 작업을 만들지 않는다.
+            $choice=if ($Job.choice) {[string]$Job.choice} else {'incoming'}
+            $restored=Invoke-Vendor $Job 'restore' ($ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$choice})
+            $result=@{message=[string]$restored.message;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$null}
             if ($Job.projectReceipt) {
-                $project=Restore-ProjectFolders $Job $Job.projectReceipt 'claude-code' $Job.nativeId $Job.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path)
-                if ($project) { $result.project=$project; $result.message+=$project.message }
+                # 대화를 가져왔거나 이미 같을 때만 프로젝트 파일도 복원한다. 이 PC 대화가 더 새로우면 파일도 그대로 둔다.
+                if ($restored.effect -cin @('restored','equal')) {
+                    $project=Restore-ProjectFolders $Job $Job.projectReceipt $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path)
+                    if ($project) { $result.project=$project; $result.message+=$project.message }
+                }
                 # 복원하지 않았어도 미리보기에서 받은 평문 사본은 지운다.
                 $result.message+=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Job.projectReceipt)))
             }
             return $result
         }
-    }
-}
-function Invoke-DesktopJob([object]$Job) {
-    $desktopRoot=Get-DesktopHome $Job
-    switch ($Job.action) {
-        List { return (Get-DesktopSessions $Job $desktopRoot) }
-        Backup {
-            Assert-NativeId $Job.nativeId
-            $stage=New-DesktopStage; $archive=Join-Path $stage 'session.archive'
-            try { $export=Invoke-DesktopBackend @('export','--home',$desktopRoot,'--id',$Job.nativeId,'--output',$archive) }
-            catch {
-                # 실패한 내보내기는 쓸 파일이 없거나 버려야 하는 파일뿐이라 평문 staging을 남기지 않는다. 진행 중(busy)이면 결과의 backendResult로 GUI가 건너뜀으로 센다.
-                $null=Remove-DesktopStage $stage
-                throw
-            }
-            # The backend owns archive semantics; never infer historyMode or recordCount from the list.
-            Assert-BundleMetadata $export.metadata
-            if ($export.metadata.sessionId -cne $Job.nativeId -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw (T 'WkExportResultInvalid') }
-            # 프로젝트 폴더가 커서 물어야 하면 대화도 올리지 않고 돌려준다.
-            $plan=$null; $planError=''
-            if ($Job.projectBackup) {
-                try { $plan=Get-ProjectPlan $Job $export.metadata.sourceCwd @($export.folders.cwds) @($export.folders.edits) } catch { $planError=$_.Exception.Message }
-                if ($plan.ask.Count) { $null=Remove-DesktopStage $stage; return (New-ProjectQuestion $plan) }
-            }
-            $metadata=Join-Path $stage 'metadata.json'
-            $metadataJson=$export.metadata | Select-Object sessionId,title,sourceCwd,updatedAt,historyMode,cliVersion,recordCount | ConvertTo-Json
-            [IO.File]::WriteAllText($metadata,$metadataJson,[Text.UTF8Encoding]::new($false))
-            $bundle=Invoke-Bundle @('put','--input',$archive,'--metadata',$metadata,'--json')
-            Assert-BundleId $bundle.id
-            # 프로젝트 파일은 대화 백업이 끝난 뒤 올린다. 실패해도 대화 백업은 그대로이고 이유만 덧붙인다.
-            $project=$null; $projectMessage=if ($planError) {T 'WkProjectFailed' $planError} else {''}
-            if ($plan) {
-                try { $project=Save-ProjectBackup $plan 'codex-desktop' $Job.nativeId $bundle.id $stage; $projectMessage=$project.message }
-                catch { $projectMessage=T 'WkProjectFailed' $_.Exception.Message }
-            }
-            # 원본은 Codex에, 백업은 암호화 bundle로 남았으므로 평문 사본은 지운다. 실패하면 위에서 중단돼 남는다.
-            $warning=Remove-DesktopStage $stage
-            return @{message=(T 'WkBackupDone' $bundle.id ($projectMessage+$warning));bundle=$bundle;project=$project}
-        }
-        Preview {
-            Assert-NativeId $Job.nativeId; Assert-BundleId $Job.remoteId
-            $cwd=Assert-DesktopTarget $Job; $stage=New-DesktopStage; $archive=Join-Path $stage 'session.archive'
-            $null=Get-BundleFile $Job.remoteId $archive
-            $preview=Invoke-DesktopBackend @('inspect','--home',$desktopRoot,'--archive',$archive,'--cwd',$cwd)
-            Assert-DesktopInspect $preview
-            if ($preview.status -ne 'blocked' -and $preview.source.sessionId -cne $Job.nativeId) { throw (T 'WkArchiveIdMismatch') }
-            $receipt=Join-Path $stage 'inspect.json'
-            @{home=$desktopRoot;cwd=$cwd;archive=$archive;bundleId=$Job.remoteId;nativeId=$Job.nativeId;token=$preview.token;sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash;preview=$preview} | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receipt -Encoding UTF8
-            $project=if ($Job.projectRestore -and $preview.status -ne 'blocked') { Get-ProjectPreviewSafe 'codex-desktop' $Job.nativeId $Job.remoteId $cwd $stage } else { @{state='off'} }
-            return @{message=(T 'WkPreviewDone');preview=$preview;receipt=$receipt;project=$project}
-        }
-        Restore {
-            $record=Read-DesktopReceipt $Job
-            if ($Job.choice -notin @('skip','incoming')) { throw (T 'WkChoiceRequired') }
-            if ($record.preview.status -eq 'blocked' -and $Job.choice -eq 'incoming') { throw (T 'WkBlockedRestore') }
-            if ($Job.choice -eq 'skip') { return @{message=(T 'WkSkipped')} }
-            $applied=Invoke-DesktopBackend @('apply','--home',$desktopRoot,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--choice',$Job.choice)
-            $message=switch ([string]$applied.status) {
-                'imported' {T 'WkRestoreImported' $Job.nativeId}
-                'equal' {T 'WkRestoreEqual' $Job.nativeId}
-                'local_newer' {T 'WkRestoreLocalNewer' $Job.nativeId}
-                default { throw (T 'WkRestoreStatusUnknown' $applied.status) }
-            }
-            # 대화를 가져왔거나 이미 같을 때만 프로젝트 파일도 복원한다. 이 PC 대화가 더 새로우면 파일도 그대로 둔다.
-            $project=$null
-            $projectReceipt=Join-Path (Split-Path -Parent $record.archive) 'project-receipt.json'
-            if ($applied.status -in @('imported','equal') -and (Test-Path -LiteralPath $projectReceipt -PathType Leaf)) {
-                $project=Restore-ProjectFolders $Job $projectReceipt 'codex-desktop' $Job.nativeId $Job.remoteId $record.cwd
-                if ($project) { $message+=$project.message }
-            }
-            # 성공하면 교체 전·후 원본은 백엔드 복구 폴더에 있으므로 내려받은 평문 사본을 지운다. 실패하면 증거로 남긴다.
-            $message+=Remove-DesktopStage (Split-Path -Parent $record.archive)
-            return @{message=$message;applied=$applied;project=$project}
-        }
-        Open { throw (T 'WkOpenManually') }
-        default { throw (T 'WkUnsupportedAction') }
+        Open { return @{message=[string](Invoke-Vendor $Job 'open' $ids).message} }
     }
 }
 function Invoke-JobCore([object]$Job) {
-    if ($Job.agent -eq 'codex-desktop' -and $Job.action -in @('List','Backup','Preview','Restore','Open')) { return (Invoke-DesktopJob $Job) }
+    if ($Job.action -in @('List','Backup','Preview','Restore','Open')) { return (Invoke-ConversationJob $Job) }
+    # 설정·저장소 작업은 벤더와 무관한 ctxhop 설정 작업이라 ClaudeWorker가 그대로 한다.
     if ($Job.agent -eq 'codex-desktop') { $Job.agent='claude-code' }
-    if ($Job.agent -eq 'claude-code' -and $Job.action -in @('Backup','Preview','Restore')) { return (Invoke-ClaudeProjectJob $Job) }
     & $script:ClaudeJobCore $Job
 }
 if ($script:VNextLibraryOnly) { return }

@@ -461,6 +461,53 @@
     - `C:\Users\me`, `C:\Users\fixture`: 시험용 가짜 경로입니다.
   - 커밋 작성자는 포크에 이미 공개된 두 신원입니다.
 
+## 벤더 계약 v1 (2026-09-28, 새 저장소 S2)
+
+- **구조**: Worker는 벤더 계약(`docs\contract-v1.md`)으로 벤더 구현을 별도 프로세스로 부릅니다.
+  - `impls.json`에 벤더 두 개를 적었습니다.
+    - `codex-desktop` → `CodexDesktop.ps1`
+    - `claude-code` → `ClaudeCode.ps1`
+  - Codex 쪽 함수(백엔드 고정 해시, 목록, 내보내기, 미리보기 receipt, 복원)는 `Worker.ps1`에서 `CodexDesktop.ps1`로 옮겼습니다. 판단과 검사는 바꾸지 않았습니다.
+  - Claude 쪽은 `ClaudeWorker.ps1`을 바꾸지 않고 `ClaudeCode.ps1`이 감쌉니다. 고정 해시 `4E601995…0CB7`는 그대로입니다.
+  - Worker에는 벤더 분기가 없습니다. 프로젝트 파일(백업·미리보기·복원)은 두 벤더가 같은 코드를 씁니다.
+  - 수동 도구 `backend\Invoke-Desktop.ps1`은 `CodexDesktop.ps1`을 불러 같은 고정 백엔드를 씁니다.
+- **동작 변화**
+  - 프로젝트 파일을 함께 올릴 때는 먼저 `describe`로 작업 폴더를 받고, 백업 직전에 다시 비교합니다.
+    - 그사이 폴더가 바뀌면 아무것도 올리지 않고 "다시 백업하세요"로 끝냅니다(`changed`).
+    - Codex는 이 때문에 내보내기를 두 번 합니다.
+  - 복원 요청의 선택은 `incoming`만 받습니다. GUI는 건너뛰기·유지를 작업으로 보내지 않으므로 쓰이지 않던 `skip` 경로를 지웠습니다.
+  - 프로젝트 파일 미리보기 사본은 두 벤더 모두 Worker가 따로 만든 staging에 둡니다. 복원 때는 GUI가 넘긴 `projectReceipt`를 씁니다.
+    - 이전에는 Codex만 대화 사본과 같은 폴더를 썼습니다.
+    - 프로젝트 기록은 벤더 이름을 묶어 둡니다. 같은 UUID라도 다른 벤더의 기록은 쓰지 않습니다.
+  - 구현이 응답하지 못하거나, 시간이 넘거나, 형식이 틀리면 "어디까지 했는지 알 수 없으니 결과를 확인하세요"로 알립니다.
+  - Claude 복원이 실패해 새 복구 기록이 남으면 그 위치를 GUI의 복구 기록으로 보여 줍니다.
+  - 결과 필드가 바뀌었습니다. 백업은 `bundle.id` 대신 `remoteId`, 복원은 `applied` 대신 `effect`와 `restored`를 씁니다. GUI가 읽는 필드는 그대로입니다.
+- **검토**: Codex 스레드가 명세를 검토했습니다(r30, 조건부 채택).
+  - 결정: 전송을 구현 안에 두는 것과 8개 op는 유지합니다.
+  - 조건: 명세의 빈 곳 다섯 가지를 메우고, Claude 구현까지 같은 계약으로 부를 것
+    1. describe 스냅숏
+    2. restore effect와 프로젝트 파일 실행 조건
+    3. receipt·token·choice의 수명
+    4. op별 결과 스키마, 결과를 알 수 없는 경우
+    5. 시험 구조
+  - mock 방식: 배포 코드에 시험용 mock 진입점을 두지 않습니다. 처리기는 시험 프로세스 안에서 부르고, 프로세스 경계는 가짜 구현과 실제 진입점으로 따로 시험합니다.
+- **시험**(LF로 맞춘 작업 트리 사본, 배포 패키지와 같은 바이트)
+  - Test-Strings 1810
+  - Test-ProjectFiles 145
+  - Test-Contract 94(새 시험)
+  - Test-DesktopWorker 296
+    - 늘어난 확인: 계약 응답 검사, 대상 홈 변경, 다른 구현의 receipt, 진행 중 대화(describe), 폴더가 바뀐 백업(Codex·Claude), 다른 벤더의 같은 UUID
+  - Test-DesktopGUI 80
+  - Test-ClaudeWorker 49 groups·828
+  - Test-ClaudeGUI 165
+  - Test-DesktopIntegration 85(설치된 엔진으로 만든 시험 대화와 고정한 실제 백엔드)
+  - 모두 exit 0이었습니다. 통합 시험 전후의 Codex 앱 프로세스 목록은 같았습니다.
+- **CI**: 엔진이 필요 없는 시험에 Test-Contract를 더했습니다(7종).
+- **아직 하지 않은 것**
+  - 실제 Claude·Codex 대화로 두 PC 사이를 왕복하는 시험(S7)
+  - 복구 기록 조회·복구 op(S3)
+  - 구현 프로세스를 호출마다 새로 띄우는 비용: 이 PC에서 호출당 약 0.7~0.9초
+
 ## 실행한 검사 (Windows PowerShell 5.1, Python 3.12.14 Codex 번들, 엔진 `0.158.0-alpha.2.1`)
 
 | 검사 | 결과 | 원시 로그 |

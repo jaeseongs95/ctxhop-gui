@@ -1,8 +1,23 @@
 ﻿#requires -Version 5.1
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
+. (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
+. (Join-Path $PSScriptRoot 'ClaudeCode.ps1') -LibraryOnly
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
+# 벤더 계약 경계: 실제 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
+# 네이티브 호출은 아래 함수 교체로 흉내 낸다. 프로세스 경계와 실제 진입점은 Test-Contract.ps1이 확인한다.
+$script:VendorOps=@{'codex-desktop'=$script:CodexDesktopOps;'claude-code'=$script:ClaudeCodeOps}
+function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
+    $id=[guid]::NewGuid().ToString()
+    $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
+    foreach ($key in $Request.Keys) { $body[$key]=$Request[$key] }
+    $script:VendorCalls+=,"$Vendor/$Op"
+    $response=ConvertTo-Json -InputObject (Invoke-ImplOp $script:VendorOps[$Vendor] (ConvertTo-Json -InputObject $body -Depth 30 | ConvertFrom-Json)) -Depth 40 | ConvertFrom-Json
+    Assert (Test-VendorResponse $response $id $Op) "contract response for $Vendor $Op"
+    return $response
+}
+$script:VendorCalls=@()
 function Throws([scriptblock]$Body,[string]$Pattern) {
     $errorRecord=$null; try { & $Body | Out-Null } catch { $errorRecord=$_ }
     Assert ($null -ne $errorRecord) 'operation must fail'
@@ -37,7 +52,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         apply {
             if ($script:ApplyFail) {
                 $e=[InvalidOperationException]::new('복원 실패, 복구 기록 유지')
-                $e.Data['backendResult']=[pscustomobject]@{error='partial write';journal='fixture/recovery/pending.json';recoveryRequired=$true}
+                $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='partial write';token=$null;pending=@('fixture/.ctxhop-desktop-recovery/run')}
                 throw $e
             }
             return @{status='imported';journal='fixture/recovery/completed.json'}
@@ -80,6 +95,7 @@ try {
     $job=@{action='List';agent='codex-desktop';home=$desktopRoot;projectPath=$target;search='';nativeId=$script:Id;remoteId=$script:BundleA}
     $list=Invoke-JobCore $job
     Assert ($list.sessions.Count -eq 204) 'all pages, two branches and blocked metadata must remain visible'
+    Assert (-not @($list.sessions | Where-Object { $_.agent -cne 'codex-desktop' }).Count) 'the caller, not the implementation, names the vendor of each row'
     Assert (@($script:Calls | Where-Object {$_.kind -eq 'backend' -and $_.arguments[0] -eq 'list'}).Count -eq 2) 'metadata list must paginate 200 at a time'
     Assert (@($list.sessions | Where-Object archived).Count -gt 0) 'archived conversations must remain visible'
     Assert (@($list.sessions | Where-Object nativeId -eq $script:Id).Count -eq 2) 'same UUID branches must not collapse by date'
@@ -89,22 +105,33 @@ try {
     $script:ListBadChildren=$true; Throws {Invoke-JobCore @{action='List';agent='codex-desktop';home=$desktopRoot;search=''}} '목록 메타데이터'; $script:ListBadChildren=$false
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $job.action='Backup'; $backup=Invoke-JobCore $job
-    Assert ($backup.bundle.id -eq $script:BundleA) 'export publishes opaque encrypted bundle'
+    Assert ($backup.remoteId -eq $script:BundleA -and ($script:VendorCalls -join ',') -ceq 'codex-desktop/list,codex-desktop/list,codex-desktop/backup') 'export publishes opaque encrypted bundle through the contract'
     Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) 'uploaded plaintext backup copy is removed'
+    # 프로젝트 파일을 함께 올릴 때는 describe가 먼저 내보낸다. 진행 중이면 대화 백업도 건너뛰고, 다른 실패는 backup이 다시 알린다.
     foreach ($status in 'busy','blocked') {
-        $script:ExportStatus=$status; $exportError=$null
-        try { $null=Invoke-JobCore $job } catch { $exportError=$_ }
-        $script:ExportStatus=$null
-        Assert ($exportError -and $exportError.Exception.Data['backendResult'].status -eq $status) "a $status export keeps the backend status for the GUI"
-        Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) "a $status export leaves no plaintext staging copy"
+        foreach ($withProject in $false,$true) {
+            $job.projectBackup=$withProject; $script:ExportStatus=$status; $exportError=$null; $script:VendorCalls=@()
+            try { $null=Invoke-JobCore $job } catch { $exportError=$_ }
+            $script:ExportStatus=$null
+            Assert ($exportError -and $exportError.Exception.Data['backendResult'].status -eq $status) "a $status export keeps the backend status for the GUI (project files: $withProject)"
+            Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) "a $status export leaves no plaintext staging copy (project files: $withProject)"
+            if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
+        }
     }
+    $job.Remove('projectBackup')
     $job.action='Preview'; $preview=Invoke-JobCore $job
     Assert ($preview.preview.status -eq 'conflict') 'backend content comparison controls status'
     $previewStage=Split-Path -Parent $preview.receipt
     Assert (Get-Acl -LiteralPath $previewStage).AreAccessRulesProtected 'plaintext preview staging must disable ACL inheritance'
     $job.action='Restore'; $job.receipt=$preview.receipt; $job.token=$preview.preview.token; $job.choice='skip'
-    $before=$script:Calls.Count; $null=Invoke-JobCore $job
-    Assert ($script:Calls.Count -eq $before) 'skip must preserve the local branch without any backend write'
+    $before=$script:Calls.Count; Throws {Invoke-JobCore $job} '선택하세요'
+    Assert ($script:Calls.Count -eq $before) 'only the incoming choice reaches the backend; skip and keep never start a restore'
+    # 미리보기 뒤에 대상 홈이 바뀌면 받지 않는다.
+    $job.choice='incoming'; $otherHome=Join-Path $testDirectory 'other-home'; $null=New-Item -ItemType Directory -Path $otherHome
+    $job.home=$otherHome; Throws {Invoke-JobCore $job} '선택'; $job.home=$desktopRoot
+    # 벤더 구현의 receipt는 그 구현의 staging 안 inspect.json만 받는다.
+    $job.receipt=Join-Path $testDirectory 'inspect.json'; Throws {Invoke-JobCore $job} '미리보기'; $job.receipt=$preview.receipt
+    Assert ($script:Calls.Count -eq $before) 'a changed home or a foreign receipt never reaches the backend'
     $job.choice='incoming'
     $job.token='another-token'; Throws {Invoke-JobCore $job} '토큰'
     $job.token='exact-token-A'; $oldId=$job.remoteId; $job.remoteId=$script:BundleB; Throws {Invoke-JobCore $job} '선택'
@@ -140,7 +167,7 @@ try {
     $script:State='conflict'; $job.action='Preview'; $r=Invoke-JobCore $job
     $job.action='Restore'; $job.receipt=$r.receipt; $job.token=$r.preview.token; $job.choice='incoming'; $script:ApplyFail=$true
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
-    Assert ($failure.Exception.Data['backendResult'].journal -eq 'fixture/recovery/pending.json') 'failure must preserve backend recovery journal data'
+    Assert ((@($failure.Exception.Data['backendResult'].pending) -join '|') -eq 'fixture/.ctxhop-desktop-recovery/run' -and $failure.Exception.Data['vendorResult'].recovery -eq 'required') 'failure must preserve backend recovery journal data and say recovery is required'
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
     # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판에, ctxhop 0.2.0-gui.3 고정과
     # Claude 세션 옆 폴더(하위 에이전트·도구 결과) 복원 확인, ctxhop 출력 UTF-8 읽기, 저장소 옮기기를 더한 판과 바이트 동일해야 한다.
@@ -212,7 +239,7 @@ try {
         Assert (($first.project.outside -join '|') -eq $outsideEdit -and $first.message -match '프로젝트 폴더 3개' -and $first.message -match '폴더 밖에서 고친 파일 1개' -and $first.message -match '복원할 수 없는 이름\(짧은 이름 형식 GIT~1, 장치 이름 CON 등\)의 파일 1개') "project backup message: $($first.message)"
         Assert (@(Get-Stored 'project-files;*').Count -eq 2 -and @(Get-Stored 'project-link;*').Count -eq 1 -and @(Get-Stored 'paginated*').Count -eq 1) "conversation, two folders and one link are stored: $(@($script:Store.Values | ForEach-Object { $_.metadata.historyMode }) -join ' / ')"
         $firstLink=@(Get-Stored 'project-link;*')[0]
-        Assert ($firstLink.metadata.historyMode -eq 'project-link;v1;codex-desktop' -and $firstLink.metadata.title -ceq $first.bundle.id -and $firstLink.metadata.sessionId -eq $script:Id -and $firstLink.metadata.sourceCwd -eq $projA) 'the link names the conversation bundle and start folder'
+        Assert ($firstLink.metadata.historyMode -eq 'project-link;v1;codex-desktop' -and $firstLink.metadata.title -ceq $first.remoteId -and $firstLink.metadata.sessionId -eq $script:Id -and $firstLink.metadata.sourceCwd -eq $projA) 'the link names the conversation bundle and start folder'
         $zipA=@(Get-Stored 'project-files;*' | Where-Object { $_.metadata.sourceCwd -eq $projA }).file
         Assert (((Get-ZipNames $zipA) -join '|') -eq 'files/README.md|files/src/app.py|manifest.json') "stored snapshot leaves out secrets and generated folders: $((Get-ZipNames $zipA) -join '|')"
         Assert (Test-StagingClean) 'project backup leaves no plaintext staging copy'
@@ -258,7 +285,7 @@ try {
         $realFolders=${function:Get-ProjectFolders}; $count=$script:Store.Count
         function Get-ProjectFolders { throw '합성 폴더 실패' }
         try { $failedPlan=Invoke-JobCore $codex } finally { ${function:Get-ProjectFolders}=$realFolders }
-        Assert ($failedPlan.bundle.id -and $null -eq $failedPlan.project -and $failedPlan.message -match '프로젝트 파일은 백업하지 못했습니다' -and $failedPlan.message -match '합성 폴더 실패' -and $script:Store.Count -eq $count+1) "a failure while picking folders never blocks the Codex conversation backup: $($failedPlan.message)"
+        Assert ($failedPlan.remoteId -and $null -eq $failedPlan.project -and $failedPlan.message -match '프로젝트 파일은 백업하지 못했습니다' -and $failedPlan.message -match '합성 폴더 실패' -and $script:Store.Count -eq $count+1) "a failure while picking folders never blocks the Codex conversation backup: $($failedPlan.message)"
 
         # 목록에는 프로젝트 파일과 연결 기록이 대화로 보이지 않는다.
         $listed=Invoke-JobCore @{action='List';agent='codex-desktop';home=$desktopRoot;search=''}
@@ -268,18 +295,18 @@ try {
         $restoreTarget=Join-Path $testDirectory 'restore-target'
         foreach ($pair in @(@("$restoreTarget\src\app.py",'local edit'),@("$restoreTarget\local.txt",'keep'))) { $null=[IO.Directory]::CreateDirectory((Split-Path -Parent $pair[0])); [IO.File]::WriteAllText($pair[0],$pair[1]) }
         Rename-Item -LiteralPath $projB -NewName 'lib-moved'; $picked=Join-Path $testDirectory 'picked-lib'
-        $restore=@{action='Preview';agent='codex-desktop';home=$desktopRoot;projectPath=$restoreTarget;nativeId=$script:Id;remoteId=$first.bundle.id;projectRestore=$true}
+        $restore=@{action='Preview';agent='codex-desktop';home=$desktopRoot;projectPath=$restoreTarget;nativeId=$script:Id;remoteId=$first.remoteId;projectRestore=$true}
         $storedB=@(Get-Stored 'project-files;*' | Where-Object { $_.metadata.sourceCwd -eq $projB })[0].file; $bytesB=[IO.File]::ReadAllBytes($storedB)
         [IO.File]::WriteAllText($storedB,'not a zip')
         try { $iso=Invoke-JobCore $restore } finally { [IO.File]::WriteAllBytes($storedB,$bytesB) }
         Assert ($iso.preview.token -and @($iso.project.folders).Count -eq 3 -and $iso.project.folders[0].state -eq 'ready' -and $iso.project.folders[1].state -eq 'error' -and $iso.project.folders[1].reason -and $iso.project.folders[1].target -eq '' -and $iso.project.folders[2].state -eq 'skipped') "one unreadable folder does not stop the others: $($iso.project | ConvertTo-Json -Depth 3 -Compress)"
-        $null=Remove-DesktopStage (Split-Path -Parent $iso.receipt)
+        $null=Remove-DesktopStage (Split-Path -Parent $iso.receipt); $null=Remove-DesktopStage (Split-Path -Parent $iso.project.receipt)
         $shown=Invoke-JobCore $restore
         $p=$shown.project
         Assert ($p.state -eq 'found' -and $p.folders.Count -eq 3 -and (($p.outside) -join '|') -eq $outsideEdit) "project preview found: $($p | ConvertTo-Json -Depth 4 -Compress)"
         Assert ($p.folders[0].state -eq 'ready' -and $p.folders[0].target -eq $restoreTarget -and $p.folders[0].compare.new -eq 1 -and $p.folders[0].compare.changed -eq 1 -and $p.folders[0].compare.localOnly -eq 1) 'start folder compares with the chosen restore folder'
         Assert ($p.folders[1].state -eq 'needsFolder' -and $p.folders[1].target -eq '' -and $p.folders[2].state -eq 'skipped') 'an extra folder missing on this PC needs a choice'
-        $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.choice='incoming'; $restore.projectTargets=@{'1'=$picked}
+        $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.choice='incoming'; $restore.projectTargets=@{'1'=$picked}; $restore.projectReceipt=$shown.project.receipt
         $restoreJob=$restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json   # GUI처럼 JSON을 거친 요청
         $done=Invoke-JobCore $restoreJob
         Assert ($done.project.folders.Count -eq 2 -and $done.message -match '프로젝트 폴더 2개 복원') "project restore message: $($done.message)"
@@ -287,24 +314,24 @@ try {
         Assert ([IO.File]::ReadAllText("$picked\lib.py") -eq 'lib v1' -and -not (Test-Path -LiteralPath "$restoreTarget\.env")) 'the extra folder goes to the chosen folder'
         $recovery=$done.project.recovery
         Assert ($recovery -and [IO.File]::ReadAllText("$recovery\0\src\app.py") -eq 'local edit' -and (Test-Path -LiteralPath "$recovery\restore-log.json") -and (Get-Acl -LiteralPath $recovery).AreAccessRulesProtected) 'replaced originals are kept in a private recovery folder'
-        Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $shown.receipt))) 'the preview staging copy is removed after restore'
+        Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $shown.receipt)) -and -not (Test-Path -LiteralPath (Split-Path -Parent $shown.project.receipt))) 'the conversation and project preview staging copies are removed after restore'
         # 이 PC 대화가 더 새로우면 파일도 그대로 둔다. 선택을 끄면 복원하지 않는다. 미리보기 뒤 바뀐 파일은 쓰지 않는다.
         foreach ($case in @(@{status='local_newer';restore=$true},@{status='imported';restore=$false},@{status='imported';restore=$true;tamper=$true})) {
             [IO.File]::WriteAllText("$restoreTarget\src\app.py",'local again'); $script:ApplyStatus=$case.status
             $restore.action='Preview'; $restore.projectRestore=$true; $shown=Invoke-JobCore $restore
-            $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.projectRestore=$case.restore
+            $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.projectRestore=$case.restore; $restore.projectReceipt=$shown.project.receipt
             if ($case.tamper) { [IO.File]::AppendAllText($shown.project.folders[0].zip,'x') }
             $done=Invoke-JobCore ($restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json)   # GUI처럼 JSON을 거쳐 고른 폴더(projectTargets)도 쓴다
-            Assert ([IO.File]::ReadAllText("$restoreTarget\src\app.py") -eq 'local again') "project files stay for $($case | ConvertTo-Json -Compress)"
-            if ($case.tamper) { Assert ($done.message -match '폴더는 복원하지 못했습니다' -and $done.applied.status -eq 'imported' -and (@($done.project.folders | ForEach-Object state) -join '|') -eq 'failed|restored' -and (Test-Path -LiteralPath "$($done.project.recovery)\restore-log.json")) "a changed download fails only that folder; the others are restored and logged: $($done.message)" }
+            Assert ([IO.File]::ReadAllText("$restoreTarget\src\app.py") -eq 'local again' -and -not (Test-Path -LiteralPath (Split-Path -Parent $shown.project.receipt))) "project files stay and the project preview copy is removed for $($case | ConvertTo-Json -Compress)"
+            if ($case.tamper) { Assert ($done.message -match '폴더는 복원하지 못했습니다' -and $done.restored.status -eq 'imported' -and $done.effect -eq 'restored' -and (@($done.project.folders | ForEach-Object state) -join '|') -eq 'failed|restored' -and (Test-Path -LiteralPath "$($done.project.recovery)\restore-log.json")) "a changed download fails only that folder; the others are restored and logged: $($done.message)" }
         }
-        $script:ApplyStatus='imported'; $restore.projectRestore=$true
+        $script:ApplyStatus='imported'; $restore.projectRestore=$true; $restore.Remove('projectReceipt')
         # 미리보기를 꺼 두면 프로젝트 파일을 받지 않는다.
         $restore.action='Preview'; $restore.projectRestore=$false; $gets=@($script:Calls | Where-Object { $_.kind -eq 'bundle' -and $_.arguments[0] -eq 'get' }).Count
         $off=Invoke-JobCore $restore
         Assert ($off.project.state -eq 'off' -and @($script:Calls | Where-Object { $_.kind -eq 'bundle' -and $_.arguments[0] -eq 'get' }).Count -eq $gets+1) 'with restore off only the conversation is downloaded'
         $null=Remove-DesktopStage (Split-Path -Parent $off.receipt)
-        Throws { Read-ProjectReceipt (Join-Path $testDirectory 'project-receipt.json') 'codex-desktop' $script:Id $first.bundle.id } '미리보기 기록'
+        Throws { Read-ProjectReceipt (Join-Path $testDirectory 'project-receipt.json') 'codex-desktop' $script:Id $first.remoteId } '미리보기 기록'
 
         # Claude Code: 대화 작업은 ClaudeWorker(여기서는 가짜)가 하고, 프로젝트 파일은 같은 저장소에 붙는다.
         Rename-Item -LiteralPath (Join-Path $projects 'lib-moved') -NewName 'lib'
@@ -331,6 +358,15 @@ try {
         function Read-ClaudeWorkData([string[]]$Files) { throw '합성 읽기 실패' }
         try { $failedRead=Invoke-JobCore $claude } finally { ${function:Read-ClaudeWorkData}=$realRead }
         Assert ($failedRead.message -match '^대화 백업 완료\. 프로젝트 파일은 백업하지 못했습니다' -and $failedRead.message -match '합성 읽기 실패' -and $script:ClaudeCalls[-1] -eq 'Backup') "a failure while picking folders never blocks the Claude conversation backup: $($failedRead.message)"
+        # describe 뒤에 작업 폴더가 바뀌면 아무것도 올리지 않는다(Claude: 대화도 올리지 않는다).
+        $realRead=${function:Read-ClaudeWorkData}; $script:Reads=0; $pushes=@($script:ClaudeCalls).Count; $count=$script:Store.Count
+        function Read-ClaudeWorkData([string[]]$Files) { $script:Reads++; $work=& $realRead $Files; if ($script:Reads -eq 2) { $work.cwds=@($work.cwds)+'D:\new-folder' }; $work }
+        try { $changed=$null; try { Invoke-JobCore $claude } catch { $changed=$_ } } finally { ${function:Read-ClaudeWorkData}=$realRead }
+        Assert ($changed.Exception.Data['vendorResult'].status -eq 'changed' -and $changed.Exception.Message -match '작업 폴더가 바뀌어' -and @($script:ClaudeCalls).Count -eq $pushes -and $script:Store.Count -eq $count -and (Test-StagingClean)) 'Claude: folders that changed after describe stop the backup before the conversation is pushed'
+        $realBackend=${function:Invoke-DesktopBackend}; $script:Exports=0; $savedCwds=$script:Cwds
+        function Invoke-DesktopBackend([string[]]$Arguments) { if ($Arguments[0] -eq 'export') { $script:Exports++; if ($script:Exports -eq 2) { $script:Cwds=@($script:Cwds)+'D:\new-folder' } }; & $realBackend $Arguments }
+        try { $changed=$null; try { Invoke-JobCore $codex } catch { $changed=$_ } } finally { ${function:Invoke-DesktopBackend}=$realBackend; $script:Cwds=$savedCwds }
+        Assert ($changed.Exception.Data['vendorResult'].status -eq 'changed' -and $script:Exports -eq 2 -and $script:Store.Count -eq $count -and (Test-StagingClean)) 'Codex: folders that changed after describe stop the backup before anything is uploaded'
         [IO.File]::WriteAllText("$projA\src\app.py",'claude v2'); $null=Invoke-JobCore $claude
         $claudeTarget=Join-Path $testDirectory 'claude-target'; $null=New-Item -ItemType Directory -Path $claudeTarget
         $claude.action='Preview'; $claude.projectPath=$claudeTarget; $claude.projectRestore=$true
@@ -343,8 +379,15 @@ try {
         $claude.action='Restore'; $claude.projectReceipt=$cp.project.receipt
         $cr=Invoke-JobCore $claude
         Assert ([IO.File]::ReadAllText("$claudeTarget\src\app.py") -eq 'claude v2' -and $cr.message -match '^복원 완료\. 프로젝트 폴더 2개 복원' -and -not (Test-Path -LiteralPath (Split-Path -Parent $cp.project.receipt))) "Claude restore writes the latest backup: $($cr.message)"
+        # 다른 벤더의 같은 UUID: Codex 대화에서 받은 프로젝트 미리보기를 같은 UUID의 Claude 복원에 넘겨도 파일을 쓰지 않는다.
+        $restore.action='Preview'; $restore.projectRestore=$true; $cxp=Invoke-JobCore $restore
+        Assert ($cxp.project.state -eq 'found') 'Codex project preview for the cross-vendor check'
+        [IO.File]::WriteAllText("$claudeTarget\src\app.py",'cross check')
+        $cross=Invoke-JobCore @{action='Restore';agent='claude-code';projectPath=$claudeTarget;nativeId=$script:Id;remoteId=$claudeRemote;projectRestore=$true;projectReceipt=$cxp.project.receipt}
+        Assert ($cross.effect -eq 'restored' -and $cross.message -match '미리보기 기록' -and [IO.File]::ReadAllText("$claudeTarget\src\app.py") -eq 'cross check' -and -not (Test-Path -LiteralPath (Split-Path -Parent $cxp.project.receipt))) "a project preview of another vendor's conversation with the same UUID is never restored: $($cross.message)"
+        $null=Remove-DesktopStage (Split-Path -Parent $cxp.receipt)
         $claude.projectRestore=$false; $claude.action='Preview'; $cp=Invoke-JobCore $claude
-        Assert ($null -eq $cp.project) 'Claude preview skips project files when the option is off'
+        Assert ($cp.project.state -eq 'off') 'Claude preview skips project files when the option is off'
         Assert (Test-StagingClean) 'no plaintext project copy remains in staging'
     } finally { $env:TMP=$oldTmp; $env:TEMP=$oldTemp; $env:GIT_CEILING_DIRECTORIES=$oldCeiling }
     # GUI처럼 Worker.ps1을 별도 프로세스로 실행해 요청·결과 경로가 ClaudeWorker dot-source 뒤에도 남는지 확인한다.

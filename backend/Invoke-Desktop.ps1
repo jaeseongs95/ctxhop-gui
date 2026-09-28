@@ -22,8 +22,8 @@ if (-not $HomePath) {
     $HomePath = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 }
 # Same pinned backend SHA256, Python selection (backend\runtime.json), isolated mode (-I) and
-# argument quoting as the GUI worker.
-. (Join-Path (Split-Path -Parent $PSScriptRoot) 'Worker.ps1') -LibraryOnly
+# argument quoting as the Codex Desktop implementation (CodexDesktop.ps1).
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'CodexDesktop.ps1') -LibraryOnly
 $nativeArgs = @($Action,'--home',$HomePath)
 foreach ($pair in @(@('--id',$Id),@('--archive',$Archive),@('--cwd',$Cwd),@('--output',$Output),@('--request',$Request),@('--run',$Run),@('--token',$Token))) {
     if ($pair[1]) { $nativeArgs += [string]$pair[0],[string]$pair[1] }
