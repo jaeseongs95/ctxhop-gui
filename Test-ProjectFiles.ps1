@@ -233,11 +233,33 @@ try {
     }
     Remove-Item -LiteralPath @(Get-ChildItem -LiteralPath $testDirectory -Filter 'h*.zip' | ForEach-Object FullName)
     Assert ((Get-TreeText $testDirectory) -eq $before) 'hostile snapshots change no file'
-    # 내용이 기록된 해시와 다르면(크기는 같음) 그 파일만 쓰지 않는다.
-    $tampered=New-TestZip (Join-Path $testDirectory 'tampered.zip') @{'keep.txt'='same';'new.txt'='abc'} { param($m,$e) $e['keep.txt']='SAME' }
+    # 내용이 기록된 해시와 다르면(크기는 같음) 그 파일에서 멈추고 남은 파일은 쓰지 않는다(S3 명세 3.2절).
+    $tampered=New-TestZip (Join-Path $testDirectory 'tampered.zip') @{'a.txt'='abc';'keep.txt'='same';'z.txt'='z'} { param($m,$e) $e['keep.txt']='SAME' }
     $restored=Restore-ProjectSnapshot $tampered $victim (Join-Path $testDirectory 'rec-tampered')
-    Assert ($restored.written -eq 1 -and $restored.failed.Count -eq 1 -and $restored.failed[0].path -eq 'keep.txt' -and $restored.backedUp -eq 0) "tampered content fails alone: $($restored | ConvertTo-Json -Compress)"
-    Assert ([IO.File]::ReadAllText((Join-Path $victim 'keep.txt')) -eq 'keep' -and -not @(Get-ChildItem -LiteralPath $victim -Force -Filter '*.part').Count) 'the original stays and no part file remains'
+    Assert ($restored.written -eq 1 -and $restored.failed.Count -eq 1 -and $restored.failed[0].path -eq 'keep.txt' -and $restored.backedUp -eq 1 -and (@($restored.files | ForEach-Object state) -join '|') -eq 'written|failed|skipped') "tampered content stops the restore: $($restored | ConvertTo-Json -Compress)"
+    Assert ([IO.File]::ReadAllText((Join-Path $victim 'keep.txt')) -eq 'keep' -and -not (Test-Path -LiteralPath (Join-Path $victim 'z.txt')) -and -not @(Get-ChildItem -LiteralPath $victim -Force -Filter '.ctxhop-*').Count) 'the original stays, later files are not written and no temporary file remains'
+    Remove-Item -LiteralPath (Join-Path $victim 'a.txt')
+    # 계획: 파일마다 before·after·action을 정하고, 바꿀 파일의 원본은 먼저 복사해 해시를 before로 적는다. 활성 파일은 그대로다.
+    $planDir=Join-Path $testDirectory 'plan'; Write-Fixture $planDir @{'a.txt'='old';'same.txt'='same'}
+    $planZip=New-TestZip (Join-Path $testDirectory 'plan.zip') @{'a.txt'='new';'same.txt'='same';'b.txt'='b'}
+    $plan=New-ProjectRestorePlan $planZip $planDir (Join-Path $testDirectory 'plan-copies')
+    $byPath=@{}; foreach ($file in $plan.files) { $byPath[$file.path]=$file }
+    Assert ($byPath['a.txt'].action -eq 'write' -and $byPath['a.txt'].before -eq (Get-Sha 'old') -and $byPath['a.txt'].after -eq (Get-Sha 'new') -and (Read-Text $byPath['a.txt'].beforeCopy) -eq 'old') "a changed file is copied first: $($byPath['a.txt'] | ConvertTo-Json -Compress)"
+    Assert ($byPath['same.txt'].action -eq 'same' -and -not $byPath['same.txt'].beforeCopy -and $byPath['b.txt'].before -eq 'absent' -and -not $byPath['b.txt'].beforeCopy) 'a same file and a new file are not copied'
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'old' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'making a plan writes no project file'
+    # 계획 뒤에 바뀐 파일은 쓰지 않고, 그 뒤 파일도 쓰지 않는다.
+    [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'edited')
+    $restored=Invoke-ProjectRestorePlan $planZip $plan.files (Join-Path $testDirectory 'plan-copies')
+    Assert ($restored.failed.Count -eq 1 -and $restored.failed[0].reason -like '*a.txt*' -and (@($restored.files | ForEach-Object state) -join '|') -eq 'failed|skipped|skipped') "a file changed after the plan stops the restore: $($restored | ConvertTo-Json -Compress)"
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'edited' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'the edited file is kept and nothing else is written'
+    # 다시 본 뒤 바꾸기 전 사이에 파일이 바뀌면, 치운 내용을 지우지 않고 남긴다.
+    [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'old')
+    $copyStream=${function:Copy-ProjectStream}
+    ${function:Copy-ProjectStream}={ param([IO.Stream]$From,[IO.Stream]$To,[long]$Limit) [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'racing'); & $copyStream $From $To $Limit }
+    try { $restored=Invoke-ProjectRestorePlan $planZip $plan.files (Join-Path $testDirectory 'plan-copies') } finally { ${function:Copy-ProjectStream}=$copyStream }
+    $kept=@(Get-ChildItem -LiteralPath $planDir -Force -Filter '.ctxhop-*.prev')
+    Assert ($restored.failed.Count -eq 1 -and $kept.Count -eq 1 -and (Read-Text $kept[0].FullName) -eq 'racing' -and $restored.failed[0].reason -like "*$($kept[0].Name)*") "content changed just before the swap is kept: $($restored | ConvertTo-Json -Compress)"
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'the restore stops after the displaced file'
     # 대상 안의 정션을 거쳐 쓰지 않는다.
     $null=New-Item -ItemType Junction -Path (Join-Path $victim 'link') -Target $outsideDir
     $viaLink=New-TestZip (Join-Path $testDirectory 'link.zip') @{'link\secret.txt'='overwritten'}

@@ -366,4 +366,6 @@ $script:StringTable=@{
     PfEntryUnsafe=@('프로젝트 백업에 쓸 수 없는 경로가 있습니다: {0}. 아무 파일도 쓰지 않았습니다.','The project backup contains a path that cannot be written: {0}. No files were written.')
     PfTargetUnsafe=@('복원할 수 없는 위치입니다(링크나 정션을 거치거나, 폴더 밖·드라이브 루트·사용자 폴더·에이전트 설정 폴더): {0}. 아무 파일도 쓰지 않았습니다.','This restore location cannot be used (it goes through a link or junction, or is outside the folder, a drive root, the user folder or an agent settings folder): {0}. No files were written.')
     PfHashMismatch=@('{0}의 백업 내용이 기록된 해시와 달라 쓰지 않았습니다.','The backup content of {0} does not match its recorded hash, so it was not written.')
+    PfChangedSincePlan=@('{0}이(가) 복원 계획을 세운 뒤 바뀌어 쓰지 않았습니다.','{0} changed after the restore plan was made, so it was not written.')
+    PfDisplacedKept=@('{0}이(가) 쓰기 직전에 바뀌었습니다. 치운 내용은 {1}에 남겼습니다.','{0} changed just before it was written. The content it replaced was kept in {1}.')
 }
