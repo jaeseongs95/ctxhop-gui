@@ -134,6 +134,7 @@ $script:ClaudeCodeOps=@{
     open={ param($R) @{message=[string](Invoke-ClaudeCore $R 'Open').message} }
     recover={ param($R)
         # 복구 기록 조회·되돌리기·닫기(S3 명세 3.4·4.2절).
+        if ([string]$R.mode -cnotin @('status','list','rollback','resolve')) { throw (T 'WkRecoverModeInvalid' ([string]$R.mode)) }
         switch -CaseSensitive ([string]$R.mode) {
             status { return @{state=(Get-ClaudeRecord ([string]$R.operationId)).state} }
             list { return @{records=@(Get-ClaudeRecordRows)} }

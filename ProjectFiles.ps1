@@ -363,7 +363,7 @@ function Invoke-ProjectRestorePlan([string]$ZipPath, [object[]]$Files, [string]$
                     $state='written'; $result.written++
                 } catch { $state='failed'; $result.failed.Add([pscustomobject]@{path=$file.path;reason=$_.Exception.Message}) }
             } elseif ($state -eq 'same') { $result.same++ }
-            $result.files.Add([pscustomobject]@{path=$file.path;state=$state})
+            $result.files.Add([pscustomobject]@{index=$file.index;path=$file.path;state=$state})
         }
     } finally { $zip.Dispose() }
     $result.failed=$result.failed.ToArray(); $result.files=$result.files.ToArray()

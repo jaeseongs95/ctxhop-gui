@@ -104,14 +104,18 @@ Save ($out | ConvertTo-Json -Depth 5)
     $real=Join-Path $root 'real'; $null=New-Item -ItemType Directory -Path $real
     foreach ($vendor in 'codex-desktop','claude-code') {
         $probe=Invoke-VendorOp $vendor 'probe' @{} $real
-        Assert ((@($probe.capabilities) -join ',') -ceq 'probe,backup,describe,guard,list,open,preview,restore') "$vendor declares the operations it handles (recover comes later in S3)"
-        $recover=Invoke-VendorOp $vendor 'recover' @{} $real
-        Assert ($recover.status -eq 'unsupported' -and $recover.reasonCode -eq 'op_unsupported' -and $recover.reason) "$vendor answers an operation it does not handle as unsupported"
+        Assert ((@($probe.capabilities) -join ',') -ceq 'probe,backup,describe,guard,list,open,preview,recover,restore') "$vendor declares the operations it handles"
+        # recover는 모드를 먼저 확인한다. 모르는 모드는 기록을 읽기 전에 failed다.
+        $recover=Invoke-VendorOp $vendor 'recover' @{mode='bogus'} $real
+        Assert ($recover.status -eq 'failed' -and $recover.reason -match 'bogus') "$vendor refuses an unknown recover mode before reading any record"
         $null=Throws { Invoke-VendorOp $vendor 'probe' @{protocolVersion='1'} $real } 'invalid|잘못된 요청'
         $null=Throws { Invoke-VendorOp $vendor 'probe' @{protocolVersion=2} $real } 'invalid|잘못된 요청'
         $null=Throws { Invoke-VendorOp $vendor 'probe' @{op='list'} $real } 'invalid|잘못된 요청'
         $null=Throws { Invoke-VendorOp $vendor 'probe' @{requestId='not-a-guid'} $real } 'invalid|잘못된 요청'
     }
+    # 구현이 처리하지 않는 op는 unsupported(op_unsupported)로 답한다.
+    $unhandled=Invoke-ImplOp @{} ([pscustomobject]@{op='list';requestId=[guid]::NewGuid().ToString()})
+    Assert ($unhandled.status -eq 'unsupported' -and $unhandled.reasonCode -eq 'op_unsupported' -and $unhandled.reason) 'an implementation answers an operation it does not handle as unsupported'
     Set-Language 'en'
     $open=Invoke-VendorOp 'codex-desktop' 'open' @{} $real
     Assert ($open.status -eq 'unsupported' -and $open.reasonCode -eq 'open_manually' -and $open.reason -match '^Open Codex Desktop yourself') 'Codex open is reported as manual, in the requested language'

@@ -377,7 +377,7 @@ function Get-ProjectPreview([string]$Agent,[string]$SessionId,[string]$Conversat
         $folders+=,$entry
     }
     $receipt=Join-Path $Stage 'project-receipt.json'
-    [IO.File]::WriteAllText($receipt,(ConvertTo-Json -InputObject ([ordered]@{agent=$Agent;sessionId=$SessionId;conversation=$Conversation;home=[string]$Pair.home;target=$Target;receipt=[string]$Pair.receipt;token=[string]$Pair.token;linkId=$links[0].id;folders=$folders}) -Depth 8),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($receipt,(ConvertTo-Json -InputObject ([ordered]@{agent=$Agent;sessionId=$SessionId;conversation=$Conversation;home=[string]$Pair.home;target=$Target;receipt=[string]$Pair.receipt;token=[string]$Pair.token;previewState=[string]$Pair.state;linkId=$links[0].id;folders=$folders}) -Depth 8),[Text.UTF8Encoding]::new($false))
     return @{state='found';receipt=$receipt;createdAt=[string]$link.createdAt;folders=$folders;skipped=@($link.skipped);outside=@($link.outside)}
 }
 function Get-ProjectPreviewSafe([string]$Agent,[string]$SessionId,[string]$Conversation,[string]$Target,[string]$Stage,[hashtable]$Pair) {
@@ -402,37 +402,7 @@ function Assert-ProjectPairing([object]$Job) {
     $record=Read-ProjectReceipt $Job.projectReceipt ([string]$Job.agent) ([string]$Job.nativeId) ([string]$Job.remoteId)
     $target=Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path
     if ($record.home -isnot [string] -or $record.home -cne [string]$Job.home -or $record.target -ne $target -or $record.receipt -cne [string]$Job.receipt -or $record.token -cne [string]$Job.token) { throw (T 'WkProjectReceiptInvalid') }
-}
-function Restore-ProjectFolders([object]$Job,[string]$Receipt,[string]$Agent,[string]$SessionId,[string]$Conversation,[string]$StartTarget) {
-    # 미리보기에서 받은 프로젝트 파일을 복원한다. 시작 폴더는 이번 복원 폴더에, 추가 폴더는 원래 경로나 GUI가 고른 폴더에 쓴다. 빈 값은 건너뜀.
-    if (-not $Job.projectRestore -or -not $Receipt) { return $null }
-    try {
-        $record=Read-ProjectReceipt $Receipt $Agent $SessionId $Conversation
-        $recovery=$null; $results=@()
-        foreach ($folder in $record.folders) {
-            if ($folder.state -notin @('ready','needsFolder')) { continue }
-            # 미리보기 뒤에 고르는 폴더는 이 PC에 원래 경로가 없던 추가 폴더(needsFolder)만 받는다. 절대 경로가 아니면 건너뛴다.
-            $override=if ($Job.projectTargets -and $folder.state -eq 'needsFolder') { $Job.projectTargets.PSObject.Properties[[string]$folder.index] } else { $null }
-            $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {[string](ConvertTo-ProjectPath ([string]$override.Value))} else {[string]$folder.target}
-            $entry=[ordered]@{index=$folder.index;role=$folder.role;sourcePath=$folder.sourcePath;target=$target;state='skipped';written=0;backedUp=0;same=0;failed=@();error=''}
-            if ($target) {
-                # 한 폴더가 실패해도(받은 파일이 바뀜, 쓸 수 없는 위치) 다른 폴더는 복원하고 기록을 남긴다. 실패한 폴더에는 쓰기 전에 멈춘다.
-                try {
-                    if ((Get-FileHash -LiteralPath $folder.zip -Algorithm SHA256).Hash -ne $folder.sha256) { throw (T 'WkArchiveChanged') }
-                    if (-not $recovery) { $recovery=New-DesktopStage 'project-recovery' }
-                    $restored=Restore-ProjectSnapshot $folder.zip $target (Join-Path $recovery ([string]$folder.index))
-                    $entry.state='restored'; $entry.written=$restored.written; $entry.backedUp=$restored.backedUp; $entry.same=$restored.same; $entry.failed=@($restored.failed)
-                } catch { $entry.state='failed'; $entry.error=$_.Exception.Message }
-            }
-            $results+=,$entry
-        }
-        if ($recovery) { [IO.File]::WriteAllText((Join-Path $recovery 'restore-log.json'),(ConvertTo-Json -InputObject ([ordered]@{agent=$Agent;sessionId=$SessionId;conversation=$Conversation;restoredAt=(Get-ProjectStamp);folders=$results}) -Depth 6),[Text.UTF8Encoding]::new($false)) }
-        $restoredCount=0; $written=0; $backedUp=0; $failed=0
-        foreach ($entry in $results) { if ($entry.state -eq 'restored') { $restoredCount++ }; $written+=$entry.written; $backedUp+=$entry.backedUp; $failed+=@($entry.failed).Count }
-        $message=T 'WkProjectRestored' $restoredCount $written $backedUp $failed $(if ($recovery) {$recovery} else {'-'})
-        foreach ($entry in @($results | Where-Object { $_.state -eq 'failed' })) { $message+=T 'WkProjectFolderRestoreFailed' $entry.sourcePath $entry.error }
-        return @{message=$message;folders=$results;recovery=$recovery}
-    } catch { return @{message=(T 'WkProjectRestoreFailed' $_.Exception.Message);folders=@();recovery=$null} }
+    return $record
 }
 function Invoke-Vendor([object]$Job,[string]$Op,[hashtable]$Request) {
     # 작업의 벤더 구현을 계약으로 부른다. ok가 아니면 그 이유로 실패시킨다.
@@ -450,6 +420,355 @@ function Invoke-Vendor([object]$Job,[string]$Op,[hashtable]$Request) {
     elseif ($response.status -ceq 'busy') { $exception.Data['backendResult']=[pscustomobject]@{status='busy';reason=[string]$response.reason} }
     throw $exception
 }
+function Get-JournalDir { return (Join-Path $env:LOCALAPPDATA 'CtxHopGUI\journal') }
+function Get-RecoveryRoot { return (Join-Path $env:LOCALAPPDATA 'CtxHopGUI\project-recovery') }
+function New-PrivateFolder([string]$Path) {
+    # 원본 사본이 들어가는 폴더는 이 사용자만 읽는다(New-DesktopStage와 같은 경계). 이미 있으면 쓰지 않고 멈춘다.
+    $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+    if ([IO.Directory]::Exists($Path)) { throw (T 'WkJournalExists' $Path) }
+    $null=New-Item -ItemType Directory -Path $Path
+    $acl=[Security.AccessControl.DirectorySecurity]::new(); $acl.SetAccessRuleProtection($true,$false)
+    $rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+    $acl.AddAccessRule($rule); Set-Acl -LiteralPath $Path -AclObject $acl
+    return $Path
+}
+function Save-Marker([Collections.IDictionary]$Marker) {
+    # 공통 표지(S3 명세 2.4절). 임시 파일에 쓰고 비운 뒤 Move/Replace로 바꾼다.
+    $Marker.updated=Get-ProjectStamp
+    $null=[IO.Directory]::CreateDirectory((Get-JournalDir))
+    Save-ProjectJson (Join-Path (Get-JournalDir) "$($Marker.operationId).json") $Marker
+}
+function New-Marker([object]$Job,[string]$Operation,[string[]]$Targets,[string]$Recovery,[string]$Phase,[string]$RecordRef,[string]$RecordKind) {
+    # 표지 없는 기록을 되돌리거나 닫을 때는 recordRef에 원래 기록(벤더 recordId 또는 프로젝트 기록 폴더)을 적는다(S3 명세 2.2절, R37-N1).
+    $marker=[ordered]@{version=1;operationId=$Operation;agent=[string]$Job.agent;nativeId=[string]$Job.nativeId;remoteId=[string]$Job.remoteId;home=[string]$Job.home;targets=@($Targets);projectRecovery=$Recovery;recordRef=$RecordRef;recordKind=$RecordKind;phase=$Phase;phaseBefore=$null;started=(Get-ProjectStamp);updated='';error=''}
+    foreach ($field in (Get-WorkerFields).GetEnumerator()) { $marker[$field.Key]=$field.Value }
+    Save-Marker $marker
+    return $marker
+}
+function Read-Markers {
+    # 표지 파일마다 {path, name, marker}. 읽지 못하거나 이름과 맞지 않으면 marker는 $null이다.
+    $dir=Get-JournalDir
+    if (-not [IO.Directory]::Exists($dir)) { return }
+    foreach ($file in [IO.Directory]::GetFiles($dir,'*.json')) {
+        $name=[IO.Path]::GetFileNameWithoutExtension($file)
+        $marker=try {
+            $record=Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($record.version -eq 1 -and [string]$record.operationId -ceq $name -and $name -cmatch '^[0-9a-f]{32}$') { $table=[ordered]@{}; foreach ($p in $record.PSObject.Properties) { $table[$p.Name]=$p.Value }; $table } else { $null }
+        } catch { $null }
+        [pscustomobject]@{path=$file;name=$name;marker=$marker}
+    }
+}
+function Get-MarkerJob([Collections.IDictionary]$Marker) { return [pscustomobject]@{agent=[string]$Marker.agent;home=[string]$Marker.home} }
+function Get-MarkerRef([Collections.IDictionary]$Marker) { if ($Marker.recordRef) { return [string]$Marker.recordRef }; return [string]$Marker.operationId }
+function Enter-Marker([Collections.IDictionary]$Marker) {
+    # 앞 writer가 모두 끝났음을 확인한 뒤에만 이 Worker로 넘겨받는다(S3 명세 2.2절). 쓰기·자식 생성보다 먼저 한다.
+    if ((Test-WorkerWritersGone $Marker) -ne 'gone') { throw (T 'WkJournalBusy') }
+    foreach ($field in (Get-WorkerFields).GetEnumerator()) { $Marker[$field.Key]=$field.Value }
+    Save-Marker $Marker
+}
+function Get-VendorState([Collections.IDictionary]$Marker) {
+    # 벤더 기록 상태(S3 명세 2.3절). 최소 표지는 새 operationId가 아니라 원래 기록(recordRef)을 조회한다(R37-N1).
+    # 조회 자체가 실패하면 failed(unreadable처럼 다루지만 닫지는 않는다). 프로젝트 기록 표지는 벤더가 없다(none).
+    if ($Marker.recordKind -eq 'project') { return 'none' }
+    try { $state=[string](Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $Marker)}).state } catch { return 'failed' }
+    if ($state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable')) { return 'failed' }
+    return $state
+}
+function Read-ProjectPlan([string]$Recovery) {
+    # restore-plan.json. 없으면 $null(프로젝트에 아직 쓰지 않음). 읽지 못하면 예외.
+    if (-not $Recovery) { return $null }
+    $file=Join-Path $Recovery 'restore-plan.json'
+    if (-not [IO.File]::Exists($file)) { return $null }
+    $plan=Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($plan.version -ne 1) { throw (T 'WkProjectPlanInvalid' $file) }
+    return $plan
+}
+function Test-ProjectSuccess([Collections.IDictionary]$Marker) {
+    # 프로젝트 성공 증거(S3 명세 2.5절): 계획의 write는 모두 written, same은 모두 same으로 restore-log.json에 있다. 폴더가 없던 작업은 성공이다.
+    try {
+        $plan=Read-ProjectPlan ([string]$Marker.projectRecovery)
+        if (-not $plan) { return (-not @($Marker.targets | Where-Object { $_ }).Count) }
+        $log=Get-Content -LiteralPath (Join-Path $Marker.projectRecovery 'restore-log.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([string]$log.operationId -cne [string]$Marker.operationId) { return $false }
+        $states=@{}; foreach ($file in @($log.files)) { $states[[int]$file.index]=[string]$file.state }
+        foreach ($file in @($plan.files)) { if ($states[[int]$file.index] -cne $(if ($file.action -eq 'same') {'same'} else {'written'})) { return $false } }
+        return $true
+    } catch { return $false }
+}
+function Undo-MarkerProject([Collections.IDictionary]$Marker,[object[]]$Confirmed) {
+    # 계획이 없으면 쓴 파일이 없으므로 끝난 것이다. 파일 이름은 원래 작업 ID(기록 폴더 이름)로 정한다.
+    $plan=Read-ProjectPlan ([string]$Marker.projectRecovery)
+    if (-not $plan) { return [pscustomobject]@{complete=$true;files=@()} }
+    return (Undo-ProjectRestorePlan @($plan.files) ([string]$Marker.projectRecovery) ([IO.Path]::GetFileName([string]$Marker.projectRecovery)) $Confirmed)
+}
+function Set-MarkerAttention([Collections.IDictionary]$Marker,[string]$Reason) {
+    $Marker.error=$Reason; Save-Marker $Marker
+    return 'attention'
+}
+function Test-DoneRecord([Collections.IDictionary]$Marker) {
+    # 종료 기록이 이 표지의 것이고 결과와 상태가 맞는지(S3 명세 2.5절). 맞을 때만 표지를 지운다.
+    $file=Join-Path (Get-JournalDir) "done\$($Marker.operationId).json"
+    if (-not [IO.File]::Exists($file)) { return $false }
+    try { $done=Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }
+    if ($done.version -ne 1 -or [string]$done.operationId -cne [string]$Marker.operationId -or [string]$done.agent -cne [string]$Marker.agent -or [string]$done.home -cne [string]$Marker.home) { return $false }
+    switch -CaseSensitive ([string]$done.outcome) {
+        completed { return ([string]$done.vendorState -cin @('complete','equal') -and $done.project.success -eq $true) }
+        rolled_back { return ([string]$done.vendorState -cin @('absent','rolled_back','none') -and $done.project.complete -eq $true) }
+        resolved { return ([string]$done.vendorState -cin @('resolved','absent','complete','rolled_back','none')) }
+    }
+    return $false
+}
+function Close-Marker([Collections.IDictionary]$Marker,[string]$Outcome,[string]$VendorState,[hashtable]$Project) {
+    # 자손이 모두 끝난 뒤, 종료 기록을 먼저 쓰고 확인한 다음 표지를 지운다(S3 명세 2.2·2.4절).
+    if ((Wait-WorkerJobAlone) -ne 'alone') { $null=Set-MarkerAttention $Marker (T 'WkWorkerHelpersLeft'); throw (T 'WkWorkerHelpersLeft') }
+    $dir=Join-Path (Get-JournalDir) 'done'; $null=[IO.Directory]::CreateDirectory($dir)
+    Save-ProjectJson (Join-Path $dir "$($Marker.operationId).json") ([ordered]@{version=1;operationId=$Marker.operationId;agent=$Marker.agent;home=$Marker.home;recordRef=$Marker.recordRef;outcome=$Outcome;vendorState=$VendorState;project=$Project;at=(Get-ProjectStamp)})
+    if (-not (Test-DoneRecord $Marker)) { return (Set-MarkerAttention $Marker (T 'WkJournalDoneMismatch')) }
+    [IO.File]::Delete((Join-Path (Get-JournalDir) "$($Marker.operationId).json"))
+    return $Outcome
+}
+function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]]$Confirmed,[string]$VendorState,[bool]$OkEqual) {
+    # 상태 결정표(S3 명세 2.5절). 앞 writer 확인(Enter-Marker)을 통과한 뒤에만 부른다.
+    # $Mode: restore(복원 작업 안의 자동 처리) | journal(목록의 자동 정리) | rollback(사용자가 누름).
+    # 돌려주는 값: completed | rolled_back | resolved | attention | waiting(사용자 결정을 기다림)
+    $phase=if ($Marker.phase -eq 'rollback') {[string]$Marker.phaseBefore} else {[string]$Marker.phase}
+    if ($VendorState -eq 'complete' -or $OkEqual) {
+        # 대화가 끝났으면 프로젝트는 되돌리지 않는다. 증거가 모자라면 확인이 필요하다.
+        if ($phase -eq 'conversation' -and (Test-ProjectSuccess $Marker)) { return (Close-Marker $Marker 'completed' $(if ($OkEqual) {'equal'} else {'complete'}) @{success=$true}) }
+        return (Set-MarkerAttention $Marker (T 'WkJournalCompleteMismatch'))
+    }
+    if ($VendorState -in @('unreadable','failed')) { return (Set-MarkerAttention $Marker (T 'WkJournalVendorUnreadable' $VendorState)) }
+    $auto=$VendorState -in @('absent','rolled_back','none') -and $Mode -in @('restore','rollback')
+    $user=$VendorState -in @('pending','resolved') -and $Mode -eq 'rollback'
+    if (-not ($auto -or $user)) { return 'waiting' }
+    if ($Marker.phase -ne 'rollback') { $Marker.phaseBefore=$Marker.phase; $Marker.phase='rollback'; Save-Marker $Marker }
+    try { $project=Undo-MarkerProject $Marker $Confirmed } catch { return (Set-MarkerAttention $Marker $_.Exception.Message) }
+    if (-not $project.complete) { return (Set-MarkerAttention $Marker (T 'WkRollbackIncomplete')) }
+    if ($VendorState -eq 'pending') {
+        # 프로젝트를 먼저 되돌린 뒤 대화를 되돌린다. 벤더가 멈추면 기록은 pending으로 남고 확인이 필요하다.
+        try { $null=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='rollback';recordId=(Get-MarkerRef $Marker);confirmedUnknown=@($Confirmed)} }
+        catch { return (Set-MarkerAttention $Marker $_.Exception.Message) }
+        $VendorState='rolled_back'
+    }
+    $outcome=if ($VendorState -eq 'resolved') {'resolved'} else {'rolled_back'}
+    return (Close-Marker $Marker $outcome $VendorState @{complete=$true})
+}
+function Get-ProjectRecordSha([string]$Folder) {
+    # 프로젝트 기록을 닫을 때 사용자가 본 내용: 새 판은 restore-plan.json, 예전 판은 restore-log.json의 SHA-256.
+    foreach ($name in 'restore-plan.json','restore-log.json') { $file=Join-Path $Folder $name; if ([IO.File]::Exists($file)) { return (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash } }
+    return ''
+}
+function Test-ProjectRecordResolved([string]$Folder) {
+    # resolved.json이 있고, 적힌 SHA-256이 지금 기록과 같을 때만 해결됨이다.
+    $file=Join-Path $Folder 'resolved.json'
+    if (-not [IO.File]::Exists($file)) { return $false }
+    try { return ([string](Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json).sha256 -ceq (Get-ProjectRecordSha $Folder)) } catch { return $false }
+}
+function Get-ProjectRecordRows([hashtable]$Referenced) {
+    # 표지 없는 프로젝트 기록(S3 명세 4.3절). 새 판은 종료 기록이 없는 restore-plan.json, 예전 판은 restore-log.json만 있는 폴더다.
+    $root=Get-RecoveryRoot
+    if (-not [IO.Directory]::Exists($root)) { return }
+    foreach ($folder in [IO.Directory]::GetDirectories($root)) {
+        $name=[IO.Path]::GetFileName($folder)
+        if ($Referenced.ContainsKey($name) -or $Referenced.ContainsKey($folder.ToLowerInvariant()) -or (Test-ProjectRecordResolved $folder)) { continue }
+        $row=[ordered]@{kind='project';operationId=$null;recordRef=$folder;agent='';nativeId='';state='';error='';canRollback=$false;sha256=(Get-ProjectRecordSha $folder);files=@();path=$folder}
+        if ([IO.File]::Exists((Join-Path $folder 'restore-plan.json'))) {
+            if ($name -cmatch '^[0-9a-f]{32}$' -and [IO.File]::Exists((Join-Path (Get-JournalDir) "done\$name.json"))) { continue }
+            try { $row.files=@(Get-ProjectUndoView @((Read-ProjectPlan $folder).files)); $row.state='pending'; $row.canRollback=$true } catch { $row.state='unreadable' }
+        } elseif ([IO.File]::Exists((Join-Path $folder 'restore-log.json'))) {
+            # 예전 판(대화 먼저, 프로젝트 나중): 모든 폴더가 실패 없이 끝났으면 성공이라 넣지 않는다. 실패·읽을 수 없음은 닫기만 된다.
+            try {
+                $log=Get-Content -LiteralPath (Join-Path $folder 'restore-log.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($log.folders -isnot [array] -and $null -ne $log.folders) { throw 'format' }
+                if (-not @($log.folders | Where-Object { $_.state -notin @('restored','skipped') -or @($_.failed | Where-Object { $_ }).Count }).Count) { continue }
+                $row.state='failed'; $row.agent=[string]$log.agent; $row.nativeId=[string]$log.sessionId
+            } catch { $row.state='unreadable' }
+        } else { continue }
+        [pscustomobject]$row
+    }
+}
+function Get-JournalRows([object]$Job,[switch]$Auto) {
+    # 공통 표지, 두 벤더의 recover list, 표지 없는 프로젝트 기록을 합친다(S3 명세 4.3절). $Auto면 결정표의 자동 정리만 한다.
+    $rows=[Collections.Generic.List[object]]::new(); $failed=[Collections.Generic.List[string]]::new(); $byRef=@{}; $referenced=@{}
+    foreach ($entry in @(Read-Markers)) {
+        if (-not $entry.marker) { $rows.Add([pscustomobject]@{kind='marker';operationId=$entry.name;recordRef=$null;agent='';nativeId='';state='unreadable';error=(T 'WkJournalMarkerUnreadable');canRollback=$false;sha256='';files=@();path=$entry.path}); continue }
+        $marker=$entry.marker
+        if ($marker.projectRecovery) { $referenced[[IO.Path]::GetFileName([string]$marker.projectRecovery)]=$true; $referenced[([string]$marker.projectRecovery).ToLowerInvariant()]=$true }
+        if ($marker.recordRef) { $referenced[([string]$marker.recordRef).ToLowerInvariant()]=$true }
+        $writers=Test-WorkerWritersGone $marker
+        if ($Auto -and $writers -eq 'gone' -and (Test-DoneRecord $marker)) { [IO.File]::Delete($entry.path); continue }
+        $state=if ($writers -ne 'gone') {'busy'} else {Get-VendorState $marker}
+        if ($Auto -and $state -eq 'complete') {
+            try { Enter-Marker $marker; if ((Resolve-Marker $marker 'journal' @() $state $false) -eq 'completed') { continue } } catch { }
+        }
+        $files=@(); $canRollback=$state -in @('absent','rolled_back','pending','resolved','none')
+        try { $plan=Read-ProjectPlan ([string]$marker.projectRecovery); if ($plan) { $files=@(Get-ProjectUndoView @($plan.files)) } } catch { $canRollback=$false }
+        $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
+        $rows.Add($row); $byRef["$($marker.agent)/$(Get-MarkerRef $marker)"]=$row
+    }
+    $map=Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($agent in @($map.PSObject.Properties.Name)) {
+        try { $records=@((Invoke-Vendor ([pscustomobject]@{agent=$agent;home=[string]$Job.home}) 'recover' @{mode='list'}).records) }
+        catch { $failed.Add($agent); continue }
+        foreach ($record in $records) {
+            $row=$byRef["$agent/$($record.recordId)"]
+            # 표지가 있는 기록은 표지 행에 벤더 파일 목록과 해시를 붙인다. 없는 기록은 따로 보인다.
+            if ($row) { $row.sha256=[string]$record.sha256; $row.files=@($row.files)+@($record.files | Where-Object { $_ }); continue }
+            $rows.Add([pscustomobject]@{kind='vendor';operationId=$record.operationId;recordRef=[string]$record.recordId;agent=$agent;nativeId=[string]$record.nativeId;state=[string]$record.state;error='';canRollback=[bool]$record.canRollback;sha256=[string]$record.sha256;files=@($record.files | Where-Object { $_ });path=[string]$record.path})
+        }
+    }
+    foreach ($row in @(Get-ProjectRecordRows $referenced)) { $rows.Add($row) }
+    return [pscustomobject]@{rows=$rows.ToArray();failed=$failed.ToArray()}
+}
+function Assert-JournalClear([object]$Job) {
+    # 미해결 항목이 있거나 조회가 실패하면 복원·백업·열기를 모두 막는다(S3 명세 4.3절). 목록·미리보기와 되돌리기·닫기는 막지 않는다.
+    # ponytail: 무관한 대화까지 막는 전체 차단. 겹침을 증명하는 검사는 필요해지면 더한다.
+    $journal=Get-JournalRows $Job -Auto
+    if ($journal.rows.Count -or $journal.failed.Count) { throw (T 'WkJournalOpen' ($journal.rows.Count+$journal.failed.Count)) }
+}
+function Get-TargetMarker([object]$Job) {
+    # Rollback·CloseJournal의 대상: 공통 표지(operationId), 표지 없는 벤더 기록(agent+recordId), 표지 없는 프로젝트 기록(projectRecord).
+    # 표지가 없으면 시작하기 전에 원래 기록을 가리키는 최소 표지를 만든다(S3 명세 2.2절).
+    if ($Job.operationId) {
+        $null=Assert-OperationId $Job.operationId
+        $entry=@(Read-Markers | Where-Object { $_.name -ceq [string]$Job.operationId })
+        if (-not $entry.Count -or -not $entry[0].marker) { throw (T 'WkJournalMissing' $Job.operationId) }
+        return $entry[0].marker
+    }
+    if ($Job.projectRecord) {
+        $folder=[IO.Path]::GetFullPath([string]$Job.projectRecord)
+        if ([IO.Path]::GetDirectoryName($folder) -ine [IO.Path]::GetFullPath((Get-RecoveryRoot)) -or -not [IO.Directory]::Exists($folder) -or ([IO.File]::GetAttributes($folder) -band [IO.FileAttributes]::ReparsePoint)) { throw (T 'WkJournalMissing' $Job.projectRecord) }
+        $existing=@(Read-Markers | Where-Object { $_.marker -and ([string]$_.marker.recordRef) -ieq $folder })
+        if ($existing.Count) { return $existing[0].marker }
+        return (New-Marker ([pscustomobject]@{agent='';home=''}) ([guid]::NewGuid().ToString('N')) @() $folder 'rollback' $folder 'project')
+    }
+    $null=Assert-OperationId $Job.recordId
+    $existing=@(Read-Markers | Where-Object { $_.marker -and [string]$_.marker.agent -ceq [string]$Job.agent -and ((Get-MarkerRef $_.marker) -ceq [string]$Job.recordId) })
+    if ($existing.Count) { return $existing[0].marker }
+    return (New-Marker ([pscustomobject]@{agent=[string]$Job.agent;home=[string]$Job.home;nativeId=[string]$Job.nativeId}) ([guid]::NewGuid().ToString('N')) @() $null 'rollback' ([string]$Job.recordId) 'vendor')
+}
+function Invoke-JournalRollback([object]$Job) {
+    # 사용자가 되돌리기를 누름(S3 명세 4.3절). 결정표의 되돌리기 행만 한다.
+    $marker=Get-TargetMarker $Job
+    Enter-Marker $marker
+    $outcome=Resolve-Marker $marker 'rollback' @($Job.confirmedUnknown | Where-Object { $_ }) (Get-VendorState $marker) $false
+    if ($outcome -ceq 'waiting') { $outcome=Set-MarkerAttention $marker (T 'WkJournalVendorUnreadable' 'complete') }
+    $message=switch ($outcome) { rolled_back {T 'WkJournalRolledBack'} resolved {T 'WkJournalRolledBackProject'} completed {T 'WkJournalCompleted'} default {T 'WkJournalAttention' $marker.error} }
+    return @{outcome=$outcome;operationId=$marker.operationId;message=$message}
+}
+function Invoke-JournalClose([object]$Job) {
+    # 사용자가 "해결했음"으로 닫음(S3 명세 3.5·4.3절). 벤더 기록이 남았으면 벤더 resolve를 먼저 부른다. 조회가 실패하면 닫지 않는다.
+    $marker=Get-TargetMarker $Job
+    Enter-Marker $marker
+    $state=Get-VendorState $marker
+    if ($state -eq 'failed') { throw (T 'WkJournalVendorUnreadable' $state) }
+    if ($marker.recordKind -eq 'project') {
+        $folder=[string]$marker.recordRef; $sha=Get-ProjectRecordSha $folder
+        if (-not $sha -or $sha -cne [string]$Job.sha256) { throw (T 'WkRecordChanged') }
+        if (-not (Test-ProjectRecordResolved $folder)) { Save-ProjectJson (Join-Path $folder 'resolved.json') ([ordered]@{version=1;operationId=$marker.operationId;sha256=$sha;at=(Get-ProjectStamp)}) }
+    } elseif ($state -in @('pending','unreadable')) {
+        $null=Invoke-Vendor (Get-MarkerJob $marker) 'recover' @{mode='resolve';recordId=(Get-MarkerRef $marker);sha256=[string]$Job.sha256}
+        $state='resolved'
+    }
+    # 종료 기록에는 아직 원래대로가 아닌 프로젝트 파일 목록을 남긴다.
+    $remaining=@(); try { $plan=Read-ProjectPlan ([string]$marker.projectRecovery); if ($plan) { $remaining=@(Get-ProjectUndoView @($plan.files) | Where-Object { $_.class -ne 'original' } | ForEach-Object target) } } catch { $remaining=@('?') }
+    $outcome=Close-Marker $marker 'resolved' $state @{remaining=$remaining}
+    return @{outcome=$outcome;operationId=$marker.operationId;message=$(if ($outcome -ceq 'resolved') {T 'WkJournalClosed'} else {T 'WkJournalAttention' $marker.error})}
+}
+function Assert-ProjectTargetsSeparate([string[]]$Targets,[string]$DesktopHome) {
+    # 한 복원 안의 폴더끼리, 그리고 대상 홈·에이전트 설정·CtxHopGUI 폴더와 겹치면 쓰기 전에 거부한다(S3 명세 4.1절 b).
+    $reserved=@(@((Get-ProjectIgnoredRoots).settings)+@(ConvertTo-ProjectPath (Join-Path $env:LOCALAPPDATA 'CtxHopGUI')))
+    if ($DesktopHome) { $reserved+=ConvertTo-ProjectPath $DesktopHome }
+    $list=@($Targets | ForEach-Object { ConvertTo-ProjectPath $_ })
+    for ($i=0; $i -lt $list.Count; $i++) {
+        if (-not $list[$i]) { throw (T 'PfTargetUnsafe' $Targets[$i]) }
+        for ($j=$i+1; $j -lt $list.Count; $j++) { if ((Test-ProjectInside $list[$i] $list[$j]) -or (Test-ProjectInside $list[$j] $list[$i])) { throw (T 'WkProjectTargetsOverlap' $list[$i] $list[$j]) } }
+        foreach ($root in @($reserved | Where-Object { $_ })) { if ((Test-ProjectInside $list[$i] $root) -or (Test-ProjectInside $root $list[$i])) { throw (T 'WkProjectTargetsOverlap' $list[$i] $root) } }
+    }
+}
+function Get-ProjectRestoreFolders([object]$Job,[object]$Record,[string]$StartTarget) {
+    # 미리보기에서 받은 폴더 중 이번에 쓸 폴더. 시작 폴더는 이번 복원 폴더에, 추가 폴더는 원래 경로나 GUI가 고른 폴더에 쓴다. 빈 값은 건너뛴다.
+    foreach ($folder in @($Record.folders)) {
+        if ($folder.state -notin @('ready','needsFolder')) { continue }
+        # 미리보기 뒤에 고르는 폴더는 이 PC에 원래 경로가 없던 추가 폴더(needsFolder)만 받는다. 절대 경로가 아니면 건너뛴다.
+        $override=if ($Job.projectTargets -and $folder.state -eq 'needsFolder') { $Job.projectTargets.PSObject.Properties[[string]$folder.index] } else { $null }
+        $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {[string](ConvertTo-ProjectPath ([string]$override.Value))} else {[string]$folder.target}
+        if ($target) { [pscustomobject]@{index=[int]$folder.index;role=[string]$folder.role;sourcePath=[string]$folder.sourcePath;target=$target;zip=[string]$folder.zip;sha256=[string]$folder.sha256} }
+    }
+}
+function Invoke-ProjectFolders([Collections.IDictionary]$Marker,[object[]]$Folders) {
+    # 모든 폴더의 계획을 세우고 저장한 뒤에 쓴다(S3 명세 3.1·3.2절). 파일 하나라도 실패하면 남은 파일은 쓰지 않는다.
+    $recovery=[string]$Marker.projectRecovery; $files=[Collections.Generic.List[object]]::new(); $plans=@()
+    foreach ($folder in $Folders) {
+        if ((Get-FileHash -LiteralPath $folder.zip -Algorithm SHA256).Hash -ne $folder.sha256) { throw (T 'WkArchiveChanged') }
+        $plan=New-ProjectRestorePlan $folder.zip $folder.target (Join-Path $recovery ([string]$folder.index)) $files.Count
+        foreach ($file in $plan.files) { $file | Add-Member -NotePropertyName folder -NotePropertyValue $folder.index; $files.Add($file) }
+        $plans+=,[pscustomobject]@{folder=$folder;files=@($plan.files)}
+    }
+    Save-ProjectJson (Join-Path $recovery 'restore-plan.json') ([ordered]@{version=1;operationId=$Marker.operationId;folders=@($Folders | Select-Object index,role,sourcePath,target);files=$files.ToArray()})
+    $states=[Collections.Generic.List[object]]::new(); $summary=@(); $failure=$null
+    foreach ($item in $plans) {
+        $entry=[ordered]@{index=$item.folder.index;role=$item.folder.role;sourcePath=$item.folder.sourcePath;target=$item.folder.target;state='skipped';written=0;backedUp=0;same=0;failed=@();error=''}
+        if (-not $failure) {
+            $done=Invoke-ProjectRestorePlan $item.folder.zip $item.files $recovery
+            foreach ($file in $done.files) { $states.Add([ordered]@{index=$file.index;state=$file.state}) }
+            $entry.state=if ($done.failed.Count) {'failed'} else {'restored'}; $entry.written=$done.written; $entry.backedUp=$done.backedUp; $entry.same=$done.same; $entry.failed=@($done.failed)
+            if ($done.failed.Count) { $failure=$done.failed[0] }
+        } else { foreach ($file in $item.files) { $states.Add([ordered]@{index=$file.index;state='skipped'}) } }
+        $summary+=,$entry
+    }
+    Save-ProjectJson (Join-Path $recovery 'restore-log.json') ([ordered]@{version=1;operationId=$Marker.operationId;agent=$Marker.agent;sessionId=$Marker.nativeId;conversation=$Marker.remoteId;restoredAt=(Get-ProjectStamp);files=$states.ToArray();folders=$summary})
+    $written=0; $backedUp=0; foreach ($entry in $summary) { $written+=$entry.written; $backedUp+=$entry.backedUp }
+    return @{folders=$summary;recovery=$recovery;failure=$failure;message=(T 'WkProjectRestored' @($summary | Where-Object { $_.state -eq 'restored' }).Count $written $backedUp @($summary | ForEach-Object { @($_.failed) } | Where-Object { $_ }).Count $recovery)}
+}
+function Invoke-RestoreOperation([object]$Job,[hashtable]$Ids,[string]$Choice) {
+    # 복원(S3 명세 4.1절): 차단 검사 → 짝·대상 확정 → 엔진 사전 검사 → 표지 → 프로젝트 파일 → 대화 → 결정표.
+    if ($Choice -cne 'incoming') { throw (T 'WkChoiceRequired') }
+    Assert-JournalClear $Job
+    $record=if ($Job.projectReceipt) { Assert-ProjectPairing $Job } else { $null }
+    $operationId=[guid]::NewGuid().ToString('N')
+    $folders=@(if ($record -and $Job.projectRestore) { Get-ProjectRestoreFolders $Job $record (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) })
+    # 미리보기가 이 PC 대화가 더 새롭다고 했으면 대화가 쓰지 않을 복원이므로 프로젝트 파일도 쓰지 않는다(S3 명세 1절).
+    if ($record -and [string]$record.previewState -ceq 'local_newer') { $folders=@() }
+    Assert-ProjectTargetsSeparate @($folders | ForEach-Object target) $(if ($Job.agent -eq 'codex-desktop') {[string]$Job.home} else {''})
+    # 엔진 사전 검사(S3 명세 4.1절 b2)는 프로젝트에 처음 쓰기 전에 한다. 대화만 쓰는 복원은 벤더 restore가 쓰기 직전에 검사한다.
+    if ($folders.Count) { $null=Invoke-Vendor $Job 'guard' @{} }
+    $recovery=if ($folders.Count) { New-PrivateFolder (Join-Path (Get-RecoveryRoot) $operationId) } else { $null }
+    $marker=New-Marker $Job $operationId @($folders | ForEach-Object target) $recovery 'project' $null ''
+    $project=$null; $failure=''
+    if ($folders.Count) {
+        try { $project=Invoke-ProjectFolders $marker $folders; if ($project.failure) { $failure="$($project.failure.path): $($project.failure.reason)" } } catch { $failure=$_.Exception.Message }
+    }
+    $restored=$null; $vendorError=$null
+    if (-not $failure) {
+        $marker.phase='conversation'; Save-Marker $marker
+        try { $restored=Invoke-Vendor $Job 'restore' ($Ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$Choice;operationId=$operationId}) } catch { $vendorError=$_ }
+    }
+    # 벤더를 부르지 않았으면 대화에는 쓰지 않았다. 불렀으면 결과와 상관없이 벤더 기록을 다시 본다.
+    $okEqual=$restored -and $restored.effect -ceq 'equal'
+    $state=if ($failure) {'absent'} elseif ($okEqual) {'complete'} else {Get-VendorState $marker}
+    $outcome=try { Resolve-Marker $marker 'restore' @() $state $okEqual } catch { Set-MarkerAttention $marker $_.Exception.Message }
+    if ($Job.projectReceipt) { $cleanup=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Job.projectReceipt))) } else { $cleanup='' }
+    # 대화를 부르지 않았으면 벤더 미리보기의 평문 사본도 쓸 일이 없으므로 지운다. 불렀다가 실패하면 벤더가 증거로 남긴다.
+    if ($failure -and [string]$Job.receipt) { $cleanup+=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath([string]$Job.receipt))) }
+    if ($outcome -ceq 'completed') {
+        $result=@{message=[string]$restored.message+$cleanup;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$project;operationId=$operationId}
+        if ($project) { $result.message+=$project.message }
+        return $result
+    }
+    if ($outcome -ceq 'rolled_back' -and $restored -and -not $vendorError) {
+        # 이 PC 대화가 더 새로워 대화를 쓰지 않은 복원: 쓴 프로젝트 파일은 되돌렸다.
+        $message=[string]$restored.message+$cleanup; if ($project) { $message+=T 'WkRestoreFilesRolledBack' }
+        return @{message=$message;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$null;operationId=$operationId}
+    }
+    $reason=if ($failure) { if ($outcome -ceq 'rolled_back') {T 'WkRestoreProjectRolledBack' $failure} else {T 'WkRestoreProjectFailed' $failure} }
+        elseif ($outcome -ceq 'rolled_back') { T 'WkRestoreConversationRolledBack' $vendorError.Exception.Message }
+        else { T 'WkRestoreNeedsAttention' $(if ($vendorError) {$vendorError.Exception.Message} else {[string]$marker.error}) }
+    $exception=[InvalidOperationException]::new($reason+$cleanup)
+    if ($vendorError) { foreach ($key in $vendorError.Exception.Data.Keys) { $exception.Data[$key]=$vendorError.Exception.Data[$key] } }
+    $exception.Data['journal']=[pscustomobject]@{operationId=$operationId;outcome=$outcome}
+    throw $exception
+}
 function Invoke-ConversationJob([object]$Job) {
     # 대화 목록·백업·미리보기·복원·열기는 벤더 구현이 하고, 프로젝트 파일은 Worker가 벤더와 상관없이 덧붙인다.
     $ids=@{nativeId=[string]$Job.nativeId;remoteId=[string]$Job.remoteId}
@@ -461,6 +780,7 @@ function Invoke-ConversationJob([object]$Job) {
             return @{sessions=$rows;excluded=[int]$listed.excluded;message=[string]$listed.message}
         }
         Backup {
+            Assert-JournalClear $Job
             # 프로젝트 파일을 함께 올리면 먼저 작업 폴더를 받아 큰 폴더를 묻는다. 그사이 작업 폴더가 바뀌면 backup이 changed로 멈춘다.
             $plan=$null; $planError=''; $stamp=''
             if ($Job.projectBackup) {
@@ -492,7 +812,8 @@ function Invoke-ConversationJob([object]$Job) {
             # 복원을 고를 수 있는 대화만 프로젝트 파일을 받아 비교한다. 프로젝트 파일을 읽지 못해도 대화 미리보기는 그대로 보인다.
             if ($Job.projectRestore -and @($preview.choices) -ccontains 'incoming') {
                 $stage=New-DesktopStage
-                $pair=@{home=[string]$Job.home;receipt=[string]$preview.receipt;token=[string]$preview.token}
+                # 미리보기 state를 함께 적는다. 복원할 때 local_newer면 프로젝트 파일을 쓰지 않는다(S3 명세 1절).
+                $pair=@{home=[string]$Job.home;receipt=[string]$preview.receipt;token=[string]$preview.token;state=[string]$preview.state}
                 $result.project=Get-ProjectPreviewSafe $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path) $stage $pair
                 if ($result.project.state -ne 'found') { $null=Remove-DesktopStage $stage }
             }
@@ -501,23 +822,12 @@ function Invoke-ConversationJob([object]$Job) {
         Restore {
             # GUI는 복원(incoming)만 작업으로 보낸다. 건너뛰기·유지는 작업을 만들지 않는다.
             $choice=if ($Job.choice) {[string]$Job.choice} else {'incoming'}
-            if ($Job.projectReceipt) { Assert-ProjectPairing $Job }
-            # 작업 ID: 벤더는 이 이름으로 첫 쓰기 전에 복구 기록을 만든다(S3 명세 2.1절).
-            $operationId=[guid]::NewGuid().ToString('N')
-            $restored=Invoke-Vendor $Job 'restore' ($ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$choice;operationId=$operationId})
-            $result=@{message=[string]$restored.message;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$null}
-            if ($Job.projectReceipt) {
-                # 대화를 가져왔거나 이미 같을 때만 프로젝트 파일도 복원한다. 이 PC 대화가 더 새로우면 파일도 그대로 둔다.
-                if ($restored.effect -cin @('restored','equal')) {
-                    $project=Restore-ProjectFolders $Job $Job.projectReceipt $Job.agent $ids.nativeId $ids.remoteId (Normalize-ProjectPath (Resolve-Path -LiteralPath $Job.projectPath).Path)
-                    if ($project) { $result.project=$project; $result.message+=$project.message }
-                }
-                # 복원하지 않았어도 미리보기에서 받은 평문 사본은 지운다.
-                $result.message+=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Job.projectReceipt)))
-            }
-            return $result
+            return (Invoke-RestoreOperation $Job $ids $choice)
         }
-        Open { return @{message=[string](Invoke-Vendor $Job 'open' $ids).message} }
+        Journal { return (Get-JournalRows $Job -Auto) }
+        Rollback { return (Invoke-JournalRollback $Job) }
+        CloseJournal { return (Invoke-JournalClose $Job) }
+        Open { Assert-JournalClear $Job; return @{message=[string](Invoke-Vendor $Job 'open' $ids).message} }
     }
 }
 function Enable-WorkerJob {
@@ -549,7 +859,7 @@ public static class CtxHopWorkerJob {
         if (handle != IntPtr.Zero) return;
         IntPtr job = CreateJobObject(IntPtr.Zero, name);
         if (job == IntPtr.Zero) throw new Win32Exception();
-        if (Marshal.GetLastWin32Error() == 183) { CloseHandle(job); throw new Win32Exception(183); } // 같은 이름이 이미 있음
+        if (Marshal.GetLastWin32Error() == 183) { CloseHandle(job); throw new Win32Exception(183); } // the name already exists
         Extended info = new Extended(); info.BasicLimits.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         int length = Marshal.SizeOf(typeof(Extended)); IntPtr buffer = Marshal.AllocHGlobal(length);
         try { Marshal.StructureToPtr(info, buffer, false); if (!SetInformationJobObject(job, 9, buffer, (uint)length)) { CloseHandle(job); throw new Win32Exception(); } }
@@ -557,7 +867,7 @@ public static class CtxHopWorkerJob {
         if (!AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); throw new Win32Exception(); }
         handle = job; Name = name;
     }
-    // 이름으로 연다(조회·종료 권한). 없으면(ERROR_FILE_NOT_FOUND) Zero, 그 밖의 실패는 예외.
+    // Opens by name with query and terminate rights. Zero when it does not exist (ERROR_FILE_NOT_FOUND); other failures throw.
     public static IntPtr Open(string name) {
         IntPtr job = OpenJobObject(0x0004 | 0x0008, false, name);
         if (job != IntPtr.Zero) return job;
@@ -566,7 +876,7 @@ public static class CtxHopWorkerJob {
         throw new Win32Exception(error);
     }
     public static void Close(IntPtr job) { if (job != IntPtr.Zero) CloseHandle(job); }
-    // JobObjectBasicProcessIdList. 할당 수가 목록 수보다 크면 버퍼를 늘려 전부 받을 때까지 다시 받는다.
+    // JobObjectBasicProcessIdList. Grows the buffer and asks again until every assigned process is listed.
     public static int[] List(IntPtr job) {
         for (int size = 64; size <= 65536; size *= 4) {
             int bytes = 8 + size * IntPtr.Size; IntPtr buffer = Marshal.AllocHGlobal(bytes);
@@ -581,7 +891,7 @@ public static class CtxHopWorkerJob {
         }
         throw new Win32Exception(234);
     }
-    // 목록의 PID가 그사이 다른 프로세스에 재사용됐을 수 있으므로, 이 Job 소속을 확인한 것만 끝낸다.
+    // A listed PID may have been reused since, so only processes confirmed to be in this Job are ended.
     public static void KillMembers(IntPtr job, int self) {
         foreach (int id in List(job)) {
             if (id == self) continue;
@@ -653,8 +963,12 @@ function Test-WorkerWritersGone([object]$Marker,[int]$KillSec=30) {
     } catch { return 'busy' } finally { [CtxHopWorkerJob]::Close($job) }
 }
 function Invoke-JobCore([object]$Job) {
-    if ($Job.action -ceq 'Restore') { Assert-WorkerJob }
-    if ($Job.action -in @('List','Backup','Preview','Restore','Open')) { return (Invoke-ConversationJob $Job) }
+    # 쓰기 작업(복원·되돌리기·닫기)은 Job 객체 안에서만 한다. 끝나기 전에 자손이 모두 끝나기를 기다려, mutex를 풀 때 writer가 남지 않게 한다.
+    if ($Job.action -cin @('Restore','Rollback','CloseJournal')) {
+        Assert-WorkerJob
+        try { return (Invoke-ConversationJob $Job) } finally { $null=Wait-WorkerJobAlone }
+    }
+    if ($Job.action -cin @('List','Backup','Preview','Open','Journal')) { return (Invoke-ConversationJob $Job) }
     # 설정·저장소 작업은 벤더와 무관한 ctxhop 설정 작업이라 ClaudeWorker가 그대로 한다.
     if ($Job.agent -eq 'codex-desktop') { $Job.agent='claude-code' }
     & $script:ClaudeJobCore $Job

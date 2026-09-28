@@ -200,6 +200,7 @@ $script:CodexDesktopOps=@{
     }
     recover={ param($R)
         # 복구 기록 조회·되돌리기·닫기(S3 명세 4.2절). 되돌리기는 기존 백엔드 recover가 하고, 닫기는 journal 이름만 바꾼다.
+        if ([string]$R.mode -cnotin @('status','list','rollback','resolve')) { throw (T 'WkRecoverModeInvalid' ([string]$R.mode)) }
         $desktopRoot=Get-DesktopHome $R
         switch -CaseSensitive ([string]$R.mode) {
             status { return @{state=(Get-DesktopRecord $desktopRoot ([string]$R.operationId)).state} }

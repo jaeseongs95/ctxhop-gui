@@ -9,6 +9,8 @@ function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Val
 # 벤더 계약 경계: Codex 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
 # 이 시험의 전송 mock과 백엔드 shim이 구현에도 적용되게 한다. 프로세스 경계는 Test-Contract.ps1이 확인한다.
 function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
+    # 중단된 복원 검사는 두 벤더의 기록을 모두 본다. Claude 구현은 이 시험 대상이 아니므로 기록이 없다고 답한다.
+    if ($Vendor -ceq 'claude-code' -and $Op -ceq 'recover' -and $Request.mode -ceq 'list') { return [pscustomobject]@{protocolVersion=1;status='ok';records=@()} }
     Assert ($Vendor -ceq 'codex-desktop') 'only the Codex Desktop implementation is under test'
     $id=[guid]::NewGuid().ToString()
     $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}

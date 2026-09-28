@@ -51,6 +51,12 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         }
         inspect { return [pscustomobject]@{status=$script:State;reason='fixture_content_comparison';token='exact-token-A';source=@{sessionId=$script:Id};target=@{sessionId=$script:Id}} }
         apply {
+            # 백엔드처럼 작업 ID 이름의 run 폴더에 journal을 남긴다. 실패는 쓰다 멈춘 경우(pending)다.
+            $run=Join-Path $Arguments[[array]::IndexOf($Arguments,'--home')+1] (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+            if (-not $script:ApplyNoRecord) {
+                $null=New-Item -ItemType Directory -Path $run -Force
+                [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status=$(if ($script:ApplyFail) {'pending'} else {'complete'});home=$Arguments[[array]::IndexOf($Arguments,'--home')+1];id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+            }
             if ($script:ApplyFail) {
                 $e=[InvalidOperationException]::new('복원 실패, 복구 기록 유지')
                 $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='partial write';token=$null;pending=@('fixture/.ctxhop-desktop-recovery/run')}
@@ -125,7 +131,7 @@ try {
     $script:ListBadChildren=$true; Throws {Invoke-JobCore @{action='List';agent='codex-desktop';home=$desktopRoot;search=''}} '목록 메타데이터'; $script:ListBadChildren=$false
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $job.action='Backup'; $backup=Invoke-JobCore $job
-    Assert ($backup.remoteId -eq $script:BundleA -and ($script:VendorCalls -join ',') -ceq 'codex-desktop/list,codex-desktop/list,codex-desktop/backup') 'export publishes opaque encrypted bundle through the contract'
+    Assert ($backup.remoteId -eq $script:BundleA -and ($script:VendorCalls -join ',') -ceq 'codex-desktop/list,codex-desktop/list,codex-desktop/recover,claude-code/recover,codex-desktop/backup') 'export checks for interrupted restores, then publishes an opaque encrypted bundle through the contract'
     Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) 'uploaded plaintext backup copy is removed'
     # 프로젝트 파일을 함께 올릴 때는 describe가 먼저 내보낸다. 진행 중이면 대화 백업도 건너뛰고, 다른 실패는 backup이 다시 알린다.
     foreach ($status in 'busy','blocked') {
@@ -135,7 +141,7 @@ try {
             $script:ExportStatus=$null
             Assert ($exportError -and $exportError.Exception.Data['backendResult'].status -eq $status) "a $status export keeps the backend status for the GUI (project files: $withProject)"
             Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) "a $status export leaves no plaintext staging copy (project files: $withProject)"
-            if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
+            if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/recover,claude-code/recover,codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
         }
     }
     $job.Remove('projectBackup')
@@ -326,6 +332,17 @@ try {
     $job.action='Restore'; $job.receipt=$r.receipt; $job.token=$r.preview.token; $job.choice='incoming'; $script:ApplyFail=$true
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
     Assert ((@($failure.Exception.Data['backendResult'].pending) -join '|') -eq 'fixture/.ctxhop-desktop-recovery/run' -and $failure.Exception.Data['vendorResult'].recovery -eq 'required') 'failure must preserve backend recovery journal data and say recovery is required'
+    # 중단된 복원은 목록에 보이고 복원·백업·열기를 막는다(S3 명세 4.3절). 사용자가 되돌리면 풀린다.
+    $journalJob=@{action='Journal';agent='codex-desktop';home=$desktopRoot}
+    $row=@((Invoke-JobCore $journalJob).rows | Where-Object kind -eq 'marker')
+    Assert ($row.Count -eq 1 -and $row[0].state -eq 'pending' -and $row[0].canRollback -and $row[0].sha256 -and $failure.Exception.Data['journal'].operationId -ceq $row[0].operationId) "the interrupted restore is listed with its vendor record: $($row | ConvertTo-Json -Compress -Depth 4)"
+    $blocked=$null; try { $null=Invoke-JobCore @{action='Open';agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id} } catch { $blocked=$_ }
+    Assert ($blocked.Exception.Message -match '중단된 복원') 'open is blocked while a restore is interrupted'
+    $rolled=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$row[0].operationId}
+    Assert ($rolled.outcome -ceq 'rolled_back' -and -not @((Invoke-JobCore $journalJob).rows).Count) "rolling back clears the interrupted restore: $($rolled | ConvertTo-Json -Compress)"
+    $done=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($row[0].operationId).json") -Raw | ConvertFrom-Json
+    Assert ($done.outcome -ceq 'rolled_back' -and $done.vendorState -ceq 'rolled_back') 'the end record says the restore was rolled back'
+    $script:ApplyFail=$false
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
     # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판에, ctxhop 0.2.0-gui.3 고정과
     # Claude 세션 옆 폴더(하위 에이전트·도구 결과) 복원 확인, ctxhop 출력 UTF-8 읽기, 저장소 옮기기를 더한 판과 바이트 동일해야 한다.
@@ -377,7 +394,15 @@ try {
                     return @{metadata=$script:ProjectMeta;folders=@{cwds=$script:Cwds;edits=$script:Edits}}
                 }
                 inspect { return [pscustomobject]@{status='incoming_newer';reason='fixture';token='project-token';source=@{sessionId=$script:Id};target=@{sessionId=$script:Id}} }
-                apply { return @{status=$script:ApplyStatus} }
+                apply {
+                    # 가져왔으면 백엔드처럼 작업 ID 이름의 run 폴더에 완료 journal을 남긴다. equal·local_newer는 기록이 없다.
+                    if ($script:ApplyStatus -eq 'imported') {
+                        $home2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $home2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+                        $null=New-Item -ItemType Directory -Path $run -Force
+                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$home2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    return @{status=$script:ApplyStatus}
+                }
             }
         }
         function Get-Stored([string]$Mode) { @($script:Store.Values | Where-Object { $_.metadata.historyMode -like $Mode }) }
@@ -479,9 +504,13 @@ try {
             $restore.action='Preview'; $restore.projectRestore=$true; $shown=Invoke-JobCore $restore
             $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.projectRestore=$case.restore; $restore.projectReceipt=$shown.project.receipt
             if ($case.tamper) { [IO.File]::AppendAllText($shown.project.folders[0].zip,'x') }
-            $done=Invoke-JobCore ($restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json)   # GUI처럼 JSON을 거쳐 고른 폴더(projectTargets)도 쓴다
+            $applies=@($script:Calls | Where-Object { $_.arguments[0] -eq 'apply' }).Count; $done=$null; $failed=$null
+            try { $done=Invoke-JobCore ($restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json) } catch { $failed=$_ }   # GUI처럼 JSON을 거쳐 고른 폴더(projectTargets)도 쓴다
             Assert ([IO.File]::ReadAllText("$restoreTarget\src\app.py") -eq 'local again' -and -not (Test-Path -LiteralPath (Split-Path -Parent $shown.project.receipt))) "project files stay and the project preview copy is removed for $($case | ConvertTo-Json -Compress)"
-            if ($case.tamper) { Assert ($done.message -match '폴더는 복원하지 못했습니다' -and $done.restored.status -eq 'imported' -and $done.effect -eq 'restored' -and (@($done.project.folders | ForEach-Object state) -join '|') -eq 'failed|restored' -and (Test-Path -LiteralPath "$($done.project.recovery)\restore-log.json")) "a changed download fails only that folder; the others are restored and logged: $($done.message)" }
+            # 받은 파일이 바뀌었으면 쓰기 전에 멈추고 대화도 복원하지 않는다(S3 명세 1절). 이 PC 대화가 더 새로우면 쓴 파일을 되돌린다.
+            if ($case.tamper) { Assert ($failed.Exception.Message -match '대화를 복원하지 않았습니다' -and $failed.Exception.Data['journal'].outcome -ceq 'rolled_back' -and @($script:Calls | Where-Object { $_.arguments[0] -eq 'apply' }).Count -eq $applies) "a changed download stops the restore before the conversation: $($failed.Exception.Message)" }
+            elseif ($case.status -eq 'local_newer') { Assert ($done.effect -eq 'local_newer' -and $done.message -match '되돌렸습니다') "files written before a local_newer answer are rolled back: $($done.message)" }
+            else { Assert (-not $failed) "restore without project files: $failed" }
         }
         $script:ApplyStatus='imported'; $restore.projectRestore=$true; $restore.Remove('projectReceipt')
         # 미리보기를 꺼 두면 프로젝트 파일을 받지 않는다.
@@ -492,6 +521,8 @@ try {
         Throws { Read-ProjectReceipt (Join-Path $testDirectory 'project-receipt.json') 'codex-desktop' $script:Id $first.remoteId } '미리보기 기록'
 
         # Claude Code: 대화 작업은 ClaudeWorker(여기서는 가짜)가 하고, 프로젝트 파일은 같은 저장소에 붙는다.
+        # 프로젝트 파일을 쓰기 전의 엔진 검사(guard)는 이 PC에서 실제로 켜진 Claude를 보지 않도록 흉내 낸다.
+        $realAgentClosed=${function:Assert-AgentClosed}; ${function:Assert-AgentClosed}={ param($Agent) }
         Rename-Item -LiteralPath (Join-Path $projects 'lib-moved') -NewName 'lib'
         $claudeId='22222222-2222-4222-8222-222222222222'; $claudeRemote='0123456789abcdefghjkmnpqrs'
         $claudeHome=Join-Path $testDirectory 'claude-projects\D--proj'; $null=New-Item -ItemType Directory -Path "$claudeHome\$claudeId\subagents" -Force
@@ -500,7 +531,7 @@ try {
         [IO.File]::WriteAllLines("$claudeHome\$claudeId\subagents\agent-1.jsonl",[string[]]@('{"cwd":' + (ConvertTo-Json $projB) + '}'),[Text.UTF8Encoding]::new($false))
         function Get-NativeFiles([string]$Agent,[string]$Id) { if ($Id -eq $claudeId) { Get-Item -LiteralPath $script:ClaudeSession } }
         $script:ClaudeCalls=@()
-        $script:ClaudeJobCore={ param($Job) $script:ClaudeCalls+=$Job.action; switch ($Job.action) { Backup {@{message='대화 백업 완료.'}} Preview {@{message='미리보기 완료.';preview=@{session=$Job.nativeId}}} Restore {@{message='복원 완료.';restored=@{session=$Job.nativeId}}} } }
+        $script:ClaudeJobCore={ param($Job) $script:ClaudeCalls+=$Job.action; switch ($Job.action) { Backup {@{message='대화 백업 완료.'}} Preview {@{message='미리보기 완료.';preview=@{session=$Job.nativeId}}} Restore { $root=Get-JournalRoot; $null=New-Item -ItemType Directory -Path $root -Force; [IO.File]::WriteAllText((Join-Path $root "$($Job.operationId).completed.json"),(@{operationId=$Job.operationId;nativeId=$Job.nativeId;restoredSha256='x'} | ConvertTo-Json)); @{message='복원 완료.';restored=@{session=$Job.nativeId}}} } }
         $claude=@{action='Backup';agent='claude-code';projectPath=$projA;nativeId=$claudeId;remoteId=$claudeRemote;projectBackup=$true}
         # 받는 쪽 한도(압축 전 16GiB)를 넘는 폴더도 올리기 전에 묻는다(한도를 낮춰 확인).
         $script:ProjectAskBytes=1; $script:ProjectMaxBytes=6
@@ -623,7 +654,7 @@ try {
         $claude.projectRestore=$false; $claude.action='Preview'; $cp=Invoke-JobCore $claude
         Assert ($cp.project.state -eq 'off') 'Claude preview skips project files when the option is off'
         Assert (Test-StagingClean) 'no plaintext project copy remains in staging'
-    } finally { $env:TMP=$oldTmp; $env:TEMP=$oldTemp; $env:GIT_CEILING_DIRECTORIES=$oldCeiling }
+    } finally { $env:TMP=$oldTmp; $env:TEMP=$oldTemp; $env:GIT_CEILING_DIRECTORIES=$oldCeiling; if ($realAgentClosed) { ${function:Assert-AgentClosed}=$realAgentClosed } }
     # GUI처럼 Worker.ps1을 별도 프로세스로 실행해 요청·결과 경로가 ClaudeWorker dot-source 뒤에도 남는지 확인한다.
     $request=Join-Path $testDirectory 'request.json'; $result=Join-Path $testDirectory 'result.json'
     @{action='Open';agent='codex-desktop';home=$desktopRoot} | ConvertTo-Json | Set-Content -LiteralPath $request -Encoding UTF8
