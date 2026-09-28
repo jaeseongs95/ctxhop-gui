@@ -58,6 +58,8 @@ try {
     Assert ((ConvertTo-ProjectPath 'D:/a/b/') -eq 'D:\a\b') 'forward slashes are normalized'
     Assert ((ConvertTo-ProjectPath 'D:\') -eq 'D:\') 'drive root keeps its backslash'
     Assert ($null -eq (ConvertTo-ProjectPath 'relative\x') -and $null -eq (ConvertTo-ProjectPath '\rooted') -and $null -eq (ConvertTo-ProjectPath '')) 'relative and drive-relative paths are rejected'
+    Assert ($null -eq (ConvertTo-ProjectPath 'C:relative-folder') -and $null -eq (ConvertTo-ProjectPath 'C:') -and $null -eq (ConvertTo-ProjectPath '\\server')) 'drive-relative paths and a UNC path without a share are rejected'
+    Assert ((ConvertTo-ProjectPath '\\server\share') -eq '\\server\share') 'a UNC share path is kept'
 
     # 2) 폴더 고르기: 안의 폴더는 합치고, 넓은 폴더·시작 폴더의 부모·임시·설정 폴더는 뺀다. 폴더 밖 편집은 목록만.
     $env:USERPROFILE='C:\Users\fixture'; $env:LOCALAPPDATA='C:\Users\fixture\AppData\Local'
@@ -178,6 +180,15 @@ try {
     Assert ((Read-ProjectSnapshot $zipE).files.Count -eq 0) 'an empty folder makes a readable empty snapshot'
     [IO.File]::WriteAllText((Join-Path $walk 'README.md'),'# changed')
     Assert ((Get-ProjectManifest (Get-ProjectFileList $walk)).hash -ne $snapA.hash) 'changed content changes the hash'
+    # 해시하는 도중 커지는 파일도 실제로 읽은 양으로 센다. 읽기 시작할 때 커지게 한다.
+    $grow=Join-Path $testDirectory 'grow'; $null=New-Item -ItemType Directory -Path $grow
+    [IO.File]::WriteAllText((Join-Path $grow 'a.txt'),('g'*100))
+    $growList=Get-ProjectFileList $grow
+    $copyStream=${function:Copy-ProjectStream}
+    ${function:Copy-ProjectStream}={ param([IO.Stream]$From,[IO.Stream]$To,[long]$Limit) [IO.File]::AppendAllText($From.Name,('h'*400)); & $copyStream $From $To $Limit }
+    try { $grown=Get-ProjectManifest $growList 150 } finally { ${function:Copy-ProjectStream}=$copyStream }
+    Assert ($grown.overLimit -and $grown.bytes -gt 150) 'a file that grows while it is hashed is counted by the bytes actually read'
+    Assert (-not (Get-ProjectManifest (Get-ProjectFileList $grow) 1000).overLimit) 'the grown file fits a larger limit'
     [IO.File]::WriteAllText((Join-Path $walk 'README.md'),'# r')
     $locked=[IO.FileStream]::new((Join-Path $walk 'src\main.py'),'Open','ReadWrite','None')
     try { $partial=New-ProjectSnapshot (Get-ProjectFileList $walk) (Join-Path $testDirectory 'locked.zip') } finally { $locked.Dispose() }
@@ -222,11 +233,159 @@ try {
     }
     Remove-Item -LiteralPath @(Get-ChildItem -LiteralPath $testDirectory -Filter 'h*.zip' | ForEach-Object FullName)
     Assert ((Get-TreeText $testDirectory) -eq $before) 'hostile snapshots change no file'
-    # 내용이 기록된 해시와 다르면(크기는 같음) 그 파일만 쓰지 않는다.
-    $tampered=New-TestZip (Join-Path $testDirectory 'tampered.zip') @{'keep.txt'='same';'new.txt'='abc'} { param($m,$e) $e['keep.txt']='SAME' }
+    # 내용이 기록된 해시와 다르면(크기는 같음) 그 파일에서 멈추고 남은 파일은 쓰지 않는다(S3 명세 3.2절).
+    $tampered=New-TestZip (Join-Path $testDirectory 'tampered.zip') @{'a.txt'='abc';'keep.txt'='same';'z.txt'='z'} { param($m,$e) $e['keep.txt']='SAME' }
     $restored=Restore-ProjectSnapshot $tampered $victim (Join-Path $testDirectory 'rec-tampered')
-    Assert ($restored.written -eq 1 -and $restored.failed.Count -eq 1 -and $restored.failed[0].path -eq 'keep.txt' -and $restored.backedUp -eq 0) "tampered content fails alone: $($restored | ConvertTo-Json -Compress)"
-    Assert ([IO.File]::ReadAllText((Join-Path $victim 'keep.txt')) -eq 'keep' -and -not @(Get-ChildItem -LiteralPath $victim -Force -Filter '*.part').Count) 'the original stays and no part file remains'
+    Assert ($restored.written -eq 1 -and $restored.failed.Count -eq 1 -and $restored.failed[0].path -eq 'keep.txt' -and $restored.backedUp -eq 1 -and (@($restored.files | ForEach-Object state) -join '|') -eq 'written|failed|skipped') "tampered content stops the restore: $($restored | ConvertTo-Json -Compress)"
+    Assert ([IO.File]::ReadAllText((Join-Path $victim 'keep.txt')) -eq 'keep' -and -not (Test-Path -LiteralPath (Join-Path $victim 'z.txt')) -and -not @(Get-ChildItem -LiteralPath $victim -Force -Filter '.ctxhop-*').Count) 'the original stays, later files are not written and no temporary file remains'
+    Remove-Item -LiteralPath (Join-Path $victim 'a.txt')
+    # 계획: 파일마다 before·after·action을 정하고, 바꿀 파일의 원본은 먼저 복사해 해시를 before로 적는다. 활성 파일은 그대로다.
+    $planDir=Join-Path $testDirectory 'plan'; Write-Fixture $planDir @{'a.txt'='old';'same.txt'='same'}
+    $planZip=New-TestZip (Join-Path $testDirectory 'plan.zip') @{'a.txt'='new';'same.txt'='same';'b.txt'='b'}
+    $plan=New-ProjectRestorePlan $planZip $planDir (Join-Path $testDirectory 'plan-copies')
+    $byPath=@{}; foreach ($file in $plan.files) { $byPath[$file.path]=$file }
+    Assert ($byPath['a.txt'].action -eq 'write' -and $byPath['a.txt'].before -eq (Get-Sha 'old') -and $byPath['a.txt'].after -eq (Get-Sha 'new') -and (Read-Text $byPath['a.txt'].beforeCopy) -eq 'old') "a changed file is copied first: $($byPath['a.txt'] | ConvertTo-Json -Compress)"
+    Assert ($byPath['same.txt'].action -eq 'same' -and -not $byPath['same.txt'].beforeCopy -and $byPath['b.txt'].before -eq 'absent' -and -not $byPath['b.txt'].beforeCopy) 'a same file and a new file are not copied'
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'old' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'making a plan writes no project file'
+    # 계획 뒤에 바뀐 파일은 쓰지 않고, 그 뒤 파일도 쓰지 않는다.
+    [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'edited')
+    $restored=Invoke-ProjectRestorePlan $planZip $plan.files (Join-Path $testDirectory 'plan-copies')
+    Assert ($restored.failed.Count -eq 1 -and $restored.failed[0].reason -like '*a.txt*' -and (@($restored.files | ForEach-Object state) -join '|') -eq 'failed|skipped|skipped') "a file changed after the plan stops the restore: $($restored | ConvertTo-Json -Compress)"
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'edited' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'the edited file is kept and nothing else is written'
+    # 다시 본 뒤 바꾸기 전 사이에 파일이 바뀌면, 치운 내용을 지우지 않고 남긴다.
+    [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'old')
+    $copyStream=${function:Copy-ProjectStream}
+    ${function:Copy-ProjectStream}={ param([IO.Stream]$From,[IO.Stream]$To,[long]$Limit) [IO.File]::WriteAllText((Join-Path $planDir 'a.txt'),'racing'); & $copyStream $From $To $Limit }
+    try { $restored=Invoke-ProjectRestorePlan $planZip $plan.files (Join-Path $testDirectory 'plan-copies') } finally { ${function:Copy-ProjectStream}=$copyStream }
+    $kept=@(Get-ChildItem -LiteralPath $planDir -Force -Filter '.ctxhop-*.prev')
+    Assert ($restored.failed.Count -eq 1 -and $kept.Count -eq 1 -and (Read-Text $kept[0].FullName) -eq 'racing' -and $restored.failed[0].reason -like "*$($kept[0].Name)*") "content changed just before the swap is kept: $($restored | ConvertTo-Json -Compress)"
+    Assert ((Read-Text (Join-Path $planDir 'a.txt')) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $planDir 'b.txt'))) 'the restore stops after the displaced file'
+    # 되돌리기(S3 명세 3.3절): a.txt는 원본이 있던 파일, b.txt는 새로 생긴 파일이다.
+    $op='c'*32
+    function New-UndoCase([string]$Name) {
+        $dir=Join-Path $testDirectory "undo-$Name"; Write-Fixture $dir @{'a.txt'='old'}
+        $zip=New-TestZip (Join-Path $testDirectory "undo-$Name.zip") @{'a.txt'='new';'b.txt'='b'}
+        $record=Join-Path $testDirectory "undo-$Name-rec"
+        $plan=New-ProjectRestorePlan $zip $dir $record 3
+        $null=Invoke-ProjectRestorePlan $zip $plan.files $record
+        return @{dir=$dir;record=$record;files=$plan.files;a=(Join-Path $dir 'a.txt');b=(Join-Path $dir 'b.txt')}
+    }
+    function Get-UndoLeft([string]$Dir) { return @(Get-ChildItem -LiteralPath $Dir -Force -Filter '.ctxhop-rb-*').Count }
+    function Get-UndoSteps([string]$Record) { return (@((Get-Content -LiteralPath (Join-Path $Record 'rollback.json') -Raw | ConvertFrom-Json).files | ForEach-Object { "$($_.index):$($_.step)" }) -join '|') }
+    $saveJson=${function:Save-ProjectJson}
+    function Invoke-UndoFault([hashtable]$Case,[scriptblock]$When,[object[]]$Confirmed=@()) {
+        # $When이 참인 기록을 저장하려는 순간 멈춘다(강제 종료 흉내). 그 파일의 남은 단계는 실행되지 않는다.
+        $script:undoFault=$When
+        ${function:Save-ProjectJson}={ param($Path,$Value) if (& $script:undoFault $Value) { throw 'fault' }; & $saveJson $Path $Value }
+        try { return (Undo-ProjectRestorePlan $Case.files $Case.record $op $Confirmed) } finally { ${function:Save-ProjectJson}=$saveJson }
+    }
+    function Test-Step($Value,[int]$Index,[string]$Step) { return [bool]@($Value.files | Where-Object { $_.index -eq $Index -and $_.step -eq $Step }).Count }
+    # 기본: 이 작업이 쓴 파일만 되돌리고, 치운 파일은 기록 폴더에 남긴다.
+    $case=New-UndoCase 'basic'
+    Assert ((@($case.files | ForEach-Object index) -join ',') -eq '3,4') 'plan indexes start at the given number'
+    $view=Get-ProjectUndoView $case.files
+    Assert ((@($view | ForEach-Object class) -join '|') -eq 'owned|owned') "files this restore wrote are owned: $($view | ConvertTo-Json -Compress)"
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert ($undo.complete -and (Read-Text $case.a) -eq 'old' -and -not (Test-Path -LiteralPath $case.b)) "rollback restores the files: $($undo | ConvertTo-Json -Compress -Depth 4)"
+    Assert ((Read-Text (Join-Path $case.record 'rollback\3')) -eq 'new' -and (Read-Text (Join-Path $case.record 'rollback\4')) -eq 'b' -and -not (Get-UndoLeft $case.dir)) 'replaced files are kept in the record folder and no temporary file remains'
+    Assert ((Get-UndoSteps $case.record) -eq '3:done|4:done') 'every step is done'
+    Assert ((Undo-ProjectRestorePlan $case.files $case.record $op).complete) 'running the rollback again stays complete'
+    # 알 수 없는 파일은 그대로 두고, 사용자가 본 스냅숏과 같을 때만 되돌린다.
+    $case=New-UndoCase 'unknown'
+    [IO.File]::WriteAllText($case.a,'user')
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert (-not $undo.complete -and $undo.files[0].state -eq 'unknown' -and $undo.files[1].state -eq 'done' -and (Read-Text $case.a) -eq 'user') 'an unknown file is left by the default rollback'
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op @([pscustomobject]@{target=$case.a;current=(Get-Sha 'other')})
+    Assert (-not $undo.complete -and (Read-Text $case.a) -eq 'user') 'a confirmation for other content is not used'
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op @([pscustomobject]@{target=$case.a;current=(Get-Sha 'user')})
+    Assert ($undo.complete -and (Read-Text $case.a) -eq 'old' -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'user') 'a confirmed unknown file is rolled back and its content kept'
+    # 원본이 있던 파일을 사용자가 지웠으면(prev=none) 치울 파일 없이 되돌린다. 정상 실행과 Move 직후 중단·재실행이 같은 결과다(R37-N2).
+    $case=New-UndoCase 'none'; Remove-Item -LiteralPath $case.a
+    $confirmAbsent=@([pscustomobject]@{target=$case.a;current='absent'})
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op $confirmAbsent
+    Assert ($undo.complete -and (Read-Text $case.a) -eq 'old' -and -not (Test-Path -LiteralPath (Join-Path $case.record 'rollback\3'))) "a deleted original comes back with nothing to keep: $($undo | ConvertTo-Json -Compress -Depth 4)"
+    $case=New-UndoCase 'none-crash'; Remove-Item -LiteralPath $case.a; $confirmAbsent=@([pscustomobject]@{target=$case.a;current='absent'})
+    $undo=Invoke-UndoFault $case { param($v) Test-Step $v 3 'done' } $confirmAbsent
+    Assert (-not $undo.complete -and (Read-Text $case.a) -eq 'old' -and (Get-UndoSteps $case.record) -like '3:swapped*') 'a stop right after the move is not complete yet'
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert ($undo.complete -and (Get-UndoSteps $case.record) -eq '3:done|4:done') 'the rerun reaches the same result as the uninterrupted run'
+    # 교체 전에 멈추면(start·prepared·swapped) 남은 .part를 버리고 처음부터 다시 한다.
+    foreach ($step in @('start','prepared','swapped')) {
+        $case=New-UndoCase "before-$step"
+        $undo=Invoke-UndoFault $case ([scriptblock]::Create("param(`$v) Test-Step `$v 3 '$step'"))
+        Assert (-not $undo.complete -and (Read-Text $case.a) -eq 'new') "a stop at $step leaves the file as it was"
+        $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+        Assert ($undo.complete -and (Read-Text $case.a) -eq 'old' -and -not (Get-UndoLeft $case.dir)) "the rerun after $step completes: $($undo | ConvertTo-Json -Compress -Depth 4)"
+    }
+    # 교체 전에 멈춘 뒤 파일이 판단 때와 달라졌으면, 확인을 받아도 다시 시작하지 않고 멈춘다.
+    $case=New-UndoCase 'changed-after-stop'
+    $null=Invoke-UndoFault $case { param($v) Test-Step $v 3 'swapped' }
+    [IO.File]::WriteAllText($case.a,'user2')
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op @([pscustomobject]@{target=$case.a;current=(Get-Sha 'user2')})
+    Assert (-not $undo.complete -and $undo.files[0].state -eq 'attention' -and (Read-Text $case.a) -eq 'user2') 'a file that changed after a stop is not rolled back'
+    # 교체 직후(mismatch를 적기 전)와 .prev를 지운 뒤(done을 적기 전)에 멈춰도 이어서 끝난다.
+    $case=New-UndoCase 'after-replace'
+    $undo=Invoke-UndoFault $case { param($v) [bool]@($v.files | Where-Object { $_.index -eq 3 -and $_.prev -and $_.prev -ne 'none' }).Count }
+    Assert (-not $undo.complete -and (Get-UndoLeft $case.dir) -eq 1) 'a stop right after the swap leaves the displaced file'
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert ($undo.complete -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'new' -and -not (Get-UndoLeft $case.dir)) 'the rerun keeps the displaced file first and completes'
+    $case=New-UndoCase 'after-delete'
+    $undo=Invoke-UndoFault $case { param($v) Test-Step $v 3 'done' }
+    Assert (-not $undo.complete -and -not (Get-UndoLeft $case.dir) -and (Get-UndoSteps $case.record) -like '3:kept*') 'a stop after deleting the displaced file is not complete yet'
+    Assert ((Undo-ProjectRestorePlan $case.files $case.record $op).complete) 'the rerun proves the kept copy and completes'
+    Remove-Item -LiteralPath (Join-Path $case.record 'rollback\3')
+    Assert (-not (Undo-ProjectRestorePlan $case.files $case.record $op).complete) 'a missing kept copy is never complete'
+    # 판단 뒤 교체 전에 파일이 바뀌면 치운 내용을 남기고 mismatch로 둔다. 다시 실행해도 성공으로 바뀌지 않는다.
+    $case=New-UndoCase 'mismatch'
+    $script:raced=$false
+    $undo=Invoke-UndoFault $case { param($v) if (-not $script:raced -and (Test-Step $v 3 'swapped')) { $script:raced=$true; [IO.File]::WriteAllText($case.a,'racing') }; $false }
+    Assert (-not $undo.complete -and $undo.files[0].state -eq 'mismatch' -and (Read-Text $case.a) -eq 'old' -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'racing') "content changed just before the swap is kept as a mismatch: $($undo | ConvertTo-Json -Compress -Depth 4)"
+    Assert (-not (Undo-ProjectRestorePlan $case.files $case.record $op).complete) 'a mismatch stays unresolved on the next run'
+    # 다른 내용의 보존 사본이 이미 있으면 덮어쓰지 않고, 치운 파일도 지우지 않는다.
+    $case=New-UndoCase 'kept-conflict'
+    Write-Fixture $case.record @{'rollback\3'='other'}
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    $prevFile=@(Get-ChildItem -LiteralPath $case.dir -Force -Filter '.ctxhop-rb-*.prev')
+    Assert (-not $undo.complete -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'other' -and $prevFile.Count -eq 1 -and (Read-Text $prevFile[0].FullName) -eq 'new') 'a conflicting kept copy stops the rollback and nothing is lost'
+    # 원본 사본과 다른 .part가 남아 있으면 지우지 않고 멈춘다.
+    $case=New-UndoCase 'bad-part'
+    Write-Fixture $case.dir @{".ctxhop-rb-$op-3.part"='tampered'}
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert (-not $undo.complete -and (Read-Text $case.a) -eq 'new' -and (Read-Text (Join-Path $case.dir ".ctxhop-rb-$op-3.part")) -eq 'tampered') 'a tampered part file is kept and the file is not touched'
+    # 원본 사본이 없으면 되돌리지 못함으로 남기고, 나머지 파일은 되돌린다.
+    $case=New-UndoCase 'no-copy'
+    Remove-Item -LiteralPath $case.files[0].beforeCopy
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    Assert (-not $undo.complete -and $undo.files[0].state -eq 'unrestorable' -and $undo.files[1].state -eq 'done' -and (Read-Text $case.a) -eq 'new') 'a missing original copy cannot be rolled back'
+    # 기록 없이 남은 .prev는 mismatch로 보존한다.
+    $case=New-UndoCase 'orphan-prev'
+    Write-Fixture $case.dir @{".ctxhop-rb-$op-3.prev"='orphan'}
+    $undo=Undo-ProjectRestorePlan $case.files $case.record $op
+    $entry=@((Get-Content -LiteralPath (Join-Path $case.record 'rollback.json') -Raw | ConvertFrom-Json).files)[0]
+    Assert (-not $undo.complete -and $undo.files[0].state -ne 'done' -and $entry.mismatch -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'orphan' -and (Read-Text $case.a) -eq 'new') 'a displaced file without a record is kept as a mismatch and nothing else changes'
+    # 계획을 세운 뒤 복원 폴더·하위 폴더·상위 폴더가 정션으로 바뀌면(R38-03), 바깥 파일이 after와 같아도 분류·되돌리기가 건드리지 않는다.
+    foreach ($shape in 'sub','root','parent') {
+        $base=Join-Path $testDirectory "jn-$shape"; $dir=Join-Path $base 'proj'
+        Write-Fixture $dir @{'sub\a.txt'='old'}
+        $zip=New-TestZip (Join-Path $testDirectory "jn-$shape.zip") @{'sub\a.txt'='new'}
+        $record=Join-Path $testDirectory "jn-$shape-rec"
+        $plan=New-ProjectRestorePlan $zip $dir $record
+        $null=Invoke-ProjectRestorePlan $zip $plan.files $record
+        $outsideBase=Join-Path $testDirectory "jn-$shape-outside"
+        Write-Fixture $outsideBase @{'proj\sub\a.txt'='new';'sub\a.txt'='new'}
+        $junction=switch ($shape) { sub { Join-Path $dir 'sub' } root { $dir } parent { $base } }
+        $pointsTo=switch ($shape) { sub { Join-Path $outsideBase 'sub' } root { Join-Path $outsideBase 'proj' } parent { $outsideBase } }
+        Rename-Item -LiteralPath $junction -NewName ([IO.Path]::GetFileName($junction)+'-moved')
+        $null=New-Item -ItemType Junction -Path $junction -Target $pointsTo
+        try {
+            $outsideFile=if ($shape -eq 'sub') { Join-Path $outsideBase 'sub\a.txt' } else { Join-Path $outsideBase 'proj\sub\a.txt' }
+            $view=Get-ProjectUndoView $plan.files
+            Assert ($view[0].class -eq 'unrestorable') "a planned file behind a new junction ($shape) cannot be rolled back: $($view | ConvertTo-Json -Compress)"
+            $undo=Undo-ProjectRestorePlan $plan.files $record $op
+            $undoConfirmed=Undo-ProjectRestorePlan $plan.files $record $op @([pscustomobject]@{target=$plan.files[0].target;current=(Get-Sha 'new')})
+            Assert (-not $undo.complete -and -not $undoConfirmed.complete -and (Read-Text $outsideFile) -eq 'new' -and -not @(Get-ChildItem -LiteralPath $outsideBase -Recurse -Force -Filter '.ctxhop-rb-*').Count -and -not (Test-Path -LiteralPath (Join-Path $record 'rollback'))) "neither rollback touches the outside file ($shape)"
+        } finally { [IO.Directory]::Delete($junction) }
+    }
     # 대상 안의 정션을 거쳐 쓰지 않는다.
     $null=New-Item -ItemType Junction -Path (Join-Path $victim 'link') -Target $outsideDir
     $viaLink=New-TestZip (Join-Path $testDirectory 'link.zip') @{'link\secret.txt'='overwritten'}

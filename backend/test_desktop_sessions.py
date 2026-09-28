@@ -44,11 +44,11 @@ class Sessions(unittest.TestCase):
     def preview(self, archive=None):
         return d.inspect(self.home, archive or self.archive, self.cwd)
 
-    def apply(self, archive=None, choice='incoming', failpoint=None):
+    def apply(self, archive=None, choice='incoming', failpoint=None, run_name=None):
         archive = archive or self.archive
         preview = self.preview(archive)
         return d.apply(self.home, archive, self.cwd, preview['token'], choice,
-            guard=self.guard, failpoint=failpoint)
+            guard=self.guard, failpoint=failpoint, run_name=run_name)
 
     def grown(self, family, index, label):
         """묶음의 index번 대화 세션 파일 끝에 기록 하나를 더한 사본."""
@@ -244,6 +244,26 @@ class Sessions(unittest.TestCase):
         self.assertEqual(result['status'], 'rolled_back')
         self.assertIsNone(d.selected(self.home, self.thread_id))
         self.assertEqual(d.pending(self.home), [])
+
+    def test_10b_recovery_named_by_caller(self):
+        # 부르는 쪽의 작업 ID가 복구 기록 폴더 이름이 된다. 형식이 틀리면 아무것도 쓰기 전에, 같은 이름이 있으면 쓰기 전에 거부한다.
+        with self.assertRaisesRegex(ValueError, '작업 이름'):
+            self.apply(run_name='../escape')
+        self.assertFalse((self.home / '.ctxhop-desktop-recovery').exists())
+        self.assertFalse((self.home / d.FILES[0]).exists())
+        name = 'ab' * 16
+        def fail(stage):
+            raise RuntimeError('injected ' + stage)
+        with self.assertRaisesRegex(RuntimeError, 'injected'):
+            self.apply(failpoint=fail, run_name=name)
+        self.assertEqual([p.parent.name for p in d.pending(self.home)], [name])
+        d.recover(self.home, self.home / '.ctxhop-desktop-recovery' / name, guard=self.guard)
+        with self.assertRaises(FileExistsError):
+            self.apply(run_name=name)
+        self.assertIsNone(d.selected(self.home, self.thread_id))
+        result = self.apply(run_name='cd' * 16)
+        self.assertEqual(Path(result['recovery']).name, 'cd' * 16)
+        self.assertEqual(json.loads((Path(result['recovery']) / 'journal.json').read_text(encoding='utf-8'))['status'], 'complete')
 
     def test_11_recovery_update_after_commit(self):
         self.apply()

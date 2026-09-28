@@ -3,6 +3,7 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'ClaudeCode.ps1') -LibraryOnly
+Enable-WorkerJob   # 복원 시험은 실제 Worker처럼 Job 객체 안에서 돈다.
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
 # 벤더 계약 경계: 실제 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
@@ -24,7 +25,7 @@ function Throws([scriptblock]$Body,[string]$Pattern) {
     Assert ($errorRecord.Exception.Message -match $Pattern) "expected $Pattern, got $($errorRecord.Exception.Message)"
 }
 $testDirectory=Join-Path ([IO.Path]::GetTempPath()) ('CtxHop-vnext-worker-'+[guid]::NewGuid().ToString('N'))
-$oldLocal=$env:LOCALAPPDATA
+$oldLocal=$env:LOCALAPPDATA; $oldCodexHome=$env:CODEX_HOME
 $script:Calls=@(); $script:Id='11111111-1111-4111-8111-111111111111'; $script:State='conflict'; $script:ApplyFail=$false
 $script:BundleA='peer-a/'+('a'*32); $script:BundleB='peer-b/'+('b'*32)
 $script:Metadata=[pscustomobject]@{sessionId=$script:Id;title='합성 대화';sourceCwd='D:\source';updatedAt='2026-09-26T01:00:00Z';historyMode='paginated';cliVersion='0.116.0';recordCount=4}
@@ -50,12 +51,37 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         }
         inspect { return [pscustomobject]@{status=$script:State;reason='fixture_content_comparison';token='exact-token-A';source=@{sessionId=$script:Id};target=@{sessionId=$script:Id}} }
         apply {
+            # 백엔드처럼 작업 ID 이름의 run 폴더에 journal을 남긴다. 실패는 쓰다 멈춘 경우(pending)다.
+            $run=Join-Path $Arguments[[array]::IndexOf($Arguments,'--home')+1] (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+            if (-not $script:ApplyNoRecord) {
+                $null=New-Item -ItemType Directory -Path $run -Force
+                [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status=$(if ($script:ApplyFail) {'pending'} else {'complete'});home=$Arguments[[array]::IndexOf($Arguments,'--home')+1];id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+            }
             if ($script:ApplyFail) {
                 $e=[InvalidOperationException]::new('복원 실패, 복구 기록 유지')
                 $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='partial write';token=$null;pending=@('fixture/.ctxhop-desktop-recovery/run')}
                 throw $e
             }
             return @{status='imported';journal='fixture/recovery/completed.json'}
+        }
+        guard {
+            if ($script:GuardOpen) {
+                $e=[InvalidOperationException]::new('Codex 앱/CLI/IDE를 모두 종료하세요. Codex/IDE writer PID: 1')
+                $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='writer';token=$null}
+                throw $e
+            }
+            return @{status='closed';engine='0.158.0'}
+        }
+        recover {
+            if ($script:RecoverStatus) {
+                $e=[InvalidOperationException]::new('중단 뒤 세션 파일이 변경됐습니다. 자동 복구를 중단합니다.')
+                $e.Data['backendResult']=[pscustomobject]@{status=$script:RecoverStatus;reason='fixture';token=$null}
+                throw $e
+            }
+            $journal=Join-Path $Arguments[[array]::IndexOf($Arguments,'--run')+1] 'journal.json'
+            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json; $record.status='rolled_back'
+            [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
+            return @{status='rolled_back';id=$record.id;members=1}
         }
         default { throw 'unexpected backend operation' }
     }
@@ -90,6 +116,8 @@ function Invoke-Bundle([string[]]$Arguments) {
 try {
     $null=New-Item -ItemType Directory -Path $testDirectory
     $env:LOCALAPPDATA=$testDirectory
+    # 홈을 주지 않은 작업(Claude)이 실제 %USERPROFILE%\.codex를 보지 않게, 없는 폴더를 Codex 기본 홈으로 둔다.
+    $env:CODEX_HOME=Join-Path $testDirectory 'no-codex-home'
     $desktopRoot=Join-Path $testDirectory 'synthetic-home'; $target=Join-Path $testDirectory '프로젝트 폴더'
     $null=New-Item -ItemType Directory -Path $desktopRoot; $null=New-Item -ItemType Directory -Path $target
     $job=@{action='List';agent='codex-desktop';home=$desktopRoot;projectPath=$target;search='';nativeId=$script:Id;remoteId=$script:BundleA}
@@ -105,7 +133,7 @@ try {
     $script:ListBadChildren=$true; Throws {Invoke-JobCore @{action='List';agent='codex-desktop';home=$desktopRoot;search=''}} '목록 메타데이터'; $script:ListBadChildren=$false
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $job.action='Backup'; $backup=Invoke-JobCore $job
-    Assert ($backup.remoteId -eq $script:BundleA -and ($script:VendorCalls -join ',') -ceq 'codex-desktop/list,codex-desktop/list,codex-desktop/backup') 'export publishes opaque encrypted bundle through the contract'
+    Assert ($backup.remoteId -eq $script:BundleA -and ($script:VendorCalls -join ',') -ceq 'codex-desktop/list,codex-desktop/list,codex-desktop/recover,claude-code/recover,codex-desktop/backup') 'export checks for interrupted restores, then publishes an opaque encrypted bundle through the contract'
     Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) 'uploaded plaintext backup copy is removed'
     # 프로젝트 파일을 함께 올릴 때는 describe가 먼저 내보낸다. 진행 중이면 대화 백업도 건너뛰고, 다른 실패는 backup이 다시 알린다.
     foreach ($status in 'busy','blocked') {
@@ -115,7 +143,7 @@ try {
             $script:ExportStatus=$null
             Assert ($exportError -and $exportError.Exception.Data['backendResult'].status -eq $status) "a $status export keeps the backend status for the GUI (project files: $withProject)"
             Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) "a $status export leaves no plaintext staging copy (project files: $withProject)"
-            if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
+            if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/recover,claude-code/recover,codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
         }
     }
     $job.Remove('projectBackup')
@@ -144,6 +172,150 @@ try {
     $null=Invoke-JobCore $job
     $apply=$script:Calls[-1].arguments
     Assert ($apply[0] -eq 'apply' -and $apply[[array]::IndexOf($apply,'--token')+1] -ceq 'exact-token-A') 'apply must pass exact inspect token'
+    Assert ($apply[[array]::IndexOf($apply,'--run')+1] -cmatch '^[0-9a-f]{32}$') 'apply names its recovery record after the operation ID from Worker'
+    foreach ($bad in @('../x',('A'*32),('a'*31),$null,32)) { Throws {Assert-OperationId $bad} '작업 ID' }
+    # 엔진 사전 검사(guard): 프로젝트 파일을 먼저 쓰기 전에 부른다. 열린 엔진은 busy, 검사 자체를 못 하면 failed다.
+    $guardJob=[pscustomobject]@{agent='codex-desktop';home=$desktopRoot}
+    $script:GuardOpen=$false
+    $g=Invoke-Vendor $guardJob 'guard' @{}
+    Assert ($g.status -ceq 'ok') 'Codex guard is ok when no engine or IDE is open'
+    Assert ($script:Calls[-1].arguments[0] -ceq 'guard' -and $script:Calls[-1].arguments[[array]::IndexOf($script:Calls[-1].arguments,'--home')+1] -ceq $desktopRoot) 'Codex guard asks the backend for the target home'
+    $script:GuardOpen=$true
+    $failure=$null; try { $null=Invoke-Vendor $guardJob 'guard' @{} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy' -and $failure.Exception.Data['vendorResult'].reasonCode -ceq 'engine_open') 'an open Codex engine makes guard busy'
+    $script:GuardOpen=$false
+    $realClosed=${function:Assert-AgentClosed}
+    try {
+        ${function:Assert-AgentClosed}={ param($Agent) if ($script:ClaudeOpen) { throw 'Claude Code를 종료하세요.' } }
+        $claudeGuard=[pscustomobject]@{agent='claude-code'}
+        $script:ClaudeOpen=$false; Assert ((Invoke-Vendor $claudeGuard 'guard' @{}).status -ceq 'ok') 'Claude guard is ok when Claude Code is closed'
+        $script:ClaudeOpen=$true
+        $failure=$null; try { $null=Invoke-Vendor $claudeGuard 'guard' @{} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy') 'an open Claude Code makes guard busy'
+    } finally { ${function:Assert-AgentClosed}=$realClosed }
+    # Codex 데이터 폴더가 없는 PC(Claude만 쓰는 경우): 목록은 비어 있어 복원·백업·열기를 막지 않는다. 기록 조회는 실패한다.
+    $noHome=[pscustomobject]@{agent='codex-desktop';home=''}
+    Assert (-not @((Invoke-Vendor $noHome 'recover' @{mode='list'}).records).Count) 'a missing Codex data folder has no recovery records'
+    $failure=$null; try { $null=Invoke-Vendor $noHome 'recover' @{mode='status';operationId=('f'*32)} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed') 'a record query against a missing Codex data folder fails instead of saying absent'
+    Assert (-not @((Get-JournalRows @{agent='claude-code'}).failed).Count) 'a Claude job on a PC without Codex is not blocked by the journal check'
+    # Codex 복구 기록(S3 명세 2.3·4.2절): 작업 ID 이름의 run 폴더를 직접 읽는다. 되돌리기는 백엔드 recover, 닫기는 journal 이름 바꾸기.
+    $recoveryRoot=Join-Path $desktopRoot '.ctxhop-desktop-recovery'
+    function Write-RunJournal([string]$Op,[string]$Text,[string]$Name='journal.json') {
+        $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot $Op) -Force
+        [IO.File]::WriteAllText((Join-Path $recoveryRoot "$Op\$Name"),$Text,[Text.UTF8Encoding]::new($false))
+    }
+    function Get-RunJson([string]$Status,[string]$HomeValue=$desktopRoot) { return (ConvertTo-Json -InputObject ([ordered]@{version=2;status=$Status;home=$HomeValue;id=$script:Id}) -Compress) }
+    $recoverJob=[pscustomobject]@{agent='codex-desktop';home=$desktopRoot}
+    function Get-CodexState([string]$Op) { return (Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId=$Op}).state }
+    $ops=@{}; foreach ($name in 'absent','empty','pending','complete','rolled','resolved','both','broken','foreign') { $ops[$name]=[guid]::NewGuid().ToString('N') }
+    $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot $ops.empty) -Force
+    Write-RunJournal $ops.pending (Get-RunJson 'pending'); Write-RunJournal $ops.complete (Get-RunJson 'complete'); Write-RunJournal $ops.rolled (Get-RunJson 'rolled_back')
+    Write-RunJournal $ops.resolved (Get-RunJson 'pending') 'journal.resolved.json'
+    Write-RunJournal $ops.both (Get-RunJson 'pending'); Write-RunJournal $ops.both (Get-RunJson 'pending') 'journal.resolved.json'
+    Write-RunJournal $ops.broken '{not json'; Write-RunJournal $ops.foreign (Get-RunJson 'pending' 'D:\other-home')
+    $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot 'not-a-record') -Force
+    $expected=@{absent='absent';empty='absent';pending='pending';complete='complete';rolled='rolled_back';resolved='resolved';both='unreadable';broken='unreadable';foreign='unreadable'}
+    foreach ($name in $expected.Keys) { Assert ((Get-CodexState $ops[$name]) -ceq $expected[$name]) "Codex record $name is $($expected[$name])" }
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId='../x'} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed') 'a record name that is not an operation ID is refused'
+    $listed=@((Invoke-Vendor $recoverJob 'recover' @{mode='list'}).records)
+    Assert ((@($listed | ForEach-Object recordId | Sort-Object) -join ',') -eq (@($ops.pending,$ops.both,$ops.broken,$ops.foreign | Sort-Object) -join ',')) 'list shows pending and unreadable records only'
+    $pendingRow=@($listed | Where-Object recordId -eq $ops.pending)[0]
+    Assert ($pendingRow.canRollback -and $pendingRow.nativeId -eq $script:Id -and $pendingRow.sha256 -eq (Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.pending)\journal.json") -Algorithm SHA256).Hash) 'a pending row can be rolled back and carries its record hash'
+    Assert (-not @($listed | Where-Object { $_.recordId -ne $ops.pending -and $_.canRollback }).Count) 'unreadable rows cannot be rolled back'
+    # 되돌리기: pending만 백엔드 recover로 되돌린다. 백엔드가 멈추면 기록은 그대로다.
+    $script:RecoverStatus='busy'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'busy' -and (Get-CodexState $ops.pending) -ceq 'pending') 'an open engine stops the rollback and keeps the record'
+    $script:RecoverStatus='blocked'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and @($failure.Exception.Data['vendorResult'].records).Count -eq 1) 'a changed conversation needs attention and the record is returned'
+    $script:RecoverStatus=$null
+    $rolled=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending}
+    $call=$script:Calls[-1].arguments
+    Assert ($rolled.effect -ceq 'rolled_back' -and $call[0] -ceq 'recover' -and $call[[array]::IndexOf($call,'--run')+1] -ceq (Join-Path $recoveryRoot $ops.pending)) 'rollback runs the backend recover on that record'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending}).effect -ceq 'rolled_back') 'a rolled back record stays rolled back'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.complete} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'unsupported_record') 'a complete record is never rolled back'
+    # 닫기: 창에서 본 해시와 같을 때만 이름을 바꾼다.
+    $brokenHash=(Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.broken)\journal.json") -Algorithm SHA256).Hash
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=('0'*64)} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'changed' -and (Get-CodexState $ops.broken) -ceq 'unreadable') 'a record that differs from what was shown is not closed'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=$brokenHash}).effect -ceq 'resolved' -and (Get-CodexState $ops.broken) -ceq 'resolved') 'an unreadable record is closed when the user saw its content'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=$brokenHash}).effect -ceq 'resolved') 'closing again succeeds'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.both;sha256=$brokenHash} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed' -and [IO.File]::Exists((Join-Path $recoveryRoot "$($ops.both)\journal.json"))) 'a record whose closed name already exists is not overwritten'
+    Remove-Item -LiteralPath $recoveryRoot -Recurse
+    # Claude 복구 기록(S3 명세 3.4절): 작업 ID 이름의 pending에 쓰기 전 상태(prepared)를 남기고, 되돌리기는 확인한 unknown만 한다.
+    $oldClaudeDir=$env:CLAUDE_CONFIG_DIR; $oldJournal=$script:TestJournalRoot; $realClosed=${function:Assert-AgentClosed}
+    try {
+        $env:CLAUDE_CONFIG_DIR=Join-Path $testDirectory 'claude-home'; $script:TestJournalRoot=Join-Path $testDirectory 'claude-recovery'
+        ${function:Assert-AgentClosed}={ param($Agent) if ($script:ClaudeOpen) { throw 'Claude Code를 종료하세요.' } }; $script:ClaudeOpen=$false
+        function Write-ClaudeFile([string]$Path,[string]$Text) { $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path)); [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false)) }
+        function Get-TextSha([string]$Text) { $sha=[Security.Cryptography.SHA256]::Create(); try { Get-ProjectHex ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))) } finally { $sha.Dispose() } }
+        $claudeJob=[pscustomobject]@{agent='claude-code'}
+        function Get-ClaudeState([string]$Op) { return (Invoke-Vendor $claudeJob 'recover' @{mode='status';operationId=$Op}).state }
+        function New-ClaudeCase([string]$Id) {
+            # 복원 전 상태를 만들고 Begin-Restore를 부른 뒤, ctxhop resume이 한 일(대화·옆 폴더 교체, companion 원본)을 흉내 낸다.
+            $folder=Join-Path $env:CLAUDE_CONFIG_DIR 'projects\D--work'
+            $case=@{id=$Id;op=[guid]::NewGuid().ToString('N');conversation=(Join-Path $folder "$Id.jsonl");side=(Join-Path $folder $Id)}
+            Write-ClaudeFile $case.conversation 'conv-before'; Write-ClaudeFile (Join-Path $case.side 'subagents\a.jsonl') 'side-a'; Write-ClaudeFile (Join-Path $case.side 'tool-results\t.txt') 't-before'
+            $case.journal=Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$Id;remoteId='r';projectPath='D:\work';operationId=$case.op})
+            Write-ClaudeFile $case.conversation 'conv-after'; Write-ClaudeFile (Join-Path $case.side 'tool-results\t.txt') 't-after'; Write-ClaudeFile (Join-Path $case.side 'subagents\new.jsonl') 'new'
+            Write-ClaudeFile (Join-Path $script:TestJournalRoot "$($case.op).companion\tool-results\t.txt") 't-before'
+            return $case
+        }
+        $case=New-ClaudeCase '22222222-2222-4222-8222-222222222222'
+        $record=Get-Content -LiteralPath $case.journal -Raw | ConvertFrom-Json
+        Assert ([IO.Path]::GetFileName($case.journal) -ceq "$($case.op).pending.json" -and $record.operationId -ceq $case.op) 'the Claude record is named after the operation ID'
+        Assert ($record.prepared.conversation.before -eq (Get-TextSha 'conv-before') -and (Get-Content -LiteralPath $record.prepared.conversation.beforeCopy -Raw) -eq 'conv-before' -and @($record.prepared.sidecar.files).Count -eq 2) "the record keeps the state before the restore: $($record.prepared | ConvertTo-Json -Compress -Depth 5)"
+        Throws { Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$case.id;remoteId='r';projectPath='D:\work';operationId=$case.op}) } '이미 있어'
+        Throws { Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$case.id;remoteId='r';projectPath='D:\work';operationId='X'}) } '작업 ID'
+        Assert ((Get-ClaudeState $case.op) -ceq 'pending' -and (Get-ClaudeState ([guid]::NewGuid().ToString('N'))) -ceq 'absent') 'a pending record and a missing one'
+        $rows=@((Invoke-Vendor $claudeJob 'recover' @{mode='list'}).records)
+        $classes=@{}; foreach ($file in @($rows[0].files)) { $classes[[IO.Path]::GetFileName($file.target)]=$file.class }
+        Assert ($rows.Count -eq 1 -and $rows[0].canRollback -and $classes['a.jsonl'] -eq 'original' -and $classes['t.txt'] -eq 'unknown' -and $classes['new.jsonl'] -eq 'unknown' -and $classes["$($case.id).jsonl"] -eq 'unknown') "Claude files are never owned; changed and new files are unknown: $($classes | ConvertTo-Json -Compress)"
+        # 확인하지 않은 기본 되돌리기는 아무것도 바꾸지 않는다.
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and (Get-Content -LiteralPath $case.conversation -Raw) -eq 'conv-after' -and (Get-ClaudeState $case.op) -ceq 'pending') 'a rollback without confirmation changes nothing'
+        $script:ClaudeOpen=$true
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'busy') 'an open Claude Code stops the rollback'
+        $script:ClaudeOpen=$false
+        $confirmed=@($rows[0].files | Where-Object class -eq 'unknown' | ForEach-Object { @{target=$_.target;current=$_.current} })
+        $rolled=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op;confirmedUnknown=$confirmed}
+        Assert ($rolled.effect -ceq 'rolled_back' -and (Get-ClaudeState $case.op) -ceq 'rolled_back') 'confirmed unknown files are rolled back and the record says so'
+        Assert ((Get-Content -LiteralPath $case.conversation -Raw) -eq 'conv-before' -and (Get-Content -LiteralPath (Join-Path $case.side 'tool-results\t.txt') -Raw) -eq 't-before' -and -not (Test-Path -LiteralPath (Join-Path $case.side 'subagents\new.jsonl')) -and (Get-Content -LiteralPath (Join-Path $case.side 'subagents\a.jsonl') -Raw) -eq 'side-a') 'the conversation and its companion folder are back as before'
+        $kept=@(Get-ChildItem -LiteralPath (Join-Path $script:TestJournalRoot "$($case.op).rollback\rollback") -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw } | Sort-Object)
+        Assert (($kept -join '|') -eq 'conv-after|new|t-after') "every file moved aside is kept: $($kept -join '|')"
+        # companion에 원본이 없으면 그 파일은 되돌리지 못함으로 남고, 기록은 pending이다.
+        $case=New-ClaudeCase '33333333-3333-4333-8333-333333333333'
+        Remove-Item -LiteralPath (Join-Path $script:TestJournalRoot "$($case.op).companion") -Recurse
+        $row=@((Invoke-Vendor $claudeJob 'recover' @{mode='list'}).records | Where-Object recordId -eq $case.op)[0]
+        $confirmed=@($row.files | Where-Object class -eq 'unknown' | ForEach-Object { @{target=$_.target;current=$_.current} })
+        Assert (@($row.files | Where-Object { $_.class -eq 'unrestorable' -and $_.target -like '*t.txt' }).Count -eq 1) 'a companion file that is missing cannot be rolled back'
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op;confirmedUnknown=$confirmed} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and (Get-ClaudeState $case.op) -ceq 'pending' -and (Get-Content -LiteralPath (Join-Path $case.side 'tool-results\t.txt') -Raw) -eq 't-after') 'the rollback is not complete and the record stays pending'
+        # 닫기: 창에서 본 해시와 같을 때만.
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=('0'*64)} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'changed' -and (Get-ClaudeState $case.op) -ceq 'pending') 'a record that differs from what was shown is not closed'
+        Assert ((Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=$row.sha256}).effect -ceq 'resolved' -and (Get-ClaudeState $case.op) -ceq 'resolved') 'a record is closed when it matches'
+        Assert ((Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=$row.sha256}).effect -ceq 'resolved') 'closing again succeeds'
+        # Complete-Restore가 completed를 옮긴 뒤 pending을 지우기 전에 멈춘 경우: 상태는 complete이고, 다음 작업이 pending을 마무리한다.
+        $op=[guid]::NewGuid().ToString('N'); $twin=@{operationId=$op;nativeId='n';started='s';restoredSha256='x'} | ConvertTo-Json
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.pending.json") (@{operationId=$op;nativeId='n';started='s'} | ConvertTo-Json); Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.completed.json") $twin
+        Assert ((Get-ClaudeState $op) -ceq 'complete') 'a completed record with its pending twin is complete'
+        Assert-NoPending
+        Assert (-not (Test-Path -LiteralPath (Join-Path $script:TestJournalRoot "$op.pending.json")) -and (Get-ClaudeState $op) -ceq 'complete') 'the leftover pending is finished by the next check'
+        $op=[guid]::NewGuid().ToString('N')
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.pending.json") (@{operationId=$op;nativeId='n';started='s'} | ConvertTo-Json); Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.completed.json") (@{operationId=$op;nativeId='other';started='s';restoredSha256='x'} | ConvertTo-Json)
+        Assert ((Get-ClaudeState $op) -ceq 'unreadable') 'a pending with a completed record of another restore is unreadable'
+        Throws { Assert-NoPending } '중단'
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.rolledback.json") '{}'
+        Remove-Item -LiteralPath (Join-Path $script:TestJournalRoot "$op.completed.json")
+        Assert ((Get-ClaudeState $op) -ceq 'unreadable') 'a pending with a rolled back record is unreadable'
+    } finally { $env:CLAUDE_CONFIG_DIR=$oldClaudeDir; $script:TestJournalRoot=$oldJournal; ${function:Assert-AgentClosed}=$realClosed }
     Assert (-not (Test-Path -LiteralPath $previewStage)) 'successful restore removes its plaintext staging copy'
     $odd=Join-Path $staging 'not-a-stage'; $null=New-Item -ItemType Directory -Path $odd
     Assert ((Remove-DesktopStage $odd) -match '지우지 못했습니다' -and (Test-Path -LiteralPath $odd)) 'cleanup refuses folders it did not create'
@@ -168,10 +340,21 @@ try {
     $job.action='Restore'; $job.receipt=$r.receipt; $job.token=$r.preview.token; $job.choice='incoming'; $script:ApplyFail=$true
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
     Assert ((@($failure.Exception.Data['backendResult'].pending) -join '|') -eq 'fixture/.ctxhop-desktop-recovery/run' -and $failure.Exception.Data['vendorResult'].recovery -eq 'required') 'failure must preserve backend recovery journal data and say recovery is required'
+    # 중단된 복원은 목록에 보이고 복원·백업·열기를 막는다(S3 명세 4.3절). 사용자가 되돌리면 풀린다.
+    $journalJob=@{action='Journal';agent='codex-desktop';home=$desktopRoot}
+    $row=@((Invoke-JobCore $journalJob).rows | Where-Object kind -eq 'marker')
+    Assert ($row.Count -eq 1 -and $row[0].state -eq 'pending' -and $row[0].canRollback -and $row[0].sha256 -and $failure.Exception.Data['journal'].operationId -ceq $row[0].operationId) "the interrupted restore is listed with its vendor record: $($row | ConvertTo-Json -Compress -Depth 4)"
+    $blocked=$null; try { $null=Invoke-JobCore @{action='Open';agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id} } catch { $blocked=$_ }
+    Assert ($blocked.Exception.Message -match '중단된 복원') 'open is blocked while a restore is interrupted'
+    $rolled=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$row[0].operationId}
+    Assert ($rolled.outcome -ceq 'rolled_back' -and -not @((Invoke-JobCore $journalJob).rows).Count) "rolling back clears the interrupted restore: $($rolled | ConvertTo-Json -Compress)"
+    $done=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($row[0].operationId).json") -Raw | ConvertFrom-Json
+    Assert ($done.outcome -ceq 'rolled_back' -and $done.vendorState -ceq 'rolled_back') 'the end record says the restore was rolled back'
+    $script:ApplyFail=$false
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
     # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판에, ctxhop 0.2.0-gui.3 고정과
     # Claude 세션 옆 폴더(하위 에이전트·도구 결과) 복원 확인, ctxhop 출력 UTF-8 읽기, 저장소 옮기기를 더한 판과 바이트 동일해야 한다.
-    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '4E601995783B6890901D09C5A0CF4F2B4D71D9618A2D9939310EB8D0379D0CB7') 'Claude worker copy must match the reviewed version'
+    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq 'E4BA86F04447C30C5CA950831FEA2BEC2C2D9995ECD0A18920F695A77FC2D2B4') 'Claude worker copy must match the reviewed version'
     Throws {Assert-FrozenFile (Join-Path $testDirectory 'nonexistent.py') ''} '준비되지'
     Throws {Assert-BundleId '../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'} '잘못된'
     Throws {Assert-BundleId 'peer-a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'} '잘못된'
@@ -218,8 +401,16 @@ try {
                     [IO.File]::WriteAllText($Arguments[[array]::IndexOf($Arguments,'--output')+1],'synthetic archive',[Text.UTF8Encoding]::new($false))
                     return @{metadata=$script:ProjectMeta;folders=@{cwds=$script:Cwds;edits=$script:Edits}}
                 }
-                inspect { return [pscustomobject]@{status='incoming_newer';reason='fixture';token='project-token';source=@{sessionId=$script:Id};target=@{sessionId=$script:Id}} }
-                apply { return @{status=$script:ApplyStatus} }
+                inspect { return [pscustomobject]@{status=$(if ($script:InspectState) {$script:InspectState} else {'incoming_newer'});reason='fixture';token='project-token';source=@{sessionId=$script:Id};target=@{sessionId=$script:Id}} }
+                apply {
+                    # 가져왔으면 백엔드처럼 작업 ID 이름의 run 폴더에 완료 journal을 남긴다. equal·local_newer는 기록이 없다.
+                    if ($script:ApplyStatus -eq 'imported') {
+                        $home2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $home2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+                        $null=New-Item -ItemType Directory -Path $run -Force
+                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$home2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                    }
+                    return @{status=$script:ApplyStatus}
+                }
             }
         }
         function Get-Stored([string]$Mode) { @($script:Store.Values | Where-Object { $_.metadata.historyMode -like $Mode }) }
@@ -316,14 +507,20 @@ try {
         Assert ($recovery -and [IO.File]::ReadAllText("$recovery\0\src\app.py") -eq 'local edit' -and (Test-Path -LiteralPath "$recovery\restore-log.json") -and (Get-Acl -LiteralPath $recovery).AreAccessRulesProtected) 'replaced originals are kept in a private recovery folder'
         Assert (-not (Test-Path -LiteralPath (Split-Path -Parent $shown.receipt)) -and -not (Test-Path -LiteralPath (Split-Path -Parent $shown.project.receipt))) 'the conversation and project preview staging copies are removed after restore'
         # 이 PC 대화가 더 새로우면 파일도 그대로 둔다. 선택을 끄면 복원하지 않는다. 미리보기 뒤 바뀐 파일은 쓰지 않는다.
-        foreach ($case in @(@{status='local_newer';restore=$true},@{status='imported';restore=$false},@{status='imported';restore=$true;tamper=$true})) {
+        foreach ($case in @(@{status='local_newer';restore=$true;preview='local_newer'},@{status='local_newer';restore=$true},@{status='imported';restore=$false},@{status='imported';restore=$true;tamper=$true})) {
             [IO.File]::WriteAllText("$restoreTarget\src\app.py",'local again'); $script:ApplyStatus=$case.status
-            $restore.action='Preview'; $restore.projectRestore=$true; $shown=Invoke-JobCore $restore
+            $script:InspectState=$case.preview; $restore.action='Preview'; $restore.projectRestore=$true; $shown=Invoke-JobCore $restore; $script:InspectState=$null
+            $plans=@(Get-ChildItem -LiteralPath (Get-RecoveryRoot) -Recurse -Filter 'restore-plan.json' -ErrorAction SilentlyContinue).Count
             $restore.action='Restore'; $restore.receipt=$shown.receipt; $restore.token=$shown.preview.token; $restore.projectRestore=$case.restore; $restore.projectReceipt=$shown.project.receipt
             if ($case.tamper) { [IO.File]::AppendAllText($shown.project.folders[0].zip,'x') }
-            $done=Invoke-JobCore ($restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json)   # GUI처럼 JSON을 거쳐 고른 폴더(projectTargets)도 쓴다
+            $applies=@($script:Calls | Where-Object { $_.arguments[0] -eq 'apply' }).Count; $done=$null; $failed=$null
+            try { $done=Invoke-JobCore ($restore | ConvertTo-Json -Depth 5 | ConvertFrom-Json) } catch { $failed=$_ }   # GUI처럼 JSON을 거쳐 고른 폴더(projectTargets)도 쓴다
             Assert ([IO.File]::ReadAllText("$restoreTarget\src\app.py") -eq 'local again' -and -not (Test-Path -LiteralPath (Split-Path -Parent $shown.project.receipt))) "project files stay and the project preview copy is removed for $($case | ConvertTo-Json -Compress)"
-            if ($case.tamper) { Assert ($done.message -match '폴더는 복원하지 못했습니다' -and $done.restored.status -eq 'imported' -and $done.effect -eq 'restored' -and (@($done.project.folders | ForEach-Object state) -join '|') -eq 'failed|restored' -and (Test-Path -LiteralPath "$($done.project.recovery)\restore-log.json")) "a changed download fails only that folder; the others are restored and logged: $($done.message)" }
+            # 받은 파일이 바뀌었으면 쓰기 전에 멈추고 대화도 복원하지 않는다(S3 명세 1절). 이 PC 대화가 더 새로우면 쓴 파일을 되돌린다.
+            if ($case.tamper) { Assert ($failed.Exception.Message -match '대화를 복원하지 않았습니다' -and $failed.Exception.Data['journal'].outcome -ceq 'rolled_back' -and @($script:Calls | Where-Object { $_.arguments[0] -eq 'apply' }).Count -eq $applies) "a changed download stops the restore before the conversation: $($failed.Exception.Message)" }
+            elseif ($case.preview -eq 'local_newer') { Assert ($done.effect -eq 'local_newer' -and $done.message -notmatch '되돌렸습니다' -and @(Get-ChildItem -LiteralPath (Get-RecoveryRoot) -Recurse -Filter 'restore-plan.json').Count -eq $plans) "a preview that says this PC is newer writes no project file: $($done.message)" }
+            elseif ($case.status -eq 'local_newer') { Assert ($done.effect -eq 'local_newer' -and $done.message -match '되돌렸습니다') "files written before a local_newer answer are rolled back: $($done.message)" }
+            else { Assert (-not $failed) "restore without project files: $failed" }
         }
         $script:ApplyStatus='imported'; $restore.projectRestore=$true; $restore.Remove('projectReceipt')
         # 미리보기를 꺼 두면 프로젝트 파일을 받지 않는다.
@@ -334,6 +531,8 @@ try {
         Throws { Read-ProjectReceipt (Join-Path $testDirectory 'project-receipt.json') 'codex-desktop' $script:Id $first.remoteId } '미리보기 기록'
 
         # Claude Code: 대화 작업은 ClaudeWorker(여기서는 가짜)가 하고, 프로젝트 파일은 같은 저장소에 붙는다.
+        # 프로젝트 파일을 쓰기 전의 엔진 검사(guard)는 이 PC에서 실제로 켜진 Claude를 보지 않도록 흉내 낸다.
+        $realAgentClosed=${function:Assert-AgentClosed}; ${function:Assert-AgentClosed}={ param($Agent) }
         Rename-Item -LiteralPath (Join-Path $projects 'lib-moved') -NewName 'lib'
         $claudeId='22222222-2222-4222-8222-222222222222'; $claudeRemote='0123456789abcdefghjkmnpqrs'
         $claudeHome=Join-Path $testDirectory 'claude-projects\D--proj'; $null=New-Item -ItemType Directory -Path "$claudeHome\$claudeId\subagents" -Force
@@ -342,7 +541,7 @@ try {
         [IO.File]::WriteAllLines("$claudeHome\$claudeId\subagents\agent-1.jsonl",[string[]]@('{"cwd":' + (ConvertTo-Json $projB) + '}'),[Text.UTF8Encoding]::new($false))
         function Get-NativeFiles([string]$Agent,[string]$Id) { if ($Id -eq $claudeId) { Get-Item -LiteralPath $script:ClaudeSession } }
         $script:ClaudeCalls=@()
-        $script:ClaudeJobCore={ param($Job) $script:ClaudeCalls+=$Job.action; switch ($Job.action) { Backup {@{message='대화 백업 완료.'}} Preview {@{message='미리보기 완료.';preview=@{session=$Job.nativeId}}} Restore {@{message='복원 완료.';restored=@{session=$Job.nativeId}}} } }
+        $script:ClaudeJobCore={ param($Job) $script:ClaudeCalls+=$Job.action; switch ($Job.action) { Backup {@{message='대화 백업 완료.'}} Preview {@{message='미리보기 완료.';preview=@{session=$Job.nativeId}}} Restore { $root=Get-JournalRoot; $null=New-Item -ItemType Directory -Path $root -Force; [IO.File]::WriteAllText((Join-Path $root "$($Job.operationId).completed.json"),(@{operationId=$Job.operationId;nativeId=$Job.nativeId;restoredSha256='x'} | ConvertTo-Json)); @{message='복원 완료.';restored=@{session=$Job.nativeId}}} } }
         $claude=@{action='Backup';agent='claude-code';projectPath=$projA;nativeId=$claudeId;remoteId=$claudeRemote;projectBackup=$true}
         # 받는 쪽 한도(압축 전 16GiB)를 넘는 폴더도 올리기 전에 묻는다(한도를 낮춰 확인).
         $script:ProjectAskBytes=1; $script:ProjectMaxBytes=6
@@ -465,7 +664,7 @@ try {
         $claude.projectRestore=$false; $claude.action='Preview'; $cp=Invoke-JobCore $claude
         Assert ($cp.project.state -eq 'off') 'Claude preview skips project files when the option is off'
         Assert (Test-StagingClean) 'no plaintext project copy remains in staging'
-    } finally { $env:TMP=$oldTmp; $env:TEMP=$oldTemp; $env:GIT_CEILING_DIRECTORIES=$oldCeiling }
+    } finally { $env:TMP=$oldTmp; $env:TEMP=$oldTemp; $env:GIT_CEILING_DIRECTORIES=$oldCeiling; if ($realAgentClosed) { ${function:Assert-AgentClosed}=$realAgentClosed } }
     # GUI처럼 Worker.ps1을 별도 프로세스로 실행해 요청·결과 경로가 ClaudeWorker dot-source 뒤에도 남는지 확인한다.
     $request=Join-Path $testDirectory 'request.json'; $result=Join-Path $testDirectory 'result.json'
     @{action='Open';agent='codex-desktop';home=$desktopRoot} | ConvertTo-Json | Set-Content -LiteralPath $request -Encoding UTF8
@@ -474,9 +673,314 @@ try {
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($answer.ok -eq $false -and $answer.error -match 'Codex Desktop') 'Worker process reports the job error in the result file'
     Assert ($answer.vendor.status -eq 'unsupported' -and $answer.vendor.reasonCode -eq 'open_manually' -and $null -eq $answer.vendorOutcome) 'the result file keeps the contract status and reason code for the GUI'
+    # Worker가 어떻게 끝나든 벤더 구현·백엔드 같은 자손도 함께 끝나야, 다음 Worker가 작업 mutex만으로 앞 작업의 writer가 없다고 볼 수 있다.
+    # Job 객체를 켜기 전에는 복원을 거부하는지도 같은 프로세스에서 본다.
+    $probe=Join-Path $testDirectory 'job-probe.ps1'; $pidFile=Join-Path $testDirectory 'job-child.txt'
+    Set-Content -LiteralPath $probe -Encoding UTF8 -Value @'
+param([string]$Package,[string]$PidFile)
+. (Join-Path $Package 'Worker.ps1') -LibraryOnly
+$before=try { Assert-WorkerJob; 'allowed' } catch { 'refused' }
+Enable-WorkerJob
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start.UseShellExecute=$false; $start.CreateNoWindow=$true
+$child=[Diagnostics.Process]::Start($start)
+[IO.File]::WriteAllText($PidFile,"$($child.Id) $before")
+Start-Sleep 120
+'@
+    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+    $probeWorker=[Diagnostics.Process]::Start($start)
+    try {
+        for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $pidFile); $i++) { Start-Sleep -Milliseconds 250 }
+        Start-Sleep -Milliseconds 300
+        $childId,$before=(Get-Content -LiteralPath $pidFile -Raw).Trim() -split ' '
+        Assert ($before -eq 'refused') 'restore is refused until the worker runs inside its Job object'
+        Assert ([bool](Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue)) 'the helper process runs while the worker runs'
+        $probeWorker.Kill(); $probeWorker.WaitForExit()
+        for ($i=0; $i -lt 40 -and (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
+        Assert (-not (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue)) 'a killed worker takes its helper processes with it (Job object)'
+    } finally { if (-not $probeWorker.HasExited) { $probeWorker.Kill() }; $probeWorker.Dispose() }
+    # 다음 Worker의 writer 확인(S3 명세 2.2절): 표지에 적힌 Worker가 살아 있으면 busy, Job이 사라졌으면 gone,
+    # Worker 없이 자손만 남았으면 Job째 끝내고 gone. 이름 형식이 틀리면 busy.
+    $fieldsFile=Join-Path $testDirectory 'job-fields.json'
+    Set-Content -LiteralPath $probe -Encoding UTF8 -Value @'
+param([string]$Package,[string]$PidFile)
+. (Join-Path $Package 'Worker.ps1') -LibraryOnly
+Enable-WorkerJob
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start.UseShellExecute=$false; $start.CreateNoWindow=$true
+$child=[Diagnostics.Process]::Start($start)
+$fields=Get-WorkerFields; $fields.child=$child.Id
+[IO.File]::WriteAllText($PidFile,(ConvertTo-Json -InputObject $fields))
+Start-Sleep 120
+'@
+    function Start-JobProbe {
+        if (Test-Path -LiteralPath $fieldsFile) { Remove-Item -LiteralPath $fieldsFile }
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
+        $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+        $process=[Diagnostics.Process]::Start($start)
+        for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $fieldsFile); $i++) { Start-Sleep -Milliseconds 250 }
+        Start-Sleep -Milliseconds 300
+        return @{process=$process;marker=(Get-Content -LiteralPath $fieldsFile -Raw | ConvertFrom-Json)}
+    }
+    # 끝났지만 아직 목록에 남은 프로세스는 살아 있지 않은 것으로 본다(핸들로 종료 여부를 확인).
+    function Test-Alive([int]$Id) { try { $process=[Diagnostics.Process]::GetProcessById($Id); try { return -not $process.HasExited } finally { $process.Dispose() } } catch { return $false } }
+    $probeRun=Start-JobProbe
+    try {
+        Assert ($probeRun.marker.workerJob -match '^Local\\CtxHopGUI-worker-[0-9a-f]{32}$' -and $probeRun.marker.workerStarted) "the marker names the worker's Job: $($probeRun.marker | ConvertTo-Json -Compress)"
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'busy' -and (Test-Alive $probeRun.marker.child)) 'a live worker is busy and nothing is stopped'
+        $held=[CtxHopWorkerJob]::Open($probeRun.marker.workerJob)
+        try {
+            # 이 시험이 Job 핸들을 쥐고 있으면 Worker가 끝나도 자손이 남는다(주인 없는 writer).
+            $probeRun.process.Kill(); $probeRun.process.WaitForExit()
+            Start-Sleep -Milliseconds 300
+            Assert (Test-Alive $probeRun.marker.child) 'an orphan writer survives while another handle holds the Job'
+            Assert ((Test-WorkerWritersGone $probeRun.marker 10) -eq 'gone' -and -not (Test-Alive $probeRun.marker.child)) 'an orphan writer is ended with its Job before anything else runs'
+        } finally { [CtxHopWorkerJob]::Close($held) }
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'gone') 'a Job that no longer exists means no writer is left'
+        Assert ((Test-WorkerWritersGone ([pscustomobject]@{workerJob='Global\other';workerPid=1;workerStarted='1'}) 5) -eq 'busy') 'a marker with a foreign Job name is busy'
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill() }; $probeRun.process.Dispose() }
+    $probeRun=Start-JobProbe
+    try {
+        $probeRun.process.Kill(); $probeRun.process.WaitForExit()
+        for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'gone' -and -not (Test-Alive $probeRun.marker.child)) 'a killed worker leaves no Job and no writer'
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill() }; $probeRun.process.Dispose() }
+    # 정상 경로: 자손이 스스로 끝나면 alone. 남으면 이 Job 소속만 끝내고(손자 포함) 목록을 다시 받는다.
+    Assert ((Get-WorkerFields).workerJob -ceq [CtxHopWorkerJob]::Name -and (Test-WorkerWritersGone ([pscustomobject](Get-WorkerFields)) 1) -eq 'gone') 'the worker itself is never a foreign writer'
+    function Start-Helper([string]$Command) {
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -Command $Command")
+        $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+        return [Diagnostics.Process]::Start($start)
+    }
+    $helper=Start-Helper 'Start-Sleep -Milliseconds 800'
+    Assert ((Wait-WorkerJobAlone 30 5) -eq 'alone') 'a helper that ends by itself leaves the worker alone'
+    $helper.Dispose()
+    $grandFile=Join-Path $testDirectory 'grandchild.txt'
+    $helper=Start-Helper "`$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 120'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$g=[Diagnostics.Process]::Start(`$s); [IO.File]::WriteAllText('$grandFile',[string]`$g.Id); Start-Sleep 120"
+    for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $grandFile); $i++) { Start-Sleep -Milliseconds 250 }
+    $grandchild=[int](Get-Content -LiteralPath $grandFile -Raw)
+    Assert ((Wait-WorkerJobAlone 1 10) -eq 'killed' -and -not (Test-Alive $helper.Id) -and -not (Test-Alive $grandchild)) 'helpers left after the wait are ended with their own children'
+    $helper.Dispose()
+    # 결정표(S3 명세 2.5절): 벤더 상태를 먼저 보고 프로젝트는 그다음이다. 자동 정리는 complete뿐이고 나머지는 사용자가 누를 때만 한다.
+    $caseRoot=Join-Path $testDirectory 'journal-cases'
+    function Invoke-DesktopBackend([string[]]$Arguments) {
+        # 이 절의 백엔드는 recover만 흉내 낸다(백엔드처럼 journal을 rolled_back으로 바꾼다).
+        switch ($Arguments[0]) {
+            recover {
+                if ($script:RecoverStatus) { $e=[InvalidOperationException]::new('중단 뒤 세션 파일이 변경됐습니다.'); $e.Data['backendResult']=[pscustomobject]@{status=$script:RecoverStatus;reason='fixture';token=$null}; throw $e }
+                $journal=Join-Path $Arguments[[array]::IndexOf($Arguments,'--run')+1] 'journal.json'
+                $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json; $record.status='rolled_back'
+                [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
+                return @{status='rolled_back';id=$record.id;members=1}
+            }
+            guard {
+                if ($script:GuardBusy) { $e=[InvalidOperationException]::new('Codex 앱/CLI/IDE를 모두 종료하세요.'); $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='writer';token=$null}; throw $e }
+                return @{status='closed';engine='fixture'}
+            }
+            default { throw "unexpected backend operation $($Arguments[0])" }
+        }
+    }
+    $script:RecoveryRootForCases=Join-Path $desktopRoot '.ctxhop-desktop-recovery'
+    function Set-RunState([string]$Op,[string]$State) {
+        $run=Join-Path $script:RecoveryRootForCases $Op; $null=New-Item -ItemType Directory -Path $run -Force
+        foreach ($name in 'journal.json','journal.resolved.json') { $file=Join-Path $run $name; if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file } }
+        $json=ConvertTo-Json -InputObject ([ordered]@{version=2;status=$State;home=$desktopRoot;id=$script:Id}) -Compress
+        switch ($State) { absent {} unreadable { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),'{bad') } resolved { [IO.File]::WriteAllText((Join-Path $run 'journal.resolved.json'),$json) } default { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),$json) } }
+    }
+    function New-JournalCase([string]$Name,[string]$State,[string]$Phase='conversation') {
+        # 프로젝트 파일 하나(a.txt: old → new)를 실제 계획대로 쓴 뒤, 벤더 run 폴더를 $State로 둔 복원 기록.
+        $source=Join-Path $caseRoot "$Name-src"; $target=Join-Path $caseRoot "$Name-dst"
+        foreach ($pair in @(@($source,'new'),@($target,'old'))) { $null=New-Item -ItemType Directory -Path $pair[0] -Force; [IO.File]::WriteAllText((Join-Path $pair[0] 'a.txt'),$pair[1]) }
+        $zip=Join-Path $caseRoot "$Name.zip"; $null=New-ProjectSnapshot (Get-ProjectFileList $source) $zip
+        $op=[guid]::NewGuid().ToString('N')
+        $recovery=New-PrivateFolder (Join-Path (Get-RecoveryRoot) $op)
+        $marker=New-Marker ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id;remoteId=$script:BundleA}) $op @($target) $recovery 'project' $null ''
+        $folder=[pscustomobject]@{index=0;role='start';sourcePath=$source;target=$target;zip=$zip;sha256=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash}
+        $null=Invoke-ProjectFolders $marker @($folder)
+        $marker.phase=$Phase; Save-Marker $marker
+        Set-RunState $op $State
+        return @{op=$op;file=(Join-Path $target 'a.txt');marker=$marker}
+    }
+    function Get-Journal { return (Invoke-JobCore @{action='Journal';agent='codex-desktop';home=$desktopRoot}) }
+    function Get-Row([string]$Op) { return ,@((Get-Journal).rows | Where-Object { $_.operationId -ceq $Op }) }   # 한 행이어도 배열로 돌려준다
+    function Get-Done([string]$Op) { $file=Join-Path $testDirectory "CtxHopGUI\journal\done\$Op.json"; if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } }
+    function Invoke-Rollback([string]$Op) { $r=$null; try { $r=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$Op} } catch { $r=[pscustomobject]@{outcome='error';message=$_.Exception.Message} }; return $r }
+    # 응답을 잃은 뒤 complete: 목록이 프로젝트를 되돌리지 않고 completed로 끝낸다.
+    $c=New-JournalCase 'complete' 'complete'
+    Assert (-not (Get-Row $c.op).Count -and (Get-Done $c.op).outcome -ceq 'completed' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'a complete conversation is cleaned up as completed and project files stay'
+    $c=New-JournalCase 'complete-early' 'complete' 'project'
+    $row=Get-Row $c.op
+    Assert ($row.Count -eq 1 -and $row[0].error -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Get-Done $c.op)) 'a complete conversation without project evidence needs attention and nothing is rolled back'
+    Assert ((Invoke-Rollback $c.op).outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'even a user rollback never rolls project files back under a complete conversation'
+    # absent: 목록은 기다리고, 사용자가 누르면 프로젝트를 되돌린다.
+    $c=New-JournalCase 'absent' 'absent'
+    $row=Get-Row $c.op
+    Assert ($row.Count -eq 1 -and $row[0].state -ceq 'absent' -and $row[0].canRollback -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and @($row[0].files | Where-Object class -eq 'owned').Count -eq 1) 'an absent conversation waits for the user and shows the files it wrote'
+    Assert ((Invoke-Rollback $c.op).outcome -ceq 'rolled_back' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and (Get-Done $c.op).outcome -ceq 'rolled_back' -and -not (Get-Row $c.op).Count) 'rolling back an absent conversation restores the project files'
+    # pending: 사용자가 누르면 프로젝트를 먼저, 그다음 대화를 되돌린다.
+    $c=New-JournalCase 'pending' 'pending'
+    Assert ((Get-Row $c.op)[0].state -ceq 'pending' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'a pending conversation is never rolled back automatically'
+    $r=Invoke-Rollback $c.op
+    Assert ($r.outcome -ceq 'rolled_back' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and (Get-CodexState $c.op) -ceq 'rolled_back' -and (Get-Done $c.op).vendorState -ceq 'rolled_back') "a user rollback undoes the project and then the conversation: $($r.message)"
+    # resolved: 사용자가 누르면 프로젝트만 되돌리고 결과는 resolved다.
+    $c=New-JournalCase 'resolved' 'resolved'
+    Assert ((Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and (Get-Row $c.op).Count -eq 1) 'a resolved conversation record is not cleaned up automatically'
+    Assert ((Invoke-Rollback $c.op).outcome -ceq 'resolved' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and (Get-CodexState $c.op) -ceq 'resolved') 'a user rollback of a resolved record undoes only the project files'
+    # unreadable·조회 실패: 아무것도 바꾸지 않는다. 조회가 실패하면 닫지도 않는다.
+    $c=New-JournalCase 'unreadable' 'unreadable'
+    Assert ((Invoke-Rollback $c.op).outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'an unreadable conversation record changes nothing'
+    $c=New-JournalCase 'lost-home' 'pending'
+    $c.marker.home=Join-Path $testDirectory 'missing-home'; Save-Marker $c.marker
+    Assert ((Get-Row $c.op)[0].state -ceq 'failed' -and (Invoke-Rollback $c.op).outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'a record that cannot be queried changes nothing'
+    $closed=$null; try { $null=Invoke-JobCore @{action='CloseJournal';agent='codex-desktop';home=$desktopRoot;operationId=$c.op;sha256='x'} } catch { $closed=$_ }
+    Assert ($closed -and (Get-Row $c.op).Count -eq 1) 'a record that cannot be queried is not closed'
+    # 닫기: 사용자가 본 벤더 기록 해시와 같을 때만 벤더를 resolved로 닫고 종료 기록을 쓴다.
+    $c=New-JournalCase 'close' 'pending'
+    $row=(Get-Row $c.op)[0]
+    $closed=$null; try { $null=Invoke-JobCore @{action='CloseJournal';agent='codex-desktop';home=$desktopRoot;operationId=$c.op;sha256=('0'*64)} } catch { $closed=$_ }
+    Assert ($closed -and (Get-CodexState $c.op) -ceq 'pending') 'closing with a different record hash changes nothing'
+    $close=Invoke-JobCore @{action='CloseJournal';agent='codex-desktop';home=$desktopRoot;operationId=$c.op;sha256=$row.sha256}
+    $done=Get-Done $c.op
+    Assert ($close.outcome -ceq 'resolved' -and (Get-CodexState $c.op) -ceq 'resolved' -and $done.outcome -ceq 'resolved' -and @($done.project.remaining).Count -eq 1 -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Get-Row $c.op).Count) 'closing as resolved keeps the files and lists what was left'
+    # 벤더 resolve 뒤, 종료 기록 전에 멈춘 경우: 목록에 남고, 다음 닫기가 벤더 resolved를 보고 이어서 끝낸다.
+    $c=New-JournalCase 'close-resume' 'pending'
+    $sha=(Get-Row $c.op)[0].sha256
+    $null=Invoke-Vendor ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot}) 'recover' @{mode='resolve';recordId=$c.op;sha256=$sha}
+    Assert ((Get-Row $c.op)[0].state -ceq 'resolved') 'a record resolved before its end record stays listed'
+    $close=Invoke-JobCore @{action='CloseJournal';agent='codex-desktop';home=$desktopRoot;operationId=$c.op;sha256=$sha}
+    Assert ($close.outcome -ceq 'resolved' -and (Get-Done $c.op).vendorState -ceq 'resolved' -and -not (Get-Row $c.op).Count) 'the next close finishes a close that stopped after the vendor step'
+    # 다른 Worker가 살아 있으면 busy: 아무것도 바꾸지 않는다.
+    $c=New-JournalCase 'busy' 'absent'
+    $probeRun=Start-JobProbe
+    try {
+        foreach ($field in 'workerJob','workerPid','workerStarted') { $c.marker[$field]=$probeRun.marker.$field }; Save-Marker $c.marker
+        Assert ((Get-Row $c.op)[0].state -ceq 'busy' -and (Invoke-Rollback $c.op).outcome -ceq 'error' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'a live earlier worker makes the record busy and nothing changes'
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill(); $probeRun.process.WaitForExit() }; $probeRun.process.Dispose() }
+    for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
+    $r=Invoke-Rollback $c.op
+    $after=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($c.op).json") -Raw | ConvertFrom-Json
+    Assert ($r.outcome -ceq 'rolled_back' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and $after.outcome -ceq 'rolled_back') 'after the earlier worker is gone the next worker takes the record over and rolls back'
+    # R38-01: 벤더 구현이 끝난 뒤에도 그 자손이 쓰고 있을 수 있다. 자손이 끝난 뒤 새로 읽은 상태로 판단해야 한다.
+    $completeJson=Join-Path $caseRoot 'complete-journal.json'
+    [IO.File]::WriteAllText($completeJson,(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$desktopRoot;id=$script:Id}) -Compress))
+    $c=New-JournalCase 'late-writer' 'absent'
+    $late=Start-Helper "Start-Sleep -Seconds 2; Copy-Item -LiteralPath '$completeJson' -Destination '$(Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json")'"
+    $outcome=Complete-RestoreMarker $c.marker $false $false
+    Assert ($outcome -ceq 'completed' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and (Get-Done $c.op).outcome -ceq 'completed') "a conversation finished by a late helper is completed, not rolled back: $outcome"
+    $late.Dispose()
+    $c=New-JournalCase 'stuck-writer' 'absent'
+    $journalPath=Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json"
+    $stuck=Start-Helper "Start-Sleep -Seconds 60; Copy-Item -LiteralPath '$completeJson' -Destination '$journalPath'"
+    $script:WorkerWaitSec=1; $script:WorkerKillSec=10
+    try { $outcome=Complete-RestoreMarker $c.marker $false $false } finally { $script:WorkerWaitSec=60; $script:WorkerKillSec=30 }
+    Assert ($outcome -ceq 'attention' -and -not (Test-Alive $stuck.Id) -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Get-Done $c.op) -and -not (Test-Path -LiteralPath $journalPath) -and (Get-Row $c.op).Count -eq 1) 'a helper that had to be ended leaves the record for review and rolls nothing back'
+    $stuck.Dispose()
+    # R38-02: 프로젝트 파일을 되돌리기 전에 엔진 guard를 부른다. 열려 있으면 파일·벤더 모두 그대로다.
+    foreach ($state in 'absent','pending','resolved') {
+        $c=New-JournalCase "guard-$state" $state
+        $script:GuardBusy=$true
+        try { $r=Invoke-Rollback $c.op } finally { $script:GuardBusy=$false }
+        $recovery=$c.marker.projectRecovery
+        Assert ($r.outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $recovery 'rollback.json')) -and (Get-CodexState $c.op) -ceq $(if ($state -eq 'absent') {'absent'} else {$state})) "an open engine stops the $state rollback before any project write"
+        Assert ((Invoke-Rollback $c.op).outcome -cin @('rolled_back','resolved') -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old') "the $state rollback goes through once the engine is closed"
+    }
+    $c=New-JournalCase 'guard-restore' 'absent'
+    $script:GuardBusy=$true
+    try { $outcome=Complete-RestoreMarker $c.marker $true $false } finally { $script:GuardBusy=$false }
+    Assert ($outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'an engine opened during the restore stops the automatic rollback'
+    $null=Invoke-Rollback $c.op
+    # 시작 시각: 없는 PID는 빈 값, 있는데 읽을 수 없는 프로세스(PID 0은 누구도 열 수 없음)는 예외다.
+    $unused=1; while (Get-Process -Id $unused -ErrorAction SilentlyContinue) { $unused+=4 }
+    Assert ((Get-WorkerStarted $unused) -eq '') 'a PID that is not running has no start time'
+    Throws { Get-WorkerStarted 0 } '.'
+    # r37 근거 보강: 살아 있는 앞 Worker의 시작 시각을 읽지 못하면 끝났다고 보지 않는다(busy, 아무것도 끝내지 않음).
+    $probeRun=Start-JobProbe
+    try {
+        $marker=[ordered]@{workerJob=$probeRun.marker.workerJob;workerPid=$probeRun.marker.workerPid;workerStarted='1'}
+        $realStarted=${function:Get-WorkerStarted}
+        ${function:Get-WorkerStarted}={ param([int]$ProcessId) throw 'access denied' }
+        try { $seen=Test-WorkerWritersGone $marker 5 } finally { ${function:Get-WorkerStarted}=$realStarted }
+        Assert ($seen -eq 'busy' -and (Test-Alive $probeRun.marker.child) -and (Test-Alive $probeRun.marker.workerPid)) 'a worker whose start time cannot be read is busy and nothing is ended'
+        # abandoned mutex: mutex를 가진 스레드만 끝났고 앞 Worker는 살아 있다. 다음 작업은 mutex를 얻어도 busy이고 쓰기 0이다.
+        if (-not ('CtxHopAbandon' -as [type])) { Add-Type -TypeDefinition 'using System.Threading; public static class CtxHopAbandon { public static void Run(string name) { var t = new Thread(() => { var m = new Mutex(false, name); m.WaitOne(); }); t.Start(); t.Join(); } }' }
+        $mutexName="Local\CtxHopGUI-test-$([guid]::NewGuid().ToString('N'))"
+        [CtxHopAbandon]::Run($mutexName)
+        $realMutexName=${function:Get-OperationMutexName}
+        ${function:Get-OperationMutexName}=[scriptblock]::Create("'$mutexName'")
+        $c=New-JournalCase 'abandoned' 'absent'
+        foreach ($field in 'workerJob','workerPid','workerStarted') { $c.marker[$field]=$probeRun.marker.$field }; Save-Marker $c.marker
+        try { $blocked=$null; try { $null=Invoke-Job @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$c.op} } catch { $blocked=$_ } } finally { ${function:Get-OperationMutexName}=$realMutexName }
+        Assert ($blocked.Exception.Message -match (T 'WkJournalBusy').Substring(0,10) -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $c.marker.projectRecovery 'rollback.json'))) "an abandoned mutex with a live earlier worker is busy and writes nothing: $($blocked.Exception.Message)"
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill(); $probeRun.process.WaitForExit() }; $probeRun.process.Dispose() }
+    for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
+    $null=Invoke-Rollback $c.op
+    # 끝내는 도중에도 새 자손이 계속 생기면, 목록을 다시 전부 받아 새로 생긴 것까지 끝낸다.
+    $spawnFile=Join-Path $caseRoot 'spawned.txt'
+    $spawner=Start-Helper "for (`$i=0; `$i -lt 200; `$i++) { `$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 60'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$p=[Diagnostics.Process]::Start(`$s); Add-Content -LiteralPath '$spawnFile' -Value `$p.Id; Start-Sleep -Milliseconds 150 }"
+    for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $spawnFile); $i++) { Start-Sleep -Milliseconds 250 }
+    Start-Sleep -Milliseconds 600
+    $result=Wait-WorkerJobAlone 1 20
+    $spawned=@(Get-Content -LiteralPath $spawnFile | ForEach-Object { [int]$_ })
+    Assert ($result -eq 'killed' -and -not (Test-Alive $spawner.Id) -and -not @($spawned | Where-Object { Test-Alive $_ }).Count -and $spawned.Count -ge 2) "helpers that keep starting children are ended together with every child: $result, $($spawned.Count) children"
+    $spawner.Dispose()
+    # 종료 기록이 다른 작업의 것이면 표지를 지우지 않는다.
+    $c=New-JournalCase 'done-mismatch' 'absent'
+    $null=[IO.Directory]::CreateDirectory((Join-Path $testDirectory 'CtxHopGUI\journal\done'))
+    [IO.File]::WriteAllText((Join-Path $testDirectory "CtxHopGUI\journal\done\$($c.op).json"),(@{version=1;operationId=$c.op;agent='claude-code';home=$desktopRoot;outcome='rolled_back';vendorState='absent';project=@{complete=$true}} | ConvertTo-Json))
+    Assert ((Get-Row $c.op).Count -eq 1) 'an end record of another restore never removes the marker'
+    $null=Invoke-Rollback $c.op
+    Assert (-not (Get-Row $c.op).Count -and (Get-Done $c.op).agent -ceq 'codex-desktop') 'the rollback writes its own end record over the foreign one'
+    # 표지 없는 벤더 기록: 최소 표지는 새 operationId를 받지만 조회·되돌리기는 원래 기록으로 한다(R37-N1).
+    $orphan=[guid]::NewGuid().ToString('N'); Set-RunState $orphan 'pending'
+    $vendorRow=@((Get-Journal).rows | Where-Object { $_.kind -eq 'vendor' -and $_.recordRef -ceq $orphan })
+    Assert ($vendorRow.Count -eq 1 -and $vendorRow[0].canRollback) 'a vendor record without a marker is listed on its own'
+    $script:RecoverStatus='blocked'
+    $first=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;recordId=$orphan}
+    $script:RecoverStatus=$null
+    $minimal=@((Get-Journal).rows | Where-Object { $_.recordRef -ceq $orphan })
+    Assert ($first.outcome -ceq 'attention' -and $minimal.Count -eq 1 -and $minimal[0].kind -eq 'marker' -and $minimal[0].operationId -cne $orphan -and $minimal[0].state -ceq 'pending') "an interrupted rollback leaves a minimal marker that still reads the original record: $($minimal | ConvertTo-Json -Compress -Depth 3)"
+    $second=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;recordId=$orphan}
+    Assert ($second.outcome -ceq 'rolled_back' -and $second.operationId -ceq $minimal[0].operationId -and (Get-CodexState $orphan) -ceq 'rolled_back' -and (Get-Done $second.operationId).recordRef -ceq $orphan) 'the retry reuses the minimal marker and rolls the original record back'
+    # 예전 판 프로젝트 기록: 성공은 넣지 않고, 실패·읽을 수 없음은 해시를 확인해 닫을 때까지 막는다.
+    function New-OldLog([string]$Text) { $folder=Join-Path (Get-RecoveryRoot) ([guid]::NewGuid().ToString('N')); $null=New-Item -ItemType Directory -Path $folder -Force; [IO.File]::WriteAllText((Join-Path $folder 'restore-log.json'),$Text); return $folder }
+    $ok=New-OldLog (@{agent='codex-desktop';sessionId=$script:Id;folders=@(@{state='restored';failed=@()},@{state='skipped';failed=@()})} | ConvertTo-Json -Depth 4)
+    $bad=New-OldLog (@{agent='codex-desktop';sessionId=$script:Id;folders=@(@{state='restored';failed=@(@{path='a.txt';reason='x'})})} | ConvertTo-Json -Depth 4)
+    $broken=New-OldLog '{bad'
+    $projectRows=@((Get-Journal).rows | Where-Object kind -eq 'project')
+    Assert (-not @($projectRows | Where-Object path -eq $ok).Count -and @($projectRows | Where-Object { $_.path -eq $bad -and $_.state -eq 'failed' }).Count -eq 1 -and @($projectRows | Where-Object { $_.path -eq $broken -and $_.state -eq 'unreadable' }).Count -eq 1) 'old project logs: success is not listed, failed and unreadable are'
+    $blocked=$null; try { $null=Invoke-JobCore @{action='Open';agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id} } catch { $blocked=$_ }
+    Assert ($blocked.Exception.Message -match '중단된 복원') 'a failed old project log blocks open'
+    foreach ($folder in $bad,$broken) {
+        $sha=(Get-FileHash -LiteralPath (Join-Path $folder 'restore-log.json') -Algorithm SHA256).Hash
+        $closed=$null; try { $null=Invoke-JobCore @{action='CloseJournal';home=$desktopRoot;projectRecord=$folder;sha256=('0'*64)} } catch { $closed=$_ }
+        Assert ($closed -and -not (Test-Path -LiteralPath (Join-Path $folder 'resolved.json'))) 'an old project log is not closed with a different hash'
+        Assert ((Invoke-JobCore @{action='CloseJournal';home=$desktopRoot;projectRecord=$folder;sha256=$sha}).outcome -ceq 'resolved') 'an old project log is closed when its hash matches'
+    }
+    # 남은 기록(확인이 필요한 complete, 읽을 수 없는 기록, 조회 실패)은 해결했다고 닫는다. 조회 실패는 홈을 되돌린 뒤에만 닫힌다.
+    $lost=@(Read-Markers | Where-Object { $_.marker -and $_.marker.home -like '*missing-home' })[0].marker; $lost.home=$desktopRoot; Save-Marker $lost
+    foreach ($row in @((Get-Journal).rows)) {
+        $request=@{action='CloseJournal';agent=$row.agent;home=$desktopRoot;sha256=$row.sha256}
+        if ($row.kind -eq 'marker') { $request.operationId=$row.operationId } elseif ($row.kind -eq 'vendor') { $request.recordId=$row.recordRef } else { $request.projectRecord=$row.recordRef }
+        Assert ((Invoke-JobCore $request).outcome -ceq 'resolved') "every remaining record can be closed as resolved: $($row | ConvertTo-Json -Compress -Depth 2)"
+    }
+    Assert (-not @((Get-Journal).rows).Count) 'nothing is left open after every record was handled'
+    $blocked=$null; try { $null=Invoke-JobCore @{action='Open';agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id} } catch { $blocked=$_ }
+    Assert ($blocked.Exception.Message -notmatch '중단된 복원') 'open is no longer blocked by interrupted restores'
+    [IO.File]::AppendAllText((Join-Path $bad 'restore-log.json'),' ')
+    Assert (@((Get-Journal).rows | Where-Object path -eq $bad).Count -eq 1) 'a log that changed after it was closed is listed again'
+    $sha=(Get-FileHash -LiteralPath (Join-Path $bad 'restore-log.json') -Algorithm SHA256).Hash
+    $null=Invoke-JobCore @{action='CloseJournal';home=$desktopRoot;projectRecord=$bad;sha256=$sha}
+    # 겹치는 복원 폴더는 쓰기 전에 거부한다.
+    $overlap=Join-Path $testDirectory 'overlap'
+    foreach ($pair in @(@(@($overlap,$overlap),''),@(@($overlap,(Join-Path $overlap 'child')),''),@(@($overlap),$overlap),@(@((Join-Path $env:USERPROFILE '.codex\x')),''),@(@((Join-Path $testDirectory 'CtxHopGUI\x')),''))) {
+        Throws { Assert-ProjectTargetsSeparate $pair[0] $pair[1] } '겹치'
+    }
+    Assert-ProjectTargetsSeparate @($overlap,(Join-Path $testDirectory 'overlap-2')) $desktopRoot
+    Remove-Item -LiteralPath $script:RecoveryRootForCases -Recurse -Force
     Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
 } finally {
-    $env:LOCALAPPDATA=$oldLocal
+    $env:LOCALAPPDATA=$oldLocal; $env:CODEX_HOME=$oldCodexHome
     $resolved=[IO.Path]::GetFullPath($testDirectory); $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
     if (-not $resolved.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($resolved) -notmatch '^CtxHop-vnext-worker-[a-f0-9]{32}$') { throw 'Refusing cleanup outside fixture directory' }
     if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }

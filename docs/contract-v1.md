@@ -39,7 +39,7 @@ Worker(`Worker.ps1`)가 벤더 구현을 부르는 방법입니다. 벤더를 �
     - 잘못된 요청의 예: 인수 형식, 16 MiB 초과, `protocolVersion`이 정수 1이 아님, CLI의 op와 요청의 `op`가 다름, `requestId`가 GUID가 아님
   - 그 밖의 값: 구현이 비정상으로 끝났습니다.
 - **시간 제한**:
-  - `probe` 120초, `list`·`describe` 1800초
+  - `probe`·`guard` 120초, `list`·`describe` 1800초
   - `backup`, `preview`, `restore`, `open`, `recover`는 제한이 없습니다. 암호 입력이나 대화 창을 기다릴 수 있기 때문입니다. 백업과 미리보기는 GUI의 취소로 멈춥니다. 복원·열기는 GUI가 취소를 막습니다.
   - 시간이 넘으면 Worker는 구현 프로세스와 그 자식 프로세스를 부모-자식 관계로만 끝냅니다(`taskkill /T`). 이름으로 찾아 다른 프로세스를 끝내지 않습니다.
   - ponytail: 이미 부모가 끝나 떨어져 나간 손자 프로세스는 찾지 못합니다. 그 경우는 각 벤더의 쓰기 잠금과 복구 기록이 막습니다.
@@ -94,6 +94,7 @@ Worker(`Worker.ps1`)가 벤더 구현을 부르는 방법입니다. 벤더를 �
 | `describe` | `ok`, `busy`, `unsupported`, `failed` |
 | `backup` | `ok`, `busy`, `changed`, `unsupported`, `failed` |
 | `preview`, `restore` | `ok`, `unsupported`, `failed` |
+| `guard` | `ok`, `busy`, `unsupported`, `failed` |
 
 - `busy`는 진행 중인 대화라서 건너뛰었다는 뜻입니다. 실패가 아니며, GUI는 건너뜀으로 셉니다.
 - `changed`는 `describe` 뒤에 작업 폴더가 바뀌어 아무것도 올리지 않았다는 뜻입니다(`reasonCode=source_changed`).
@@ -108,9 +109,10 @@ Worker(`Worker.ps1`)가 벤더 구현을 부르는 방법입니다. 벤더를 �
 | `describe` | `nativeId` | `sourceCwd`(문자열), `cwds`·`edits`(문자열 배열), `sourceStamp`(문자열) |
 | `backup` | `nativeId`, `remoteId`, `sourceStamp` | `remoteId`(빈 값 아님). 선택 필드는 `message`입니다. |
 | `preview` | `nativeId`, `remoteId` | `state`(문자열), `choices`(배열, 값은 `incoming`만), `receipt`·`token`(문자열, 빈 값 가능). 선택 필드는 `view`와 `message`입니다. |
-| `restore` | `nativeId`, `remoteId`, `receipt`, `token`, `choice` | `effect`(`restored` \| `equal` \| `local_newer`), `nativeId`. 선택 필드는 `view`와 `message`입니다. |
+| `restore` | `nativeId`, `remoteId`, `receipt`, `token`, `choice`, `operationId` | `effect`(`restored` \| `equal` \| `local_newer`), `nativeId`. 선택 필드는 `view`와 `message`입니다. |
 | `open` | `nativeId`, `remoteId` | 선택 필드 `message` |
-| `recover` | S3에서 정합니다. | S3에서 정합니다. |
+| `guard` | 없음 | 없음. 대상 엔진·writer가 모두 닫혀 있을 때만 `ok`이고, 열려 있으면 `busy`(`reasonCode=engine_open`)입니다. 읽기만 합니다. |
+| `recover` | `mode`와 모드별 값(아래) | 모드별(아래) |
 
 **목록 행 (`list.sessions[]`)**
 
@@ -162,25 +164,46 @@ Worker(`Worker.ps1`)가 벤더 구현을 부르는 방법입니다. 벤더를 �
   - 복원할 때 이 값이 요청과 모두 같아야 합니다. Worker는 벤더 `restore`를 부르기 전에 확인합니다.
   - 하나라도 다르면 대화도 파일도 쓰지 않고, 어느 미리보기 사본도 지우지 않고 멈춥니다. 다른 벤더의 같은 UUID나, 같은 대화의 다른 미리보기를 섞는 경우가 여기서 막힙니다.
   - 미리보기 뒤에 고르는 폴더는 이 PC에 원래 경로가 없던 추가 폴더(`needsFolder`)에만 씁니다. 절대 경로여야 합니다. 시작 폴더는 늘 복원 폴더이고, 원래 경로가 있는 추가 폴더는 그 경로를 씁니다.
-- `effect`는 대화에 실제로 한 일입니다. Worker는 `restored`나 `equal`일 때만 프로젝트 파일을 복원합니다. `local_newer`이거나 실패하면 프로젝트 파일을 쓰지 않습니다.
-  - 복원 결과는 대화 결과(`effect`, `restored`)와 프로젝트 결과(`project`, 복구 위치)를 따로 둡니다. 대화와 파일을 함께 되돌린다고 약속하지 않습니다.
+- **순서**: Worker는 프로젝트 파일을 먼저 쓰고 대화는 맨 마지막에 복원합니다.
+  - 미리보기 `state`가 `local_newer`이면 `restore`가 대화에 쓰지 않는다는 뜻입니다. Worker는 이때 프로젝트 파일을 쓰지 않습니다. Worker는 이 값을 프로젝트 미리보기 기록에 함께 적어 둡니다.
+  - 프로젝트 파일을 처음 쓰기 전에 `guard`를 부릅니다. `ok`가 아니면 아무것도 쓰지 않습니다.
+  - 프로젝트 파일 하나라도 쓰지 못하면 `restore`를 부르지 않고, 쓴 파일을 되돌립니다.
+- `effect`는 대화에 실제로 한 일입니다. `restored`·`equal`이면 복원이 끝납니다. `local_newer`이거나 실패해서 대화에 쓰지 않았으면 Worker가 방금 쓴 프로젝트 파일을 되돌립니다.
+  - 복원 결과는 대화 결과(`effect`, `restored`)와 프로젝트 결과(`project`, 복구 위치)를 따로 둡니다. 판단은 아래 복구 기록 상태로 합니다.
 - **수명과 정리**:
   - 미리보기 사본은 구현의 staging(`%LOCALAPPDATA%\CtxHopGUI\staging\<id>`)에 있습니다. 호출 폴더와 따로 있어서, 호출 폴더를 지워도 사라지지 않습니다.
   - 복원에 성공하면 구현이 대화 사본을 지우고, Worker가 프로젝트 사본을 지웁니다.
   - 실패하면 증거로 남습니다. 건너뛴 미리보기도 남습니다.
 
-**복구 기록**
+**복구 기록 (S3)**
 
-- S2에서는 두 구현 모두 `recover`를 처리하지 않습니다(`unsupported`). 기존 보호는 그대로입니다.
-  - Codex: 백엔드가 남은 복구 기록(`pending`)이 있으면 쓰기를 막습니다. 실패 응답의 `detail.pending`으로 알립니다.
-  - Claude: 남은 `*.pending.json`이 있으면 `ClaudeWorker`가 백업·복원을 막습니다.
-- 복구 기록 조회와 실제 복구는 S3(공통 journal)에서 나눠 정합니다. 사용자가 모르게 실데이터를 되돌리는 호출은 두지 않습니다.
+- `operationId`는 Worker가 복원마다 만드는 32자 소문자 hex입니다. 구현은 **첫 쓰기 전에** 이 이름으로 복구 기록을 만듭니다.
+  - Codex: 백엔드 `apply --run <operationId>`의 run 폴더(`<home>\.ctxhop-desktop-recovery\<operationId>`)
+  - Claude: `%LOCALAPPDATA%\CtxHopGUI\recovery\<operationId>.pending.json`. 쓰기 전 상태(`prepared`)를 함께 적습니다.
+  - 이름이 틀리거나 같은 이름의 기록이 있으면 아무것도 쓰지 않고 실패합니다.
+- `recover`의 모드
+
+| `mode` | 요청 | `ok` 응답 |
+|---|---|---|
+| `status` | `operationId` | `state`: `absent` \| `pending` \| `complete` \| `rolled_back` \| `resolved` \| `unreadable` |
+| `list` | 공통 문맥 | `records`: 되돌리거나 닫아야 할 기록(`pending`·`unreadable`). 예전 형식 포함 |
+| `rollback` | `recordId`, `confirmedUnknown`(선택, `{target, current}` 배열) | `effect: rolled_back`. 모두 원래대로일 때만 |
+| `resolve` | `recordId`, `sha256` | `effect: resolved`. 기록 파일의 SHA-256이 사용자가 본 값과 같을 때만 이름을 바꿉니다. 이미 닫혔으면 성공입니다. |
+
+- `records` 행: `recordId`, `operationId`(모르면 null), `nativeId`, `path`, `state`, `sha256`(기록 파일), `canRollback`, `files`(파일별 분류, 알 수 있을 때)
+- 실패 응답은 `failed`와 `reasonCode`(`needs_attention` \| `unsupported_record` \| `changed` \| `busy`)를 함께 돌려주고, 남은 항목은 `records`에 담습니다. 모르는 `mode`는 기록을 읽기 전에 `failed`입니다.
+- Claude 파일은 "이 작업이 씀"으로 인증하지 않습니다. 그래서 Claude `rollback`은 사용자가 확인한 알 수 없는 파일(`confirmedUnknown`)만 되돌리고, 치운 파일은 모두 `<operationId>.rollback\`에 남깁니다.
+- `recover`를 부르는 것은 Worker뿐입니다. 구현 CLI를 직접 부르는 사용은 지원하지 않습니다.
+- Worker는 복원마다 공통 표지(`%LOCALAPPDATA%\CtxHopGUI\journal\<operationId>.json`)를 남기고, 결정표로 마무리한 뒤 종료 기록(`journal\done\`)을 쓰고 표지를 지웁니다.
+  - 미해결 표지·기록이 있거나 조회가 실패하면 복원·백업·열기를 모두 막습니다. 목록·미리보기와 `Journal`·`Rollback`·`CloseJournal` 작업은 막지 않습니다.
+  - 벤더의 기존 보호도 그대로입니다. Codex 백엔드는 남은 `pending`이 있으면 쓰기를 막고, `ClaudeWorker`는 남은 `*.pending.json`이 있으면 백업·복원을 막습니다.
+- 사용자가 모르게 실데이터를 되돌리는 호출은 두지 않습니다. 자동으로 되돌리는 것은 같은 복원 작업 안에서 방금 쓴 프로젝트 파일뿐입니다.
 
 ## 5. 시험
 
 - `Test-Contract.ps1`:
   - 가짜 구현 프로세스로 클라이언트를 확인합니다. 사례는 잘린 JSON, 판·ID·op·status·필드 형식, 종료 코드, 시간 초과, 16 MiB, 한글·따옴표입니다.
-  - 실제 구현의 진입점은 네이티브 도구를 부르기 전에 끝나는 요청(probe, recover, Codex 열기, 잘못된 요청)으로 확인합니다.
+  - 실제 구현의 진입점은 네이티브 도구를 부르기 전에 끝나는 요청(probe, 모르는 `recover` 모드, Codex 열기, 잘못된 요청)으로 확인합니다.
 - `Test-DesktopWorker.ps1`, `Test-DesktopIntegration.ps1`:
   - 두 구현의 처리기를 같은 프로세스에서 부릅니다. 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 받습니다.
   - 네이티브 호출은 시험 안에서 함수를 바꿔 흉내 냅니다.

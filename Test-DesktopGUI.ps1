@@ -215,7 +215,7 @@ try {
     $script:Pending=$null
     # 작업 취소는 GUI가 띄운 작업 창과 그 하위 프로세스만 끝낸다. 이름으로 찾아 끄지 않으므로 Codex·Claude 앱은 건드리지 않는다.
     Assert ($source -notmatch 'Stop-Process\s+-Name|Get-Process|\.Kill\(|taskkill') 'GUI never kills processes by name, so the Codex and Claude apps are never force-closed'
-    Assert ([regex]::Matches($source,'Stop-Process ').Count -eq 1 -and [regex]::Matches($source,'Stop-ProcessTree \$pending\.process\.Id').Count -eq 1 -and $source -match "action -in @\('Restore','Open','MoveStore'\)\) \{ return \}") 'GUI stops only the worker tree it started, and never during Restore, Open or MoveStore'
+    Assert ([regex]::Matches($source,'Stop-Process ').Count -eq 1 -and [regex]::Matches($source,'Stop-ProcessTree \$pending\.process\.Id').Count -eq 1 -and $source -match "action -in @\('Restore','Open','MoveStore','Rollback','CloseJournal'\)\) \{ return \}") 'GUI stops only the worker tree it started, and never during Restore, Open, MoveStore, Rollback or CloseJournal'
     # 부모보다 먼저 생긴 "자식"은 끝난 프로세스의 PID를 물려받은 다른 프로그램(예: 런처가 띄운 앱)이므로 끝내지 않는다. 부모부터 끝낸다.
     $stopped = & {
         function Get-CimInstance {
@@ -345,6 +345,56 @@ try {
     $script:StartedJobs=@()
     Finish-Fake @{agent='claude-code';action='Preview';nativeId=$id;remoteId=('a'*25+'0');title='Claude 대화';identity='합성';projectRestore=$false} @{ok=$true;data=@{message='미리보기 완료';preview=@{session=$id;agent='claude-code';workspace='consistent';differences=0}}}
     Assert ($script:Asked -like '*복원하지 않음(선택 꺼짐)*' -and $script:StartedJobs.Count -eq 1 -and -not $script:StartedJobs[0].projectReceipt) 'with the option off nothing about project files is passed'
+    # 중단된 복원 창(S3 명세 4.4절): 버튼은 고른 행에 맞춰 켜고, 고른 할 일은 확인을 한 번 더 받은 뒤 작업으로 보낸다.
+    $unknownFile=[pscustomobject]@{index=1;target='D:\합성\b.txt';class='unknown';current=('b'*64)}
+    $journal=[pscustomobject]@{failed=@('claude-code');rows=@(
+        [pscustomobject]@{kind='marker';operationId=('1'*32);recordRef=$null;agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$true;sha256='AB';path='D:\기록';targets=@('D:\합성');files=@([pscustomobject]@{index=0;target='D:\합성\a.txt';class='owned';current=('a'*64)},$unknownFile)},
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('2'*32);agent='claude-code';nativeId=$id;state='unreadable';error='';canRollback=$false;sha256='CD';path='';files=@()},
+        [pscustomobject]@{kind='project';operationId=$null;recordRef='D:\예전 기록';agent='';nativeId='';state='failed';error='';canRollback=$false;sha256='EF';path='D:\예전 기록';files=@()})}
+    $ui=New-JournalDialog $journal
+    try {
+        $null=$ui.dialog.Handle; $null=$ui.list.Handle   # 창을 띄우지 않고도 선택 이벤트가 오게 한다
+        Assert ($ui.list.Items.Count -eq 3 -and $ui.dialog.Controls[0].Text -match 'claude-code') 'the window lists every record and names the tool it could not check'
+        Assert ($ui.list.Items[0].SubItems[3].Text -eq '원래대로 0 / 이 복원이 씀 1 / 알 수 없음 1 / 되돌리지 못함 0') "the file counts are shown: $($ui.list.Items[0].SubItems[3].Text)"
+        Assert (-not @($ui.buttons.Values | Where-Object Enabled).Count) 'no action is available before a row is picked'
+        $ui.list.Items[0].Selected=$true; [Windows.Forms.Application]::DoEvents()
+        Assert ($ui.buttons.rollback.Enabled -and $ui.buttons.unknown.Enabled -and $ui.buttons.open.Enabled -and $ui.buttons.resolve.Enabled) 'a record that can be rolled back enables every action'
+        $ui.list.Items[0].Selected=$false; $ui.list.Items[1].Selected=$true; [Windows.Forms.Application]::DoEvents()
+        Assert (-not $ui.buttons.rollback.Enabled -and -not $ui.buttons.unknown.Enabled -and -not $ui.buttons.open.Enabled -and $ui.buttons.resolve.Enabled) 'an unreadable record can only be closed as resolved'
+        # 보이지 않는 창의 버튼은 PerformClick이 무시하므로 클릭 처리기를 직접 부른다.
+        $ui.buttons.resolve.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'NonPublic,Instance').Invoke($ui.buttons.resolve,@([EventArgs]::Empty))
+        Assert ($ui.dialog.Tag.action -eq 'resolve' -and $ui.dialog.Tag.row.recordRef -eq ('2'*32)) 'a button returns its action and the picked row'
+    } finally { $ui.dialog.Dispose() }
+    $realShowDialog=${function:Show-Dialog}; $realConfirm=${function:Confirm}
+    function Show-Dialog([object]$Dialog) { $Dialog.Tag=$script:JournalChoice; return 'OK' }
+    function Confirm([string]$Message) { $script:Asked=$Message; return $script:ConfirmAnswer }
+    try {
+        $cases=@(
+            @{choice=@{action='rollback';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and $j.operationId -eq ('1'*32) -and -not $j.confirmedUnknown };ask='복원 전 상태로'},
+            @{choice=@{action='unknown';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and @($j.confirmedUnknown).Count -eq 1 -and $j.confirmedUnknown[0].target -eq 'D:\합성\b.txt' -and $j.confirmedUnknown[0].current -eq ('b'*64) };ask='D:\합성\b.txt'},
+            @{choice=@{action='resolve';row=$journal.rows[1]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.recordId -eq ('2'*32) -and $j.agent -eq 'claude-code' -and $j.sha256 -eq 'CD' };ask='다시 되돌릴 수 없습니다'},
+            @{choice=@{action='resolve';row=$journal.rows[2]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.projectRecord -eq 'D:\예전 기록' -and $j.sha256 -eq 'EF' };ask='0개'},
+            @{choice=@{action='rollback';row=[pscustomobject]@{kind='vendor';recordRef=('3'*32);agent='claude-code';canRollback=$true;files=@($unknownFile)}};check={ param($j) $j.action -eq 'Rollback' -and $j.recordId -eq ('3'*32) -and @($j.confirmedUnknown).Count -eq 1 };ask='모르는 파일'}
+        )
+        foreach ($case in $cases) {
+            $script:JournalChoice=$case.choice
+            $script:StartedJobs=@(); $script:ConfirmAnswer=$false; Show-JournalDialog $journal
+            Assert (-not $script:StartedJobs.Count -and $script:Asked -like "*$($case.ask)*") "saying no to the second question starts nothing ($($case.choice.action))"
+            $script:ConfirmAnswer=$true; Show-JournalDialog $journal
+            Assert ($script:StartedJobs.Count -eq 1 -and (& $case.check $script:StartedJobs[0])) "the confirmed action becomes a job ($($case.choice.action)): $($script:StartedJobs[0] | ConvertTo-Json -Compress -Depth 4)"
+        }
+    } finally { ${function:Show-Dialog}=$realShowDialog; ${function:Confirm}=$realConfirm }
+    # 막힌 작업의 결과는 이유를 보인 뒤 중단된 복원 창을 연다. 되돌리기·닫기가 끝나면 목록을 다시 불러온다.
+    $script:StartedJobs=@(); $script:Errors=@()
+    Finish-Fake @{agent='codex-desktop';action='Open';nativeId=$id} @{ok=$false;error='중단된 복원이 1개 있어';journalOpen=$true}
+    Assert ($script:Errors[-1] -like '*중단된 복원*' -and $script:StartedJobs.Count -eq 1 -and $script:StartedJobs[0].action -eq 'Journal') 'a job blocked by an interrupted restore opens the window'
+    $script:StartedJobs=@()
+    Finish-Fake @{agent='codex-desktop';action='Rollback';operationId=('1'*32)} @{ok=$true;data=@{outcome='rolled_back';message='되돌렸습니다'}}
+    Assert ($script:StartedJobs.Count -eq 1 -and $script:StartedJobs[0].action -eq 'Journal') 'the list is loaded again after a rollback'
+    $script:StartedJobs=@()
+    Finish-Fake @{agent='codex-desktop';action='Journal'} @{ok=$true;data=@{rows=@();failed=@()}}
+    Assert ($status.Text -eq '중단된 복원이 없습니다.' -and -not $script:StartedJobs.Count) 'an empty list only says so'
+    Assert ($journalButton.Parent -eq $settings) 'the settings tab has the interrupted restores button'
     Assert (-not (Test-Path -LiteralPath (Join-Path $testDirectory 'CtxHopGUI\vnext-preferences.json'))) 'isolated GUI tests never save user preferences'
     Write-Output "PASS: $script:Checks isolated Desktop GUI assertions. No native apps or user stores invoked."
 } finally {

@@ -249,16 +249,31 @@ function Get-JournalRoot {
     if ($script:TestJournalRoot) { return $script:TestJournalRoot }
     Join-Path $env:LOCALAPPDATA 'CtxHopGUI\recovery'
 }
+function Test-CompletedTwin([string]$Pending) {
+    # Complete-Restore는 completed를 먼저 옮기고 pending을 지운다. 둘이 함께 있으면 pending을 지우기 직전에 멈춘 것이다.
+    # completed를 읽을 수 있고 같은 작업(operationId·대화·시작 시각)일 때만 참이다.
+    $completed=$Pending.Replace('.pending.json','.completed.json')
+    if (-not [IO.File]::Exists($completed)) { return $false }
+    try { $a=Get-Content -LiteralPath $Pending -Raw -Encoding UTF8 | ConvertFrom-Json; $b=Get-Content -LiteralPath $completed -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }
+    return ([string]$a.operationId -ceq [string]$b.operationId -and [string]$a.nativeId -ceq [string]$b.nativeId -and [string]$a.started -ceq [string]$b.started -and [bool]$b.restoredSha256)
+}
 function Assert-NoPending {
     $root=Get-JournalRoot
     if (Test-Path -LiteralPath $root) {
-        if (@(Get-ChildItem -LiteralPath $root -Filter '*.pending.json' -File).Count) { throw (T 'CwPendingRestore' $root) }
+        foreach ($pending in @(Get-ChildItem -LiteralPath $root -Filter '*.pending.json' -File)) {
+            # 완료 기록이 이미 있는 pending은 지우기만 남은 것이므로 마무리한다. 그 밖의 pending은 백업·복원을 막는다.
+            if (Test-CompletedTwin $pending.FullName) { Remove-Item -LiteralPath $pending.FullName; continue }
+            throw (T 'CwPendingRestore' $root)
+        }
     }
 }
 function Begin-Restore([object]$Job) {
     $root=Get-JournalRoot
     New-Item -ItemType Directory -Path $root -Force | Out-Null
-    $name=[guid]::NewGuid().ToString('N')
+    # Worker가 준 작업 ID로 기록 이름을 정한다(S3 명세 2.1절). 같은 이름의 기록이 있으면 아무것도 쓰지 않고 멈춘다.
+    $name=if ($Job.operationId) { [string]$Job.operationId } else { [guid]::NewGuid().ToString('N') }
+    if ($name -cnotmatch '^[0-9a-f]{32}$') { throw (T 'WkOperationIdInvalid') }
+    if (@(Get-ChildItem -LiteralPath $root -Filter "$name.*").Count) { throw (T 'CwJournalExists' $name) }
     $backups=@()
     foreach ($file in @(Get-NativeFiles $Job.agent $Job.nativeId)) {
         $hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
@@ -270,7 +285,17 @@ function Begin-Restore([object]$Job) {
     $journal=Join-Path $root "$name.pending.json"
     # Claude 세션 옆 폴더(subagents·tool-results)에서 복원이 바꾸는 파일의 원본은 ctxhop이 이 폴더에 남긴다(바뀐 파일이 있을 때만 생김).
     $companion=if ($Job.agent -eq 'claude-code') {Join-Path $root "$name.companion"} else {$null}
-    @{ agent=$Job.agent; nativeId=$Job.nativeId; remoteId=$Job.remoteId; projectPath=$Job.projectPath; originals=$backups; companionBackup=$companion; started=(Get-Date).ToString('o') } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journal -Encoding UTF8
+    $record=[ordered]@{ agent=$Job.agent; nativeId=$Job.nativeId; remoteId=$Job.remoteId; projectPath=$Job.projectPath; originals=$backups; companionBackup=$companion; started=(Get-Date).ToString('o'); operationId=$name }
+    # 되돌리기에 쓸 쓰기 전 상태(S3 명세 3.4절): 대화 파일 하나의 원본 사본과 해시, 옆 폴더 파일 목록과 해시. 옆 폴더 사본은 ctxhop이 companion에 남긴다.
+    if ($Job.agent -eq 'claude-code' -and $backups.Count -le 1) {
+        $conversation=if ($backups.Count) { [ordered]@{target=$backups[0].original;before=$backups[0].sha256.ToLowerInvariant();beforeCopy=$backups[0].backup} } else { [ordered]@{target=$null;before='absent';beforeCopy=$null} }
+        $sideRoot=if ($backups.Count) { Join-Path ([IO.Path]::GetDirectoryName($backups[0].original)) $Job.nativeId } else { $null }
+        $sideFiles=@(if ($sideRoot -and [IO.Directory]::Exists($sideRoot)) { foreach ($file in [IO.Directory]::GetFiles($sideRoot,'*','AllDirectories')) { [ordered]@{path=$file.Substring($sideRoot.Length+1);sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()} } })
+        $record.prepared=[ordered]@{conversation=$conversation;sidecar=[ordered]@{root=$sideRoot;files=$sideFiles};sidecarBackup=$companion}
+    }
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 8))
+    $stream=[IO.FileStream]::new($journal,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
     return $journal
 }
 function Assert-Sidecar([object]$Sidecar) {
@@ -283,8 +308,11 @@ function Complete-Restore([string]$Journal, [object]$Job, [object]$Sidecar=$null
     $file=@(Get-NativeFiles $Job.agent $Job.nativeId)[0]
     $record | Add-Member -NotePropertyName restoredSha256 -NotePropertyValue (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
     if ($Sidecar) { $record | Add-Member -NotePropertyName sidecar -NotePropertyValue $Sidecar }
+    # completed는 임시 파일에 쓴 뒤 옮긴다(이미 있으면 실패). 그다음 pending을 지운다. 사이에서 멈추면 Assert-NoPending이 마무리한다.
     $completed=$Journal.Replace('.pending.json','.completed.json')
-    $record | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $completed -Encoding UTF8
+    $temp="$completed.tmp"
+    $record | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temp -Encoding UTF8
+    [IO.File]::Move($temp,$completed)
     Remove-Item -LiteralPath $Journal
 }
 function Get-CtxVersion {

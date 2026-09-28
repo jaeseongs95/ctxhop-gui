@@ -19,7 +19,8 @@ function ConvertTo-ProjectPath([string]$Value) {
     elseif ($path.StartsWith('\\?\')) { $path=$path.Substring(4) }
     $head=if ($path.StartsWith('\\')) {'\\'} else {''}
     $path=$head+[regex]::Replace($path.Substring($head.Length),'\\{2,}','\')
-    if (-not [IO.Path]::IsPathRooted($path) -or $path -match '^\\[^\\]') { return $null }
+    # 드라이브 전체 경로(X:\…)와 UNC(\\server\share…)만 받는다. C:folder·\folder는 현재 폴더에 따라 뜻이 바뀐다.
+    if ($path -notmatch '^([A-Za-z]:\\|\\\\[^\\]+\\[^\\]+)') { return $null }
     try { $full=[IO.Path]::GetFullPath($path) } catch { return $null }
     if ($full.Length -gt 3) { $full=$full.TrimEnd('\') }
     return $full
@@ -199,19 +200,19 @@ function Get-ProjectFileHash([string]$Path, [Security.Cryptography.HashAlgorithm
 }
 function Get-ProjectManifest([object]$List, [long]$Limit=[long]::MaxValue) {
     # 올리기 전에 같은 내용이 이미 백업돼 있는지 보려고 내용 해시만 먼저 구한다. 읽지 못한 파일은 빼고 목록으로 돌려준다.
-    # 파일 크기 합이 $Limit를 넘으면 더 읽지 않고 overLimit으로 돌려준다.
+    # 실제로 읽은 총량이 $Limit를 넘으면 더 읽지 않고 overLimit으로 돌려준다(해시하는 도중 커지는 파일 포함).
     $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new(); [long]$total=0
-    $sha=[Security.Cryptography.SHA256]::Create()
-    try {
-        foreach ($file in $List.files) {
-            try { $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare) } catch { $unreadable.Add($file.path); continue }
-            try {
-                $total+=$stream.Length
-                if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
-                $entries.Add([pscustomobject]@{path=$file.path;size=$stream.Length;sha256=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()})
-            } catch { $unreadable.Add($file.path) } finally { $stream.Dispose() }
-        }
-    } finally { $sha.Dispose() }
+    foreach ($file in $List.files) {
+        try { $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare) } catch { $unreadable.Add($file.path); continue }
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try {
+            $crypto=[Security.Cryptography.CryptoStream]::new([IO.Stream]::Null,$sha,[Security.Cryptography.CryptoStreamMode]::Write)
+            try { $size=Copy-ProjectStream $stream $crypto ($Limit-$total); if ($size -le $Limit-$total) { $crypto.FlushFinalBlock() } } finally { $crypto.Dispose() }
+            $total+=$size
+            if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
+            $entries.Add([pscustomobject]@{path=$file.path;size=$size;sha256=(Get-ProjectHex $sha.Hash)})
+        } catch { $unreadable.Add($file.path) } finally { $sha.Dispose(); $stream.Dispose() }
+    }
     return [pscustomobject]@{hash=(Get-ProjectContentHash $entries.ToArray());files=$entries.Count;unreadable=$unreadable.ToArray()}
 }
 function Copy-ProjectStream([IO.Stream]$From, [IO.Stream]$To, [long]$Limit) {
@@ -291,7 +292,14 @@ function Compare-ProjectSnapshot([object]$Snapshot, [string]$Target) {
     return [pscustomobject]$result
 }
 function Restore-ProjectSnapshot([string]$ZipPath, [string]$Target, [string]$Recovery) {
-    # 새 파일은 쓰고, 바뀐 파일은 원본을 $Recovery에 복사한 뒤 덮어쓴다. 지우는 파일은 없다. 쓰기 전에 모든 경로를 검사한다.
+    # 계획을 세우고 바로 쓴다. Worker는 모든 폴더의 계획을 저장한 뒤에 쓰므로 두 단계를 따로 부른다.
+    $plan=New-ProjectRestorePlan $ZipPath $Target $Recovery
+    return (Invoke-ProjectRestorePlan $ZipPath $plan.files $Recovery)
+}
+function New-ProjectRestorePlan([string]$ZipPath, [string]$Target, [string]$Copies, [int]$FirstIndex=0) {
+    # 쓰기 전에 모든 경로를 검사하고, 파일마다 before(absent 또는 SHA-256)·after·action을 정한다(S3 명세 3.1절).
+    # 바꿀 파일은 원본을 $Copies에 먼저 복사하고, 복사본의 해시를 before로 적는다. 활성 파일은 바꾸지 않는다.
+    # index는 $FirstIndex부터 붙인다. Worker는 여러 폴더의 계획을 한 목록으로 이어 붙인다.
     $snapshot=Read-ProjectSnapshot $ZipPath
     $root=ConvertTo-ProjectPath $Target
     $cache=@{}
@@ -302,35 +310,184 @@ function Restore-ProjectSnapshot([string]$ZipPath, [string]$Target, [string]$Rec
         $full=[IO.Path]::GetFullPath((Join-Path $root $file.path))
         if (-not (Test-ProjectInside $full $root) -or $full -ieq $root -or -not (Test-ProjectLinkFree $full $root $cache)) { throw (T 'PfTargetUnsafe' $full) }
     }
-    $result=[ordered]@{written=0;backedUp=0;same=0;failed=[Collections.Generic.List[object]]::new();recovery=$Recovery}
-    $zip=[IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $files=[Collections.Generic.List[object]]::new()
+    $sha=[Security.Cryptography.SHA256]::Create()
     try {
         foreach ($file in $snapshot.files) {
-            $full=Join-Path $root $file.path
-            try {
-                $exists=[IO.File]::Exists($full)
-                if ($exists -and (Get-ProjectFileHash $full) -eq $file.sha256) { $result.same++; continue }
-                # 옆의 임시 파일에 먼저 쓰고 해시가 맞을 때만 원본을 복구 폴더에 복사한 뒤 제자리로 옮긴다.
-                $folder=[IO.Path]::GetDirectoryName($full)
-                $null=[IO.Directory]::CreateDirectory($folder)
-                $part=Join-Path $folder ('.ctxhop-'+[guid]::NewGuid().ToString('N')+'.part')
-                $sha=[Security.Cryptography.SHA256]::Create()
-                $source=$zip.GetEntry('files/'+$file.path.Replace('\','/')).Open()
+            $entry=[ordered]@{index=$FirstIndex+$files.Count;path=$file.path;target=(Join-Path $root $file.path);size=[long]$file.size;before='absent';beforeCopy=$null;after=$file.sha256;action='write'}
+            if ([IO.File]::Exists($entry.target)) {
+                if ((Get-ProjectFileHash $entry.target $sha) -eq $file.sha256) { $entry.before=$file.sha256; $entry.action='same' }
+                else {
+                    # 해시를 구한 뒤에 파일이 바뀌어도 사본과 before는 같은 내용이다. 쓰기 직전에 현재 해시를 before와 다시 비교한다.
+                    $copy=Join-Path $Copies $file.path
+                    $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($copy))
+                    [IO.File]::Copy($entry.target,$copy,$false)
+                    $entry.before=Get-ProjectFileHash $copy $sha; $entry.beforeCopy=$copy
+                }
+            }
+            $files.Add([pscustomobject]$entry)
+        }
+    } finally { $sha.Dispose() }
+    return [pscustomobject]@{target=$root;files=$files.ToArray()}
+}
+function Invoke-ProjectRestorePlan([string]$ZipPath, [object[]]$Files, [string]$Recovery) {
+    # 계획대로 쓴다(S3 명세 3.2절). 쓰기 직전에 현재 파일이 before와 같은지 다시 보고, 한 파일이라도 실패하면 남은 파일은 쓰지 않는다.
+    # 파일마다 state(written·same·failed·skipped)를 돌려준다. skipped는 앞 파일이 실패해 쓰지 않은 파일이다.
+    $result=[ordered]@{written=0;backedUp=@($Files | Where-Object { $_.beforeCopy }).Count;same=0;failed=[Collections.Generic.List[object]]::new();recovery=$Recovery;files=[Collections.Generic.List[object]]::new()}
+    $zip=[IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($file in $Files) {
+            $state=if ($result.failed.Count) {'skipped'} elseif ($file.action -eq 'same') {'same'} else {'write'}
+            if ($state -eq 'write') {
                 try {
-                    $crypto=[Security.Cryptography.CryptoStream]::new([IO.FileStream]::new($part,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None),$sha,[Security.Cryptography.CryptoStreamMode]::Write)
-                    try { $size=Copy-ProjectStream $source $crypto ([long]$file.size); $crypto.FlushFinalBlock() } finally { $crypto.Dispose() }
-                    if ($size -ne [long]$file.size -or (Get-ProjectHex $sha.Hash) -ne $file.sha256) { throw (T 'PfHashMismatch' $file.path) }
-                    if ($exists) {
-                        $copy=Join-Path $Recovery $file.path
-                        $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($copy))
-                        [IO.File]::Copy($full,$copy,$false); $result.backedUp++
-                        [IO.File]::Replace($part,$full,[NullString]::Value)   # $null은 빈 문자열로 넘어가 실패한다
-                    } else { [IO.File]::Move($part,$full) }
-                } finally { $source.Dispose(); $sha.Dispose(); if ([IO.File]::Exists($part)) { [IO.File]::Delete($part) } }
-                $result.written++
-            } catch { $result.failed.Add([pscustomobject]@{path=$file.path;reason=$_.Exception.Message}) }
+                    $current=if ([IO.File]::Exists($file.target)) { Get-ProjectFileHash $file.target } else { 'absent' }
+                    if ($current -ne $file.before) { throw (T 'PfChangedSincePlan' $file.path) }
+                    # 옆의 임시 파일에 먼저 쓰고 해시가 맞을 때만 제자리로 옮긴다. 치운 원본은 before와 같을 때만 지운다.
+                    $folder=[IO.Path]::GetDirectoryName($file.target)
+                    $null=[IO.Directory]::CreateDirectory($folder)
+                    $name='.ctxhop-'+[guid]::NewGuid().ToString('N'); $part=Join-Path $folder "$name.part"; $prev=Join-Path $folder "$name.prev"
+                    $sha=[Security.Cryptography.SHA256]::Create()
+                    $source=$zip.GetEntry('files/'+$file.path.Replace('\','/')).Open()
+                    try {
+                        $crypto=[Security.Cryptography.CryptoStream]::new([IO.FileStream]::new($part,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None),$sha,[Security.Cryptography.CryptoStreamMode]::Write)
+                        try { $size=Copy-ProjectStream $source $crypto $file.size; $crypto.FlushFinalBlock() } finally { $crypto.Dispose() }
+                        if ($size -ne $file.size -or (Get-ProjectHex $sha.Hash) -ne $file.after) { throw (T 'PfHashMismatch' $file.path) }
+                        if ($file.before -eq 'absent') { [IO.File]::Move($part,$file.target) }
+                        else {
+                            [IO.File]::Replace($part,$file.target,$prev)
+                            # 다시 본 뒤 바꾸기 전 사이에 파일이 바뀌었으면 치운 내용을 지우지 않고 남긴다.
+                            if ((Get-ProjectFileHash $prev) -ne $file.before) { throw (T 'PfDisplacedKept' $file.path $prev) }
+                            [IO.File]::Delete($prev)
+                        }
+                    } finally { $source.Dispose(); $sha.Dispose(); if ([IO.File]::Exists($part)) { [IO.File]::Delete($part) } }
+                    $state='written'; $result.written++
+                } catch { $state='failed'; $result.failed.Add([pscustomobject]@{path=$file.path;reason=$_.Exception.Message}) }
+            } elseif ($state -eq 'same') { $result.same++ }
+            $result.files.Add([pscustomobject]@{index=$file.index;path=$file.path;state=$state})
         }
     } finally { $zip.Dispose() }
-    $result.failed=$result.failed.ToArray()
+    $result.failed=$result.failed.ToArray(); $result.files=$result.files.ToArray()
     return [pscustomobject]$result
+}
+function Save-ProjectJson([string]$Path, [object]$Value) {
+    # 임시 파일에 쓰고 디스크까지 비운 뒤 바꾼다. 처음이면 Move, 이미 있으면 Replace(S3 명세 2.4·3.3절). 전원 차단 내구성은 약속하지 않는다.
+    $temp="$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $Value -Depth 8))
+    $stream=[IO.FileStream]::new($temp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp,$Path,[NullString]::Value) } else { [IO.File]::Move($temp,$Path) }
+}
+function Get-ProjectState([string]$Path) { if ([IO.File]::Exists($Path)) { return (Get-ProjectFileHash $Path) }; return 'absent' }
+function Test-ProjectUndoTarget([object]$File) {
+    # 저장된 계획으로 되돌릴 때마다 지금 경로를 새로 검사한다(R38-03). 계획을 세운 뒤 폴더가 링크·정션으로 바뀌었을 수 있다.
+    # 계획의 복원 폴더(target에서 상대 경로를 뺀 곳)가 복원할 수 있는 위치이고, 드라이브 루트부터 target까지 링크·정션이 없어야 한다.
+    # 상대 경로가 없는 항목(Claude 대화 파일 등)은 부르는 쪽이 목록을 만들 때 검사한다.
+    if (-not $File.path) { return $true }
+    $target=[string]$File.target; $suffix='\'+([string]$File.path).TrimStart('\')
+    if (-not $target.EndsWith($suffix,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $root=ConvertTo-ProjectPath $target.Substring(0,$target.Length-$suffix.Length)
+    if (-not $root -or (Test-ProjectTooBroad $root) -or (Test-ProjectUnder $root (Get-ProjectIgnoredRoots).settings)) { return $false }
+    $full=[IO.Path]::GetFullPath($target)
+    if ($full -ine $target -or -not (Test-ProjectInside $full $root)) { return $false }
+    $cache=@{}
+    return ((Test-ProjectLinkFree $root ([IO.Path]::GetPathRoot($root)) $cache) -and (Test-ProjectLinkFree $full $root $cache))
+}
+function Get-ProjectUndoClass([object]$File, [string]$Current) {
+    # 이미 원래대로(original) / 이 작업이 씀(owned) / 알 수 없음(unknown). 되돌릴 원본 사본이 없거나 다르면 되돌리지 못함(unrestorable).
+    if ($Current -eq $File.before) { return 'original' }
+    if ($File.before -ne 'absent' -and -not ($File.beforeCopy -and [IO.File]::Exists($File.beforeCopy) -and (Get-ProjectFileHash $File.beforeCopy) -eq $File.before)) { return 'unrestorable' }
+    if ($Current -eq $File.after) { return 'owned' }
+    return 'unknown'
+}
+function Get-ProjectUndoView([object[]]$Files) {
+    # 되돌리기 전에 보여 줄 파일별 분류. 아무것도 쓰지 않는다.
+    # 지금 경로가 링크·정션을 거치면 읽지도 않고 되돌리지 못함으로 보인다.
+    return @(foreach ($file in $Files) {
+        if (-not (Test-ProjectUndoTarget $file)) { [pscustomobject]@{index=[int]$file.index;target=$file.target;class='unrestorable';current=''}; continue }
+        $current=Get-ProjectState $file.target; [pscustomobject]@{index=[int]$file.index;target=$file.target;class=(Get-ProjectUndoClass $file $current);current=$current}
+    })
+}
+function Undo-ProjectRestorePlan([object[]]$Files, [string]$Record, [string]$Operation, [object[]]$Confirmed=@()) {
+    # 계획의 파일을 복원 전 상태로 되돌린다(S3 명세 3.3절). 이 작업이 쓴 파일(after와 같음)은 되돌리고, 알 수 없는 파일은 사용자가 확인한
+    # 스냅숏({target, current})과 같을 때만 되돌린다. 치운 파일은 모두 $Record\rollback\<index>에 남긴다. 멈춘 뒤 다시 부르면 이어서 한다.
+    # complete는 모든 파일이 원래대로이고, 남은 임시 파일·보존 충돌·mismatch가 없을 때만 참이다.
+    $log=Join-Path $Record 'rollback.json'
+    $entries=@{}
+    if ([IO.File]::Exists($log)) { foreach ($entry in @((Get-Content -LiteralPath $log -Raw -Encoding UTF8 | ConvertFrom-Json).files)) { $entries[[int]$entry.index]=$entry } }
+    $save={ Save-ProjectJson $log ([ordered]@{version=1;operationId=$Operation;files=@($entries.Keys | Sort-Object | ForEach-Object { $entries[$_] })}) }   # 동적 범위로 $entries·$log를 본다(시험이 Save-ProjectJson을 바꿔 끼울 수 있게 클로저를 쓰지 않음)
+    $confirmedMap=@{}; foreach ($item in $Confirmed) { $confirmedMap[([string]$item.target).ToLowerInvariant()]=[string]$item.current }
+    $results=@(foreach ($file in $Files) { Undo-ProjectFile $file $entries $save $Record $Operation $confirmedMap })
+    return [pscustomobject]@{complete=-not @($results | Where-Object { $_.state -ne 'done' }).Count;files=$results}
+}
+function Undo-ProjectFile([object]$File, [hashtable]$Entries, [scriptblock]$Save, [string]$Record, [string]$Operation, [hashtable]$Confirmed) {
+    $index=[int]$File.index; $target=[string]$File.target; $folder=[IO.Path]::GetDirectoryName($target)
+    $part=Join-Path $folder ".ctxhop-rb-$Operation-$index.part"; $prev=Join-Path $folder ".ctxhop-rb-$Operation-$index.prev"
+    $entry=$Entries[$index]
+    $out=[ordered]@{index=$index;target=$target;class='';current='';state='attention';reason=''}
+    # 경로가 안전하지 않으면 읽거나 쓰지 않고 멈춘다. 원본 사본과 보존 사본은 그대로 남는다.
+    if (-not (Test-ProjectUndoTarget $File)) { $out.reason=T 'PfTargetUnsafe' $target; return [pscustomobject]$out }
+    try {
+        if (-not [IO.File]::Exists($prev)) {
+            # 남은 .part는 원본 사본과 같을 때만 버린다(사본이 따로 있음). 다르면 남기고 멈춘다.
+            if ([IO.File]::Exists($part)) {
+                if ($File.before -eq 'absent' -or (Get-ProjectFileHash $part) -ne $File.before) { $out.reason=$part; return [pscustomobject]$out }
+                [IO.File]::Delete($part)
+            }
+            $current=Get-ProjectState $target; $out.current=$current; $out.class=Get-ProjectUndoClass $File $current
+            if ($out.class -eq 'original') { return (Complete-ProjectUndoFile $File $entry $Save $Record $prev $part $out) }
+            if ($entry) {
+                # 교체 전에 멈춘 기록만 처음부터 다시 한다. 파일이 기록과 다르거나 교체 뒤 단계면 아무것도 바꾸지 않는다.
+                if ($entry.step -notin @('start','prepared','swapped') -or ($entry.prev -and $entry.prev -ne 'none') -or $current -ne $entry.judged) { $out.reason=$target; return [pscustomobject]$out }
+            }
+            if ($out.class -eq 'unrestorable') { $out.state='unrestorable'; return [pscustomobject]$out }
+            if ($out.class -eq 'unknown' -and $Confirmed[$target.ToLowerInvariant()] -cne $current) { $out.state='unknown'; return [pscustomobject]$out }
+            $entry=[pscustomobject]@{index=$index;judged=$current;approved=($out.class -eq 'unknown');step='start';prev=$null;mismatch=$false}
+            $Entries[$index]=$entry; & $Save
+            if ($File.before -ne 'absent') {
+                [IO.File]::Copy($File.beforeCopy,$part,$false)
+                if ((Get-ProjectFileHash $part) -ne $File.before) { $out.reason=$part; return [pscustomobject]$out }
+                $entry.step='prepared'; & $Save
+            }
+            # swapped는 교체를 부르기 직전에 적는다. 교체가 끝났다는 증거가 아니다.
+            $entry.step='swapped'; if ($current -eq 'absent') { $entry.prev='none' }; & $Save
+            if ($File.before -eq 'absent') { [IO.File]::Move($target,$prev) }
+            elseif ($current -eq 'absent') { [IO.File]::Move($part,$target) }   # 그사이 파일이 생기면 실패하고 덮어쓰지 않는다
+            else { [IO.File]::Replace($part,$target,$prev) }
+        }
+        if ([IO.File]::Exists($prev)) {
+            # 치운 파일은 보존·삭제 전에 판단 때 상태와 비교한다. 기록이 없으면 mismatch로 본다. mismatch는 풀지 않는다.
+            if (-not $entry) { $entry=[pscustomobject]@{index=$index;judged=$null;approved=$false;step='swapped';prev=$null;mismatch=$true}; $Entries[$index]=$entry }
+            $hash=Get-ProjectFileHash $prev
+            $entry.prev=$hash; $entry.mismatch=[bool]$entry.mismatch -or $hash -ne $entry.judged; & $Save
+            $kept=Join-Path $Record "rollback\$index"
+            if (-not [IO.File]::Exists($kept)) {
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($kept))
+                $temp="$kept.$([guid]::NewGuid().ToString('N')).tmp"
+                [IO.File]::Copy($prev,$temp,$false)
+                if ((Get-ProjectFileHash $temp) -ne $hash) { $out.reason=$temp; return [pscustomobject]$out }
+                [IO.File]::Move($temp,$kept)
+            }
+            # 다른 내용의 보존 사본이 이미 있으면 덮어쓰지 않고 멈춘다.
+            if ((Get-ProjectFileHash $kept) -ne $hash) { $out.reason=$kept; return [pscustomobject]$out }
+            $entry.step='kept'; & $Save
+            [IO.File]::Delete($prev)
+        }
+        return (Complete-ProjectUndoFile $File $entry $Save $Record $prev $part $out)
+    } catch { $out.reason=$_.Exception.Message; return [pscustomobject]$out }
+}
+function Complete-ProjectUndoFile([object]$File, [object]$Entry, [scriptblock]$Save, [string]$Record, [string]$Prev, [string]$Part, [Collections.Specialized.OrderedDictionary]$Out) {
+    # 완료 판정. 정상 실행과 재실행이 같은 증거를 본다(R37-N2): 대상이 before이고 .part·.prev가 없고,
+    # 치운 파일이 없었으면(prev=none) 판단 때도 파일이 없었고, 있었으면 보존 사본의 해시가 기록과 같아야 한다.
+    $Out.current=Get-ProjectState $File.target
+    if (-not $Out.class) { $Out.class='original' }
+    if ($Out.current -ne $File.before -or [IO.File]::Exists($Part) -or [IO.File]::Exists($Prev)) { $Out.state='attention'; $Out.reason=$File.target; return [pscustomobject]$Out }
+    if ($Entry) {
+        $kept=Join-Path $Record "rollback\$($Entry.index)"
+        $proof=if ($Entry.prev -eq 'none') { $Entry.judged -eq 'absent' } elseif ($Entry.prev) { [IO.File]::Exists($kept) -and (Get-ProjectFileHash $kept) -eq $Entry.prev } else { $false }
+        if (-not $proof) { $Out.state='attention'; $Out.reason=$kept; return [pscustomobject]$Out }
+        if ($Entry.step -ne 'done') { $Entry.step='done'; & $Save }
+        if ($Entry.mismatch) { $Out.state='mismatch'; $Out.reason=$kept; return [pscustomobject]$Out }
+    }
+    $Out.state='done'; $Out.reason=''
+    return [pscustomobject]$Out
 }

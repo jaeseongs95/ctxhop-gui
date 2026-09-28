@@ -3,11 +3,14 @@
 # 암호화 bundle 전송만 mock이다. 실제 사용자 저장소와 공유 Drive는 읽거나 쓰지 않는다.
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
+Enable-WorkerJob   # 복원 시험은 실제 Worker처럼 Job 객체 안에서 돈다.
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
 # 벤더 계약 경계: Codex 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
 # 이 시험의 전송 mock과 백엔드 shim이 구현에도 적용되게 한다. 프로세스 경계는 Test-Contract.ps1이 확인한다.
 function Invoke-VendorOp([string]$Vendor,[string]$Op,[Collections.IDictionary]$Request,[string]$JobDir) {
+    # 중단된 복원 검사는 두 벤더의 기록을 모두 본다. Claude 구현은 이 시험 대상이 아니므로 기록이 없다고 답한다.
+    if ($Vendor -ceq 'claude-code' -and $Op -ceq 'recover' -and $Request.mode -ceq 'list') { return [pscustomobject]@{protocolVersion=1;status='ok';records=@()} }
     Assert ($Vendor -ceq 'codex-desktop') 'only the Codex Desktop implementation is under test'
     $id=[guid]::NewGuid().ToString()
     $body=[ordered]@{protocolVersion=1;requestId=$id;op=$Op;language=$script:UiLanguage}
@@ -100,6 +103,9 @@ try {
         if ($script:UseShim) { return (Invoke-JsonNative $runtime.python (@('-I','-B','-u',$shim) + $Arguments)) }
         & $script:RealBackend $Arguments
     }
+    # 엔진 사전 검사(guard)를 실제 백엔드 CLI로 부른다. 검사 함수만 shim이 바꾼다.
+    $guard=Invoke-Vendor ([pscustomobject]@{agent='codex-desktop';home=$receiver}) 'guard' @{}
+    Assert ($guard.status -ceq 'ok') 'the real backend guard action answers through the contract'
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $stages=@(Get-ChildItem -LiteralPath $staging -Directory).Count
     $backup=Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread}
