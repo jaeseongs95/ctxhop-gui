@@ -19,7 +19,8 @@ function ConvertTo-ProjectPath([string]$Value) {
     elseif ($path.StartsWith('\\?\')) { $path=$path.Substring(4) }
     $head=if ($path.StartsWith('\\')) {'\\'} else {''}
     $path=$head+[regex]::Replace($path.Substring($head.Length),'\\{2,}','\')
-    if (-not [IO.Path]::IsPathRooted($path) -or $path -match '^\\[^\\]') { return $null }
+    # 드라이브 전체 경로(X:\…)와 UNC(\\server\share…)만 받는다. C:folder·\folder는 현재 폴더에 따라 뜻이 바뀐다.
+    if ($path -notmatch '^([A-Za-z]:\\|\\\\[^\\]+\\[^\\]+)') { return $null }
     try { $full=[IO.Path]::GetFullPath($path) } catch { return $null }
     if ($full.Length -gt 3) { $full=$full.TrimEnd('\') }
     return $full
@@ -199,19 +200,19 @@ function Get-ProjectFileHash([string]$Path, [Security.Cryptography.HashAlgorithm
 }
 function Get-ProjectManifest([object]$List, [long]$Limit=[long]::MaxValue) {
     # 올리기 전에 같은 내용이 이미 백업돼 있는지 보려고 내용 해시만 먼저 구한다. 읽지 못한 파일은 빼고 목록으로 돌려준다.
-    # 파일 크기 합이 $Limit를 넘으면 더 읽지 않고 overLimit으로 돌려준다.
+    # 실제로 읽은 총량이 $Limit를 넘으면 더 읽지 않고 overLimit으로 돌려준다(해시하는 도중 커지는 파일 포함).
     $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new(); [long]$total=0
-    $sha=[Security.Cryptography.SHA256]::Create()
-    try {
-        foreach ($file in $List.files) {
-            try { $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare) } catch { $unreadable.Add($file.path); continue }
-            try {
-                $total+=$stream.Length
-                if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
-                $entries.Add([pscustomobject]@{path=$file.path;size=$stream.Length;sha256=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()})
-            } catch { $unreadable.Add($file.path) } finally { $stream.Dispose() }
-        }
-    } finally { $sha.Dispose() }
+    foreach ($file in $List.files) {
+        try { $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare) } catch { $unreadable.Add($file.path); continue }
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try {
+            $crypto=[Security.Cryptography.CryptoStream]::new([IO.Stream]::Null,$sha,[Security.Cryptography.CryptoStreamMode]::Write)
+            try { $size=Copy-ProjectStream $stream $crypto ($Limit-$total); if ($size -le $Limit-$total) { $crypto.FlushFinalBlock() } } finally { $crypto.Dispose() }
+            $total+=$size
+            if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
+            $entries.Add([pscustomobject]@{path=$file.path;size=$size;sha256=(Get-ProjectHex $sha.Hash)})
+        } catch { $unreadable.Add($file.path) } finally { $sha.Dispose(); $stream.Dispose() }
+    }
     return [pscustomobject]@{hash=(Get-ProjectContentHash $entries.ToArray());files=$entries.Count;unreadable=$unreadable.ToArray()}
 }
 function Copy-ProjectStream([IO.Stream]$From, [IO.Stream]$To, [long]$Limit) {

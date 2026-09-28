@@ -408,7 +408,7 @@ function Restore-ProjectFolders([object]$Job,[string]$Receipt,[string]$Agent,[st
             if ($folder.state -notin @('ready','needsFolder')) { continue }
             # 미리보기 뒤에 고르는 폴더는 이 PC에 원래 경로가 없던 추가 폴더(needsFolder)만 받는다. 절대 경로가 아니면 건너뛴다.
             $override=if ($Job.projectTargets -and $folder.state -eq 'needsFolder') { $Job.projectTargets.PSObject.Properties[[string]$folder.index] } else { $null }
-            $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {$(if ([IO.Path]::IsPathRooted([string]$override.Value)) {[string]$override.Value} else {''})} else {[string]$folder.target}
+            $target=if ($folder.role -eq 'start') {$StartTarget} elseif ($override) {[string](ConvertTo-ProjectPath ([string]$override.Value))} else {[string]$folder.target}
             $entry=[ordered]@{index=$folder.index;role=$folder.role;sourcePath=$folder.sourcePath;target=$target;state='skipped';written=0;backedUp=0;same=0;failed=@();error=''}
             if ($target) {
                 # 한 폴더가 실패해도(받은 파일이 바뀜, 쓸 수 없는 위치) 다른 폴더는 복원하고 기록을 남긴다. 실패한 폴더에는 쓰기 전에 멈춘다.

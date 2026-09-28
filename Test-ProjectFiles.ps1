@@ -58,6 +58,8 @@ try {
     Assert ((ConvertTo-ProjectPath 'D:/a/b/') -eq 'D:\a\b') 'forward slashes are normalized'
     Assert ((ConvertTo-ProjectPath 'D:\') -eq 'D:\') 'drive root keeps its backslash'
     Assert ($null -eq (ConvertTo-ProjectPath 'relative\x') -and $null -eq (ConvertTo-ProjectPath '\rooted') -and $null -eq (ConvertTo-ProjectPath '')) 'relative and drive-relative paths are rejected'
+    Assert ($null -eq (ConvertTo-ProjectPath 'C:relative-folder') -and $null -eq (ConvertTo-ProjectPath 'C:') -and $null -eq (ConvertTo-ProjectPath '\\server')) 'drive-relative paths and a UNC path without a share are rejected'
+    Assert ((ConvertTo-ProjectPath '\\server\share') -eq '\\server\share') 'a UNC share path is kept'
 
     # 2) 폴더 고르기: 안의 폴더는 합치고, 넓은 폴더·시작 폴더의 부모·임시·설정 폴더는 뺀다. 폴더 밖 편집은 목록만.
     $env:USERPROFILE='C:\Users\fixture'; $env:LOCALAPPDATA='C:\Users\fixture\AppData\Local'
@@ -178,6 +180,15 @@ try {
     Assert ((Read-ProjectSnapshot $zipE).files.Count -eq 0) 'an empty folder makes a readable empty snapshot'
     [IO.File]::WriteAllText((Join-Path $walk 'README.md'),'# changed')
     Assert ((Get-ProjectManifest (Get-ProjectFileList $walk)).hash -ne $snapA.hash) 'changed content changes the hash'
+    # 해시하는 도중 커지는 파일도 실제로 읽은 양으로 센다. 읽기 시작할 때 커지게 한다.
+    $grow=Join-Path $testDirectory 'grow'; $null=New-Item -ItemType Directory -Path $grow
+    [IO.File]::WriteAllText((Join-Path $grow 'a.txt'),('g'*100))
+    $growList=Get-ProjectFileList $grow
+    $copyStream=${function:Copy-ProjectStream}
+    ${function:Copy-ProjectStream}={ param([IO.Stream]$From,[IO.Stream]$To,[long]$Limit) [IO.File]::AppendAllText($From.Name,('h'*400)); & $copyStream $From $To $Limit }
+    try { $grown=Get-ProjectManifest $growList 150 } finally { ${function:Copy-ProjectStream}=$copyStream }
+    Assert ($grown.overLimit -and $grown.bytes -gt 150) 'a file that grows while it is hashed is counted by the bytes actually read'
+    Assert (-not (Get-ProjectManifest (Get-ProjectFileList $grow) 1000).overLimit) 'the grown file fits a larger limit'
     [IO.File]::WriteAllText((Join-Path $walk 'README.md'),'# r')
     $locked=[IO.FileStream]::new((Join-Path $walk 'src\main.py'),'Open','ReadWrite','None')
     try { $partial=New-ProjectSnapshot (Get-ProjectFileList $walk) (Join-Path $testDirectory 'locked.zip') } finally { $locked.Dispose() }
