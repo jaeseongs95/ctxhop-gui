@@ -66,6 +66,17 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
             }
             return @{status='closed';engine='0.158.0'}
         }
+        recover {
+            if ($script:RecoverStatus) {
+                $e=[InvalidOperationException]::new('중단 뒤 세션 파일이 변경됐습니다. 자동 복구를 중단합니다.')
+                $e.Data['backendResult']=[pscustomobject]@{status=$script:RecoverStatus;reason='fixture';token=$null}
+                throw $e
+            }
+            $journal=Join-Path $Arguments[[array]::IndexOf($Arguments,'--run')+1] 'journal.json'
+            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json; $record.status='rolled_back'
+            [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
+            return @{status='rolled_back';id=$record.id;members=1}
+        }
         default { throw 'unexpected backend operation' }
     }
 }
@@ -174,6 +185,54 @@ try {
         $failure=$null; try { $null=Invoke-Vendor $claudeGuard 'guard' @{} } catch { $failure=$_ }
         Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy') 'an open Claude Code makes guard busy'
     } finally { ${function:Assert-AgentClosed}=$realClosed }
+    # Codex 복구 기록(S3 명세 2.3·4.2절): 작업 ID 이름의 run 폴더를 직접 읽는다. 되돌리기는 백엔드 recover, 닫기는 journal 이름 바꾸기.
+    $recoveryRoot=Join-Path $desktopRoot '.ctxhop-desktop-recovery'
+    function Write-RunJournal([string]$Op,[string]$Text,[string]$Name='journal.json') {
+        $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot $Op) -Force
+        [IO.File]::WriteAllText((Join-Path $recoveryRoot "$Op\$Name"),$Text,[Text.UTF8Encoding]::new($false))
+    }
+    function Get-RunJson([string]$Status,[string]$HomeValue=$desktopRoot) { return (ConvertTo-Json -InputObject ([ordered]@{version=2;status=$Status;home=$HomeValue;id=$script:Id}) -Compress) }
+    $recoverJob=[pscustomobject]@{agent='codex-desktop';home=$desktopRoot}
+    function Get-CodexState([string]$Op) { return (Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId=$Op}).state }
+    $ops=@{}; foreach ($name in 'absent','empty','pending','complete','rolled','resolved','both','broken','foreign') { $ops[$name]=[guid]::NewGuid().ToString('N') }
+    $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot $ops.empty) -Force
+    Write-RunJournal $ops.pending (Get-RunJson 'pending'); Write-RunJournal $ops.complete (Get-RunJson 'complete'); Write-RunJournal $ops.rolled (Get-RunJson 'rolled_back')
+    Write-RunJournal $ops.resolved (Get-RunJson 'pending') 'journal.resolved.json'
+    Write-RunJournal $ops.both (Get-RunJson 'pending'); Write-RunJournal $ops.both (Get-RunJson 'pending') 'journal.resolved.json'
+    Write-RunJournal $ops.broken '{not json'; Write-RunJournal $ops.foreign (Get-RunJson 'pending' 'D:\other-home')
+    $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot 'not-a-record') -Force
+    $expected=@{absent='absent';empty='absent';pending='pending';complete='complete';rolled='rolled_back';resolved='resolved';both='unreadable';broken='unreadable';foreign='unreadable'}
+    foreach ($name in $expected.Keys) { Assert ((Get-CodexState $ops[$name]) -ceq $expected[$name]) "Codex record $name is $($expected[$name])" }
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId='../x'} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed') 'a record name that is not an operation ID is refused'
+    $listed=@((Invoke-Vendor $recoverJob 'recover' @{mode='list'}).records)
+    Assert ((@($listed | ForEach-Object recordId | Sort-Object) -join ',') -eq (@($ops.pending,$ops.both,$ops.broken,$ops.foreign | Sort-Object) -join ',')) 'list shows pending and unreadable records only'
+    $pendingRow=@($listed | Where-Object recordId -eq $ops.pending)[0]
+    Assert ($pendingRow.canRollback -and $pendingRow.nativeId -eq $script:Id -and $pendingRow.sha256 -eq (Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.pending)\journal.json") -Algorithm SHA256).Hash) 'a pending row can be rolled back and carries its record hash'
+    Assert (-not @($listed | Where-Object { $_.recordId -ne $ops.pending -and $_.canRollback }).Count) 'unreadable rows cannot be rolled back'
+    # 되돌리기: pending만 백엔드 recover로 되돌린다. 백엔드가 멈추면 기록은 그대로다.
+    $script:RecoverStatus='busy'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'busy' -and (Get-CodexState $ops.pending) -ceq 'pending') 'an open engine stops the rollback and keeps the record'
+    $script:RecoverStatus='blocked'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and @($failure.Exception.Data['vendorResult'].records).Count -eq 1) 'a changed conversation needs attention and the record is returned'
+    $script:RecoverStatus=$null
+    $rolled=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending}
+    $call=$script:Calls[-1].arguments
+    Assert ($rolled.effect -ceq 'rolled_back' -and $call[0] -ceq 'recover' -and $call[[array]::IndexOf($call,'--run')+1] -ceq (Join-Path $recoveryRoot $ops.pending)) 'rollback runs the backend recover on that record'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending}).effect -ceq 'rolled_back') 'a rolled back record stays rolled back'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.complete} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'unsupported_record') 'a complete record is never rolled back'
+    # 닫기: 창에서 본 해시와 같을 때만 이름을 바꾼다.
+    $brokenHash=(Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.broken)\journal.json") -Algorithm SHA256).Hash
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=('0'*64)} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'changed' -and (Get-CodexState $ops.broken) -ceq 'unreadable') 'a record that differs from what was shown is not closed'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=$brokenHash}).effect -ceq 'resolved' -and (Get-CodexState $ops.broken) -ceq 'resolved') 'an unreadable record is closed when the user saw its content'
+    Assert ((Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.broken;sha256=$brokenHash}).effect -ceq 'resolved') 'closing again succeeds'
+    $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.both;sha256=$brokenHash} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed' -and [IO.File]::Exists((Join-Path $recoveryRoot "$($ops.both)\journal.json"))) 'a record whose closed name already exists is not overwritten'
+    Remove-Item -LiteralPath $recoveryRoot -Recurse
     Assert (-not (Test-Path -LiteralPath $previewStage)) 'successful restore removes its plaintext staging copy'
     $odd=Join-Path $staging 'not-a-stage'; $null=New-Item -ItemType Directory -Path $odd
     Assert ((Remove-DesktopStage $odd) -match '지우지 못했습니다' -and (Test-Path -LiteralPath $odd)) 'cleanup refuses folders it did not create'

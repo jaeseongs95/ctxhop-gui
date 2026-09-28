@@ -104,6 +104,42 @@ function ConvertFrom-DesktopBusy([Management.Automation.ErrorRecord]$ErrorRecord
     if ($report.status -ceq 'busy') { return @{status='busy';reason=$ErrorRecord.Exception.Message;detail=$report} }
     throw $ErrorRecord
 }
+function Get-DesktopRecord([string]$DesktopRoot,[string]$RecordId) {
+    # 백엔드 복구 기록(run 폴더)의 상태(S3 명세 2.3절). 백엔드 pending()은 손상된 journal에서 예외를 내므로 직접 읽는다.
+    # 기록 이름은 작업 ID다(apply --run). 예전 기록도 32자 hex 이름이라 같은 방법으로 찾는다.
+    $null=Assert-OperationId $RecordId
+    $run=Join-Path $DesktopRoot ".ctxhop-desktop-recovery\$RecordId"
+    $row=[ordered]@{recordId=$RecordId;operationId=$RecordId;nativeId=$null;path=$run;state='absent';sha256=$null;canRollback=$false;files=$null}
+    if (-not [IO.Directory]::Exists($run)) { return $row }
+    $journal=Join-Path $run 'journal.json'; $resolved=Join-Path $run 'journal.resolved.json'
+    $present=@($journal,$resolved | Where-Object { [IO.File]::Exists($_) })
+    if (-not $present.Count) { return $row }
+    $row.state='unreadable'
+    if ($present.Count -ne 1) { return $row }
+    try {
+        $row.sha256=(Get-FileHash -LiteralPath $present[0] -Algorithm SHA256).Hash
+        # 닫힌 기록은 내용을 읽지 않는다. 읽을 수 없던 기록도 사용자가 보고 닫을 수 있기 때문이다.
+        if ($present[0] -eq $resolved) { $row.state='resolved'; return $row }
+        $record=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($record.home -isnot [string] -or $record.home.TrimEnd('\') -ne $DesktopRoot.TrimEnd('\')) { return $row }
+        if ($record.id -is [string]) { $row.nativeId=$record.id }
+        if ([string]$record.status -cin @('pending','complete','rolled_back')) { $row.state=[string]$record.status }
+    } catch { $row.state='unreadable' }
+    $row.canRollback=$row.state -eq 'pending'
+    return $row
+}
+function Get-DesktopRecordRows([string]$DesktopRoot) {
+    # 되돌리거나 닫아야 할 기록(pending·unreadable).
+    $root=Join-Path $DesktopRoot '.ctxhop-desktop-recovery'
+    if (-not [IO.Directory]::Exists($root)) { return @() }
+    foreach ($folder in [IO.Directory]::GetDirectories($root)) {
+        # 백엔드는 32자 hex 이름으로만 기록을 만든다. 다른 이름의 폴더는 이 도구의 기록이 아니다.
+        $name=[IO.Path]::GetFileName($folder)
+        if ($name -cnotmatch '^[0-9a-f]{32}$') { continue }
+        $row=Get-DesktopRecord $DesktopRoot $name
+        if ($row.state -in @('pending','unreadable')) { [pscustomobject]$row }
+    }
+}
 $script:CodexDesktopOps=@{
     list={ param($R) @{sessions=@((Get-DesktopSessions $R (Get-DesktopHome $R)).sessions);message=(T 'WkListLoaded')} }
     describe={ param($R)
@@ -161,6 +197,37 @@ $script:CodexDesktopOps=@{
         # 성공하면 교체 전·후 원본은 백엔드 복구 폴더에 있으므로 내려받은 평문 사본을 지운다. 실패하면 증거로 남긴다.
         $message+=Remove-DesktopStage (Split-Path -Parent $record.archive)
         return @{effect=$effect;nativeId=[string]$R.nativeId;view=$applied;message=$message}
+    }
+    recover={ param($R)
+        # 복구 기록 조회·되돌리기·닫기(S3 명세 4.2절). 되돌리기는 기존 백엔드 recover가 하고, 닫기는 journal 이름만 바꾼다.
+        $desktopRoot=Get-DesktopHome $R
+        switch -CaseSensitive ([string]$R.mode) {
+            status { return @{state=(Get-DesktopRecord $desktopRoot ([string]$R.operationId)).state} }
+            list { return @{records=@(Get-DesktopRecordRows $desktopRoot)} }
+            rollback {
+                $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)
+                if ($row.state -eq 'rolled_back') { return @{effect='rolled_back';message=(T 'WkRecoverRolledBack' $row.path)} }
+                if ($row.state -ne 'pending') { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordNotPending' $row.state);records=@([pscustomobject]$row)} }
+                try { $done=Invoke-DesktopBackend @('recover','--home',$desktopRoot,'--run',$row.path) }
+                catch {
+                    # 백엔드는 중단 뒤 대화가 바뀌었으면 되돌리지 않고 멈춘다. 기록은 pending으로 남는다.
+                    $code=if ($_.Exception.Data['backendResult'].status -eq 'busy') {'busy'} else {'needs_attention'}
+                    return @{status='failed';reasonCode=$code;reason=$_.Exception.Message;records=@([pscustomobject](Get-DesktopRecord $desktopRoot $row.recordId))}
+                }
+                if ($done.status -cne 'rolled_back') { throw (T 'WkRestoreStatusUnknown' $done.status) }
+                return @{effect='rolled_back';message=(T 'WkRecoverRolledBack' $row.path)}
+            }
+            resolve {
+                # 사용자가 창에서 본 기록 내용(SHA-256)과 같을 때만 닫는다. 이미 닫혔으면 성공이고, 닫은 이름이 있으면 덮어쓰지 않는다.
+                $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)
+                if ($row.state -eq 'resolved') { return @{effect='resolved';message=(T 'WkRecoverResolved' $row.path)} }
+                if ($row.state -notin @('pending','unreadable')) { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordNotPending' $row.state);records=@([pscustomobject]$row)} }
+                if (-not $row.sha256 -or $row.sha256 -ne [string]$R.sha256) { return @{status='failed';reasonCode='changed';reason=(T 'WkRecordChanged');records=@([pscustomobject]$row)} }
+                [IO.File]::Move((Join-Path $row.path 'journal.json'),(Join-Path $row.path 'journal.resolved.json'))
+                return @{effect='resolved';message=(T 'WkRecoverResolved' $row.path)}
+            }
+        }
+        throw (T 'WkRecoverModeInvalid' ([string]$R.mode))
     }
     guard={ param($R)
         # 프로젝트 파일을 먼저 쓰기 전에, apply와 같은 검사로 Codex 앱·CLI·IDE가 모두 닫혔는지 본다. 열려 있으면 busy다.
