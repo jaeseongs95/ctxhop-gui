@@ -5,7 +5,7 @@ $ErrorActionPreference='Stop'
 $implArgs=$args   # Worker.ps1을 dot-source하면 $args가 바뀔 수 있어 먼저 보관한다.
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 # Release integration replaces this pin only after reviewing the final candidate.
-$script:DesktopBackendSHA256='7BD1B4EBBC33A318B0DDDE1F55409DE88B8076AAEB47E880C55ADEDC61245AA2'
+$script:DesktopBackendSHA256='DEF1FDB9B9B17721682F38EFEB2BA9322089453C265A334133F6346F0F75B349'
 function Get-DesktopRuntime {
     $backend=Join-Path $PSScriptRoot 'backend\desktop_sessions.py'
     Assert-FrozenFile $backend $script:DesktopBackendSHA256
@@ -161,6 +161,16 @@ $script:CodexDesktopOps=@{
         # 성공하면 교체 전·후 원본은 백엔드 복구 폴더에 있으므로 내려받은 평문 사본을 지운다. 실패하면 증거로 남긴다.
         $message+=Remove-DesktopStage (Split-Path -Parent $record.archive)
         return @{effect=$effect;nativeId=[string]$R.nativeId;view=$applied;message=$message}
+    }
+    guard={ param($R)
+        # 프로젝트 파일을 먼저 쓰기 전에, apply와 같은 검사로 Codex 앱·CLI·IDE가 모두 닫혔는지 본다. 열려 있으면 busy다.
+        $desktopRoot=Get-DesktopHome $R
+        try { $null=Invoke-DesktopBackend @('guard','--home',$desktopRoot) }
+        catch {
+            if (-not $_.Exception.Data['backendResult']) { throw }
+            return @{status='busy';reasonCode='engine_open';reason=$_.Exception.Message}
+        }
+        return @{}
     }
     # Codex Desktop은 대화를 여는 공식 명령이 없어 사용자가 직접 연다.
     open={ param($R) @{status='unsupported';reasonCode='open_manually';reason=(T 'WkOpenManually')} }

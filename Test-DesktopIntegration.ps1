@@ -101,6 +101,9 @@ try {
         if ($script:UseShim) { return (Invoke-JsonNative $runtime.python (@('-I','-B','-u',$shim) + $Arguments)) }
         & $script:RealBackend $Arguments
     }
+    # 엔진 사전 검사(guard)를 실제 백엔드 CLI로 부른다. 검사 함수만 shim이 바꾼다.
+    $guard=Invoke-Vendor ([pscustomobject]@{agent='codex-desktop';home=$receiver}) 'guard' @{}
+    Assert ($guard.status -ceq 'ok') 'the real backend guard action answers through the contract'
     $staging=Join-Path $testDirectory 'CtxHopGUI\staging'
     $stages=@(Get-ChildItem -LiteralPath $staging -Directory).Count
     $backup=Invoke-JobCore @{action='Backup';agent='codex-desktop';home=$fixtureHome;nativeId=$thread}

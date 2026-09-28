@@ -104,7 +104,7 @@ Save ($out | ConvertTo-Json -Depth 5)
     $real=Join-Path $root 'real'; $null=New-Item -ItemType Directory -Path $real
     foreach ($vendor in 'codex-desktop','claude-code') {
         $probe=Invoke-VendorOp $vendor 'probe' @{} $real
-        Assert ((@($probe.capabilities) -join ',') -ceq 'probe,backup,describe,list,open,preview,restore') "$vendor declares the operations it handles (recover is S3)"
+        Assert ((@($probe.capabilities) -join ',') -ceq 'probe,backup,describe,guard,list,open,preview,restore') "$vendor declares the operations it handles (recover comes later in S3)"
         $recover=Invoke-VendorOp $vendor 'recover' @{} $real
         Assert ($recover.status -eq 'unsupported' -and $recover.reasonCode -eq 'op_unsupported' -and $recover.reason) "$vendor answers an operation it does not handle as unsupported"
         $null=Throws { Invoke-VendorOp $vendor 'probe' @{protocolVersion='1'} $real } 'invalid|잘못된 요청'

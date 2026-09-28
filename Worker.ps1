@@ -66,16 +66,16 @@ $script:ImplsFile=Join-Path $PSScriptRoot 'impls.json'
 $script:ContractStatus=@{
     probe=@('ok','failed'); list=@('ok','unsupported','failed'); open=@('ok','unsupported','failed'); recover=@('ok','unsupported','failed')
     describe=@('ok','busy','unsupported','failed'); backup=@('ok','busy','changed','unsupported','failed')
-    preview=@('ok','unsupported','failed'); restore=@('ok','unsupported','failed')
+    preview=@('ok','unsupported','failed'); restore=@('ok','unsupported','failed'); guard=@('ok','busy','unsupported','failed')
 }
 # status가 ok일 때 있어야 하는 필드와 형식. 그 밖의 필드는 선택이고 Worker는 해석하지 않고 넘긴다.
 $script:ContractFields=@{
     probe=@{capabilities='array'}; list=@{sessions='array'}; open=@{}; recover=@{}
     describe=@{sourceCwd='string';cwds='array';edits='array';sourceStamp='string'}; backup=@{remoteId='string'}
-    preview=@{state='string';choices='array';receipt='string';token='string'}; restore=@{effect='string';nativeId='string'}
+    preview=@{state='string';choices='array';receipt='string';token='string'}; restore=@{effect='string';nativeId='string'}; guard=@{}
 }
 # ponytail: 암호 입력·대화 열기를 기다릴 수 있는 op(backup·preview·restore·open·recover)는 시간 제한 없이 GUI 취소(프로세스 트리 종료)에 맡긴다.
-$script:ContractTimeoutSec=@{probe=120;list=1800;describe=1800}
+$script:ContractTimeoutSec=@{probe=120;list=1800;describe=1800;guard=120}
 $script:ContractMaxBytes=16MB
 function Test-VendorRow([object]$Row) {
     # 목록 행의 공통 필드. nativeId가 GUID가 아니면 blockedReason이 있어야 한다(확인하지 못한 백업).

@@ -1130,7 +1130,7 @@ def main():
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=('list', 'export', 'inspect', 'inspect-many', 'apply', 'recover', 'pending'))
+    parser.add_argument('action', choices=('list', 'export', 'inspect', 'inspect-many', 'apply', 'recover', 'pending', 'guard'))
     parser.add_argument('--home', required=True)
     parser.add_argument('--id')
     parser.add_argument('--archive')
@@ -1189,6 +1189,9 @@ def main():
             if path.stat().st_size > 1024*1024:
                 raise ValueError('비교 요청 파일이 너무 큽니다.')
             result = inspect_many(home, json.loads(path.read_text(encoding='utf-8')), engine_version())
+        elif args.action == 'guard':
+            # 프로젝트 파일을 먼저 쓰기 전에 apply와 같은 엔진 종료 검사를 한다. 대화와 복구 기록은 읽지 않는다.
+            result = {'status': 'closed', 'engine': assert_closed()}
         elif args.action == 'pending':
             result = {'pending': [str(p.parent) for p in pending(home)]}
         elif args.action == 'recover':

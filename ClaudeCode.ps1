@@ -69,6 +69,11 @@ $script:ClaudeCodeOps=@{
         return @{effect='restored';nativeId=[string]$done.restored.session;view=$done.restored;message=[string]$done.message}
     }
     open={ param($R) @{message=[string](Invoke-ClaudeCore $R 'Open').message} }
+    guard={ param($R)
+        # 프로젝트 파일을 먼저 쓰기 전에, 복원과 같은 검사로 Claude Code가 닫혔는지 본다. 열려 있으면 busy다.
+        try { Assert-AgentClosed 'claude-code' } catch { return @{status='busy';reasonCode='engine_open';reason=$_.Exception.Message} }
+        return @{}
+    }
 }
 if ($implArgs.Count -and $implArgs[0] -ceq '-LibraryOnly') { return }
 Invoke-Impl $script:ClaudeCodeOps $implArgs

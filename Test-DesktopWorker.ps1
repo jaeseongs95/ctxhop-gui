@@ -58,6 +58,14 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
             }
             return @{status='imported';journal='fixture/recovery/completed.json'}
         }
+        guard {
+            if ($script:GuardOpen) {
+                $e=[InvalidOperationException]::new('Codex 앱/CLI/IDE를 모두 종료하세요. Codex/IDE writer PID: 1')
+                $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='writer';token=$null}
+                throw $e
+            }
+            return @{status='closed';engine='0.158.0'}
+        }
         default { throw 'unexpected backend operation' }
     }
 }
@@ -147,6 +155,25 @@ try {
     Assert ($apply[0] -eq 'apply' -and $apply[[array]::IndexOf($apply,'--token')+1] -ceq 'exact-token-A') 'apply must pass exact inspect token'
     Assert ($apply[[array]::IndexOf($apply,'--run')+1] -cmatch '^[0-9a-f]{32}$') 'apply names its recovery record after the operation ID from Worker'
     foreach ($bad in @('../x',('A'*32),('a'*31),$null,32)) { Throws {Assert-OperationId $bad} '작업 ID' }
+    # 엔진 사전 검사(guard): 프로젝트 파일을 먼저 쓰기 전에 부른다. 열린 엔진은 busy, 검사 자체를 못 하면 failed다.
+    $guardJob=[pscustomobject]@{agent='codex-desktop';home=$desktopRoot}
+    $script:GuardOpen=$false
+    $g=Invoke-Vendor $guardJob 'guard' @{}
+    Assert ($g.status -ceq 'ok') 'Codex guard is ok when no engine or IDE is open'
+    Assert ($script:Calls[-1].arguments[0] -ceq 'guard' -and $script:Calls[-1].arguments[[array]::IndexOf($script:Calls[-1].arguments,'--home')+1] -ceq $desktopRoot) 'Codex guard asks the backend for the target home'
+    $script:GuardOpen=$true
+    $failure=$null; try { $null=Invoke-Vendor $guardJob 'guard' @{} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy' -and $failure.Exception.Data['vendorResult'].reasonCode -ceq 'engine_open') 'an open Codex engine makes guard busy'
+    $script:GuardOpen=$false
+    $realClosed=${function:Assert-AgentClosed}
+    try {
+        ${function:Assert-AgentClosed}={ param($Agent) if ($script:ClaudeOpen) { throw 'Claude Code를 종료하세요.' } }
+        $claudeGuard=[pscustomobject]@{agent='claude-code'}
+        $script:ClaudeOpen=$false; Assert ((Invoke-Vendor $claudeGuard 'guard' @{}).status -ceq 'ok') 'Claude guard is ok when Claude Code is closed'
+        $script:ClaudeOpen=$true
+        $failure=$null; try { $null=Invoke-Vendor $claudeGuard 'guard' @{} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy') 'an open Claude Code makes guard busy'
+    } finally { ${function:Assert-AgentClosed}=$realClosed }
     Assert (-not (Test-Path -LiteralPath $previewStage)) 'successful restore removes its plaintext staging copy'
     $odd=Join-Path $staging 'not-a-stage'; $null=New-Item -ItemType Directory -Path $odd
     Assert ((Remove-DesktopStage $odd) -match '지우지 못했습니다' -and (Test-Path -LiteralPath $odd)) 'cleanup refuses folders it did not create'
