@@ -547,7 +547,8 @@
 - **계약**: `recover`(`status`·`list`·`rollback`·`resolve`)와 `guard`를 두 구현이 처리합니다. `restore` 요청에 `operationId`가 들어갑니다.
 - **고정 해시**: `ClaudeWorker.ps1`은 `prepared`, 작업 ID 이름, `completed` 원자 기록, 남은 `pending` 마무리 때문에 `E4BA86F0…D2B4`로 바뀌었습니다. 백엔드는 `apply --run`과 `guard` 동작 때문에 `DEF1FDB9…B349`입니다.
 - **구현 감사 r38 반영**: 벤더 호출 뒤 자손이 모두 끝난 것을 확인한 다음에 상태를 새로 읽고, 프로젝트 파일을 되돌리기 전에 엔진 guard를 부르며, 저장된 계획으로 되돌릴 때마다 경로의 링크·정션을 새로 검사합니다. 늦게 끝나는 자손, 되돌리기 직전 엔진 열림, 계획 뒤 정션으로 바뀐 폴더(하위·복원·상위), 시작 시각을 읽지 못하는 앞 Worker, abandoned mutex와 살아 있는 앞 Worker, 끝내는 도중 계속 생기는 자손을 시험합니다.
-- **검사**(LF 사본, Windows PowerShell 5.1): Strings 2067, ProjectFiles 192, Contract 95, DesktopWorker 924, DesktopGUI 100, ClaudeWorker 828, ClaudeGUI 166, 통합 108이 모두 통과했습니다. 백엔드 단위 시험은 백엔드를 마지막으로 바꾼 `2a94904`에서 42/42로 두 번 통과했습니다.
+- **Codex가 없는 PC**: Codex 데이터 폴더가 없으면 Codex 복구 기록 목록은 비어 있습니다. 그래서 Claude만 쓰는 PC에서 중단된 복원 검사가 모든 작업을 막지 않습니다(PR #3 CI에서 발견). 시험은 `CODEX_HOME`을 없는 폴더로 두어 실제 `%USERPROFILE%\.codex`를 보지 않습니다.
+- **검사**(LF 사본, Windows PowerShell 5.1): Strings 2067, ProjectFiles 192, Contract 95, DesktopWorker 931, DesktopGUI 100, ClaudeWorker 828, ClaudeGUI 166, 통합 108이 모두 통과했습니다. 백엔드 단위 시험은 백엔드를 마지막으로 바꾼 `2a94904`에서 42/42로 두 번 통과했습니다.
   - 변이 검사: 계획 재확인, 치운 파일 해시, 첫 실패에서 멈춤, 되돌리기의 mismatch·보존 사본·`.part`·충돌·확인 스냅숏·재시작 조건, Job의 살아 있는 Worker·Job 종료·자손 종료·이름 없음, Claude 짝 기록·기록 이름 중복·해시 확인·옆 폴더 원본, Worker의 성공 증거·`local_newer`·원래 기록 조회(R37-N1)·writer 확인·차단·겹침·실패 뒤 대화 호출을 각각 되돌려 보면 시험이 실패했습니다.
   - 결과가 달라지지 않는 변이 두 개가 남았습니다. 목록의 자동 정리는 `complete`만 결정표로 보내므로 모드 조건을 넓혀도 같고, 방금 쓴 종료 기록을 다시 확인하는 줄은 지워도 같습니다(방어용).
 
@@ -665,7 +666,7 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 
 ## 고정 해시 (SHA-256)
 
-아래 표는 `20260927.7` 패키지 때 계산한 값입니다. 코드가 실행할 때 확인하는 고정값은 백엔드와 `ClaudeWorker.ps1` 두 줄이고, 이 두 줄은 S3에서 지금 값으로 바꿨습니다. 나머지 줄은 그 패키지의 파일 해시라 지금 파일과 다르며, 다음 릴리스 때 다시 계산합니다.
+아래 표는 `20260927.7` 패키지 때 계산한 값입니다. 실행할 때 코드가 확인하는 고정값은 백엔드, `bin\ctxhop.exe`, `bin\ctxhop-claude.exe` 줄이고, `ClaudeWorker.ps1` 줄은 시험(`Test-DesktopWorker.ps1`)이 확인합니다. 백엔드와 `ClaudeWorker.ps1` 줄은 S3에서 지금 값으로 바꿨고, 두 실행 파일은 그 뒤 바뀌지 않았습니다. 나머지 줄은 그 패키지의 파일 해시라 지금 파일과 다르며, 다음 릴리스 때 다시 계산합니다.
 
 | 파일 | SHA-256 |
 |---|---|

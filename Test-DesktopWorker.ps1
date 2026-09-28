@@ -25,7 +25,7 @@ function Throws([scriptblock]$Body,[string]$Pattern) {
     Assert ($errorRecord.Exception.Message -match $Pattern) "expected $Pattern, got $($errorRecord.Exception.Message)"
 }
 $testDirectory=Join-Path ([IO.Path]::GetTempPath()) ('CtxHop-vnext-worker-'+[guid]::NewGuid().ToString('N'))
-$oldLocal=$env:LOCALAPPDATA
+$oldLocal=$env:LOCALAPPDATA; $oldCodexHome=$env:CODEX_HOME
 $script:Calls=@(); $script:Id='11111111-1111-4111-8111-111111111111'; $script:State='conflict'; $script:ApplyFail=$false
 $script:BundleA='peer-a/'+('a'*32); $script:BundleB='peer-b/'+('b'*32)
 $script:Metadata=[pscustomobject]@{sessionId=$script:Id;title='합성 대화';sourceCwd='D:\source';updatedAt='2026-09-26T01:00:00Z';historyMode='paginated';cliVersion='0.116.0';recordCount=4}
@@ -116,6 +116,8 @@ function Invoke-Bundle([string[]]$Arguments) {
 try {
     $null=New-Item -ItemType Directory -Path $testDirectory
     $env:LOCALAPPDATA=$testDirectory
+    # 홈을 주지 않은 작업(Claude)이 실제 %USERPROFILE%\.codex를 보지 않게, 없는 폴더를 Codex 기본 홈으로 둔다.
+    $env:CODEX_HOME=Join-Path $testDirectory 'no-codex-home'
     $desktopRoot=Join-Path $testDirectory 'synthetic-home'; $target=Join-Path $testDirectory '프로젝트 폴더'
     $null=New-Item -ItemType Directory -Path $desktopRoot; $null=New-Item -ItemType Directory -Path $target
     $job=@{action='List';agent='codex-desktop';home=$desktopRoot;projectPath=$target;search='';nativeId=$script:Id;remoteId=$script:BundleA}
@@ -191,6 +193,12 @@ try {
         $failure=$null; try { $null=Invoke-Vendor $claudeGuard 'guard' @{} } catch { $failure=$_ }
         Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy') 'an open Claude Code makes guard busy'
     } finally { ${function:Assert-AgentClosed}=$realClosed }
+    # Codex 데이터 폴더가 없는 PC(Claude만 쓰는 경우): 목록은 비어 있어 복원·백업·열기를 막지 않는다. 기록 조회는 실패한다.
+    $noHome=[pscustomobject]@{agent='codex-desktop';home=''}
+    Assert (-not @((Invoke-Vendor $noHome 'recover' @{mode='list'}).records).Count) 'a missing Codex data folder has no recovery records'
+    $failure=$null; try { $null=Invoke-Vendor $noHome 'recover' @{mode='status';operationId=('f'*32)} } catch { $failure=$_ }
+    Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed') 'a record query against a missing Codex data folder fails instead of saying absent'
+    Assert (-not @((Get-JournalRows @{agent='claude-code'}).failed).Count) 'a Claude job on a PC without Codex is not blocked by the journal check'
     # Codex 복구 기록(S3 명세 2.3·4.2절): 작업 ID 이름의 run 폴더를 직접 읽는다. 되돌리기는 백엔드 recover, 닫기는 journal 이름 바꾸기.
     $recoveryRoot=Join-Path $desktopRoot '.ctxhop-desktop-recovery'
     function Write-RunJournal([string]$Op,[string]$Text,[string]$Name='journal.json') {
@@ -972,7 +980,7 @@ Start-Sleep 120
     Remove-Item -LiteralPath $script:RecoveryRootForCases -Recurse -Force
     Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
 } finally {
-    $env:LOCALAPPDATA=$oldLocal
+    $env:LOCALAPPDATA=$oldLocal; $env:CODEX_HOME=$oldCodexHome
     $resolved=[IO.Path]::GetFullPath($testDirectory); $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
     if (-not $resolved.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($resolved) -notmatch '^CtxHop-vnext-worker-[a-f0-9]{32}$') { throw 'Refusing cleanup outside fixture directory' }
     if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }

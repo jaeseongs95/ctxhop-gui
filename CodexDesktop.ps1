@@ -201,6 +201,11 @@ $script:CodexDesktopOps=@{
     recover={ param($R)
         # 복구 기록 조회·되돌리기·닫기(S3 명세 4.2절). 되돌리기는 기존 백엔드 recover가 하고, 닫기는 journal 이름만 바꾼다.
         if ([string]$R.mode -cnotin @('status','list','rollback','resolve')) { throw (T 'WkRecoverModeInvalid' ([string]$R.mode)) }
+        # Codex 데이터 폴더가 없는 PC(Claude만 쓰는 경우)에는 복구 기록도 없다. 목록은 비어 있고, 나머지 모드는 폴더가 없으면 실패한다.
+        if ([string]$R.mode -ceq 'list') {
+            $path=if ($R.home) {[string]$R.home} elseif ($env:CODEX_HOME) {$env:CODEX_HOME} else {Join-Path $env:USERPROFILE '.codex'}
+            if ([IO.Path]::IsPathRooted($path) -and -not (Test-Path -LiteralPath $path)) { return @{records=@()} }
+        }
         $desktopRoot=Get-DesktopHome $R
         switch -CaseSensitive ([string]$R.mode) {
             status { return @{state=(Get-DesktopRecord $desktopRoot ([string]$R.operationId)).state} }
