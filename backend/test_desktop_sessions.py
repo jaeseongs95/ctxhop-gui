@@ -122,15 +122,13 @@ class Sessions(unittest.TestCase):
         self.assertEqual(restored['data']['thread']['sandbox_policy'], '{"type":"read-only"}')
         self.assertEqual(restored['data']['thread']['approval_mode'], 'untrusted')
         self.assertEqual(restored['data']['thread']['project_id'], None)
-        delta = len(restored['rollout']) - len(original['rollout'])
+        def place(raw, at):  # (줄 번호, 줄 안 위치)
+            return raw[:at].count(b'\n'), at - (raw.rfind(b'\n', 0, at) + 1)
         for left, right in zip(original['data']['history']['thread_turns'], restored['data']['history']['thread_turns']):
             for key in ('rollout_byte_offset', 'rollout_end_byte_offset'):
-                if left[key] and left[key] > len(original['rollout'].split(b'\n')[0]):
-                    if key == 'rollout_end_byte_offset':
-                        self.assertEqual(right[key], left[key] + delta)
-                    else:
-                        header_delta = len(restored['rollout'].split(b'\n')[0]) - len(original['rollout'].split(b'\n')[0])
-                        self.assertEqual(right[key], left[key] + header_delta)
+                if left[key]:
+                    # 바뀐 설정 기록 길이만큼 옮겨져 두 파일에서 같은 줄의 같은 자리를 가리켜야 한다.
+                    self.assertEqual(place(restored['rollout'], right[key]), place(original['rollout'], left[key]))
         self.assertEqual(self.preview()['status'], 'equal')
 
     def test_02_native_read_resume(self):
@@ -144,6 +142,9 @@ class Sessions(unittest.TestCase):
             payload = json.dumps(items, ensure_ascii=False)
             self.assertIn('CTXHOP_NATIVE_FIXTURE_USER', payload)
             self.assertIn('CTXHOP_NATIVE_FIXTURE_REPLY', payload)
+            # 작업 폴더를 넘기지 않아도(요청 값 없음) 원래 PC 폴더가 아니라 가져온 작업 폴더로 열린다.
+            bare = rpc.call('thread/resume', {'threadId': self.thread_id, 'excludeTurns': True, 'modelProvider': 'openai'})
+            self.assertEqual((bare['cwd'], bare['approvalPolicy'], bare['sandbox']['type']), (str(self.cwd), 'untrusted', 'readOnly'))
             resumed = rpc.call('thread/resume', {'threadId': self.thread_id, 'excludeTurns': True,
                 'cwd': str(self.cwd), 'modelProvider': 'openai'})
             self.assertEqual(resumed['thread']['id'], self.thread_id)
@@ -808,6 +809,176 @@ class Sessions(unittest.TestCase):
             {'data': {'thread': {'cwd': 'E:\\sub'}}, 'rollout': child}]}
         self.assertEqual(d.work_folders(family), {'cwds': ['D:\\codex\\보고서', 'D:\\other', 'E:\\sub'],
             'edits': ['D:\\codex\\보고서\\a.py', 'C:\\Users\\me\\Desktop\\x.txt']})
+
+    def with_settings(self, item, **values):
+        """세션 파일의 모든 설정 기록(turn_context, thread_settings_applied)에 values를 넣은(None이면 뺀) 사본. 이력 행은 비운다(위치가 바뀌므로)."""
+        item = copy.deepcopy(item)
+        lines = []
+        for obj in d.records(item['rollout'], item['data']['thread']['id']):
+            settings = d.settings_record(obj)
+            for key, value in values.items() if settings is not None else ():
+                if value is None:
+                    settings.pop(key, None)
+                else:
+                    settings[key] = value
+            lines.append(d.encoded(obj) + b'\n')
+        item['rollout'] = b''.join(lines)
+        item['data']['history'] = {table: [] for table in d.TABLES}
+        return item
+
+    def test_38_restore_replaces_every_resume_setting(self):
+        # 엔진은 이어 쓸 때 마지막 설정 기록의 승인·권한과 소유 thread_settings_applied의 작업 폴더를 쓴다.
+        # 원래 PC의 never·전체 권한·작업 루트가 어느 기록에 있든 복원 후에는 이 PC 값만 남아야 한다.
+        unsafe = {'approval_policy': 'never', 'active_permission_profile': {'id': ':danger-full-access'}}
+        source = self.with_settings(self.original['members'][0], **unsafe)
+        path = self.home / 'sessions' / 'x.jsonl'
+        restored = d.mapped(source, self.cwd, path, None)
+        parsed = d.records(restored['rollout'], self.thread_id)
+        self.assertEqual(d.resume_settings(parsed), d.SAFE_SETTINGS)
+        owned = [d.settings_record(o) for o in parsed if o['type'] == 'event_msg'
+            and o['payload'].get('type') == 'thread_settings_applied' and o['payload'].get('thread_id') == self.thread_id]
+        self.assertTrue(owned, 'fixture에 소유 thread_settings_applied가 있어야 한다')
+        self.assertEqual(owned[-1]['cwd'], str(self.cwd))
+        self.assertEqual(owned[-1].get('runtime_workspace_roots', [str(self.cwd)]), [str(self.cwd)])
+        self.assertEqual(d.canonical(restored['rollout'], self.thread_id), d.canonical(source['rollout'], self.thread_id))
+        # 이 PC에 같은 대화가 있으면 그 대화의 현재 승인·권한을 그대로 둔다.
+        local = self.with_settings(self.original['members'][0], approval_policy='on-request',
+            active_permission_profile={'id': ':workspace'})
+        kept = d.mapped(source, self.cwd, path, local)
+        self.assertEqual(d.resume_settings(d.records(kept['rollout'], self.thread_id)),
+            d.resume_settings(d.records(local['rollout'], self.thread_id)))
+
+    def reviewer_shape(self, item, order, last):
+        """앞 기록에 승인자 auto_review가 있고 마지막 turn_context의 승인자가 없거나(last='missing') null인 사본.
+        order='tsa'는 끝의 thread_settings_applied를 헤더 뒤로 옮기고, 'tc'는 앞 turn_context를 하나 더 두고 끝의 설정 기록을 뺀다."""
+        item = self.with_settings(item)
+        objs = d.records(item['rollout'], self.thread_id)
+        at = max(i for i, o in enumerate(objs) if o['type'] == 'turn_context')
+        tail = [o for o in objs[at + 1:] if d.settings_record(o) is None]
+        if order == 'tsa':
+            early = [o for o in objs[at + 1:] if d.settings_record(o) is not None]
+            self.assertTrue(early, 'fixture 끝에 thread_settings_applied가 있어야 한다')
+        else:
+            early = [copy.deepcopy(objs[at])]
+        for o in early:
+            d.settings_record(o)['approvals_reviewer'] = 'auto_review'
+        objs = objs[:1] + early + objs[1:at + 1] + tail if order == 'tsa' else objs[:at] + early + objs[at:at + 1] + tail
+        context = [o for o in objs if o['type'] == 'turn_context'][-1]['payload']
+        if last == 'missing':
+            context.pop('approvals_reviewer', None)
+        else:
+            context['approvals_reviewer'] = None
+        item['rollout'] = b''.join(d.encoded(o) + b'\n' for o in objs)
+        return item
+
+    def engine_resume(self, item, label):
+        """세션 파일 하나만 둔 새 격리 홈에서 실제 엔진이 요청 값 없이 이어 쓸 때 고르는 (승인 정책, 승인자, 권한 프로필 ID)."""
+        day = self.root / label / 'sessions' / '2026' / '09' / '27'  # 긴 시험 폴더에서도 260자를 넘지 않게 짧은 이름
+        day.mkdir(parents=True)
+        (day / f'rollout-2026-09-27T00-00-00-{self.thread_id}.jsonl').write_bytes(item['rollout'])
+        rpc = Rpc(EXE, day.parents[3])
+        try:
+            r = rpc.call('thread/resume', {'threadId': self.thread_id, 'excludeTurns': True, 'modelProvider': 'openai'})
+        finally:
+            rpc.close()
+        return r['approvalPolicy'], r['approvalsReviewer'], (r.get('activePermissionProfile') or {}).get('id')
+
+    def test_41_resume_settings_follow_engine_and_keep_local_reviewer(self):
+        # 마지막 turn_context에 승인자가 없거나 null이면 엔진은 앞 기록의 승인자를 쓴다(persisted_resume_settings.rs).
+        # 덮어쓰기 전후 엔진이 고르는 값이 같아야 하고, 처음 가져오는 대화는 원래 PC의 앞 기록으로 돌아가지 않아야 한다.
+        path = self.home / 'sessions' / 'x.jsonl'
+        item = self.original['members'][0]
+        # 원래 PC: 승인자 user, never·전체 권한, turn_context 두 개.
+        source = self.with_settings(item, approval_policy='never', approvals_reviewer='user',
+            active_permission_profile={'id': ':danger-full-access'})
+        objs = d.records(source['rollout'], self.thread_id)
+        at = max(i for i, o in enumerate(objs) if o['type'] == 'turn_context')
+        source['rollout'] = b''.join(d.encoded(o) + b'\n' for o in objs[:at] + [copy.deepcopy(objs[at])] + objs[at:])
+        for order in ('tsa', 'tc'):
+            for last in ('missing', 'null'):
+                label = order + last[0]
+                local = self.reviewer_shape(item, order, last)
+                before = self.engine_resume(local, label + 'l')
+                self.assertEqual(before[1], 'auto_review', label)
+                settings = d.resume_settings(d.records(local['rollout'], self.thread_id))
+                self.assertEqual((settings['approval_policy'], settings['approvals_reviewer']), before[:2], label)
+                self.assertEqual(self.engine_resume(d.mapped(source, self.cwd, path, local), label + 'k'), before, label)
+                restored = d.mapped(self.reviewer_shape(item, order, last), self.cwd, path, None)
+                self.assertEqual(self.engine_resume(restored, label + 'n'), ('untrusted', 'user', ':read-only'), label)
+        # 이 PC 대화 어디에도 승인자가 없으면(엔진은 설정 기본값을 씀) 원래 PC 앞 기록의 승인자가 끼어들지 않아야 한다.
+        bare = self.with_settings(item, approvals_reviewer=None)
+        bare['rollout'] = b''.join(d.encoded(o) + b'\n' for o in d.records(bare['rollout'], self.thread_id)
+            if o['type'] != 'event_msg' or d.settings_record(o) is None)
+        expected = self.engine_resume(bare, 'bare')
+        for last in ('missing', 'null'):
+            kept = d.mapped(self.reviewer_shape(item, 'tc', last), self.cwd, path, bare)
+            self.assertEqual(self.engine_resume(kept, 'bare' + last[0]), expected, last)
+
+    def test_39_old_app_tools_are_backed_up_and_restored(self):
+        # 옛 Codex 앱이 헤더에 남긴 동적 도구가 있어도 백업·복원하고, 미리보기에서 알린다.
+        item = self.original['members'][0]
+        tools = [{'namespace': 'codex_app', 'name': 'create_thread', 'description': 'old app tool', 'inputSchema': {}}]
+        family = copy.deepcopy(self.original)
+        family['members'][0] = self.rekeyed(item, self.thread_id, item['data']['thread']['source'], dynamic_tools=tools)
+        archive = self.save(family, 'old-tools')
+        preview = self.preview(archive)
+        self.assertEqual(preview['status'], 'new')
+        self.assertIn('옛 Codex 앱 도구', preview['reason'])
+        self.assertNotIn('옛 Codex 앱 도구', self.preview()['reason'])
+        self.assertEqual(self.apply(archive)['status'], 'imported')
+        output = self.root / 'old-tools-export.zip'
+        with mock.patch.object(d, 'engine_version', return_value=d.VERSIONS[-1]):
+            code, result = self.run_cli('export', '--home', str(self.home), '--id', self.thread_id, '--output', str(output))
+        self.assertEqual(code, 0, result)
+        header = json.loads(d.read_archive(output)['members'][0]['rollout'].split(b'\n', 1)[0])['payload']
+        self.assertEqual(header['dynamic_tools'], tools)
+
+    def test_40_pending_restore_blocks_only_its_conversations(self):
+        item = self.original['members'][0]
+        other_id = str(uuid.uuid4())
+        other = copy.deepcopy(self.original)
+        other['members'][0] = self.rekeyed(item, other_id, item['data']['thread']['source'], session_id=other_id)
+        self.apply(self.save(other, 'other'))
+        self.apply()
+        def fail(stage):
+            if stage == 'commit':
+                raise RuntimeError('injected commit')
+        with self.assertRaisesRegex(RuntimeError, 'commit'):
+            self.apply(self.append('after'), failpoint=fail)
+        self.assertEqual(d.pending_ids(self.home), {self.thread_id})
+        with mock.patch.object(d, 'engine_version', return_value=d.VERSIONS[-1]):
+            code, blocked = self.run_cli('export', '--home', str(self.home), '--id', self.thread_id,
+                '--output', str(self.root / 'blocked.zip'))
+            self.assertEqual((code, blocked['status']), (1, 'blocked'))
+            self.assertIn('먼저 복구', blocked['reason'])
+            code, result = self.run_cli('export', '--home', str(self.home), '--id', other_id,
+                '--output', str(self.root / 'other-export.zip'))
+        self.assertEqual((code, result['status']), (0, 'exported'))
+        # 정상 기록(형식 1, 하위 대화만 쓴 형식 2)은 다른 대화의 백업을 막지 않고,
+        # 대상을 확정할 수 없는 기록은 모든 백업을 막는다.
+        def record(text):
+            run = self.home / '.ctxhop-desktop-recovery' / uuid.uuid4().hex
+            run.mkdir()
+            (run / 'journal.json').write_text(text, encoding='utf-8')
+            return run
+        def export_other():
+            with mock.patch.object(d, 'engine_version', return_value=d.VERSIONS[-1]):
+                return self.run_cli('export', '--home', str(self.home), '--id', other_id,
+                    '--output', str(self.root / (uuid.uuid4().hex + '.zip')))
+        record(json.dumps({'status': 'pending', 'id': str(uuid.uuid4())}))
+        record(json.dumps({'status': 'pending', 'version': 2, 'id': self.thread_id, 'members': [{'id': str(uuid.uuid4())}]}))
+        self.assertEqual(export_other()[1]['status'], 'exported')
+        for label, text in [('bad json', '{'), ('unknown version', {'version': 3, 'members': [{'id': other_id}]}),
+                ('no members', {'version': 2, 'id': other_id}), ('empty members', {'version': 2, 'members': []}),
+                ('null id', {'version': 2, 'members': [{'id': None}]}), ('bad id', {'version': 2, 'members': [{'id': 'x'}]}),
+                ('format 1 without id', {})]:
+            run = record(text if isinstance(text, str) else json.dumps({'status': 'pending', **text}))
+            code, result = export_other()
+            self.assertEqual((code, result['status']), (1, 'blocked'), label)
+            if label != 'bad json':
+                self.assertIn('손상', result['reason'], label)
+            shutil.rmtree(run)
+        self.assertEqual(export_other()[1]['status'], 'exported')
 
 
 if __name__ == '__main__':

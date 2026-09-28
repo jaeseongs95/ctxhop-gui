@@ -183,15 +183,60 @@ def validate_row(row, table):
             raise ValueError('DB 값 형식이 올바르지 않습니다.')
 
 
+SETTINGS_KEYS = ('approval_policy', 'approvals_reviewer', 'sandbox_policy', 'permission_profile', 'active_permission_profile')
+SAFE_SETTINGS = {'approval_policy': 'untrusted', 'approvals_reviewer': 'user', 'sandbox_policy': {'type': 'read-only'},
+    'permission_profile': {'type': 'managed', 'file_system': {'type': 'restricted', 'entries': [
+        {'path': {'type': 'special', 'value': {'kind': 'root'}}, 'access': 'read'}]}, 'network': 'restricted'},
+    'active_permission_profile': {'id': ':read-only'}}
+# 기록 종류별로 반드시 채우는 설정 값. turn_context의 approvals_reviewer는 선택 필드지만,
+# 비어 있으면 엔진이 그 앞 기록(원래 PC 값)에서 가져오므로 늘 채운다.
+REQUIRED_SETTINGS = {'turn_context': ('approval_policy', 'approvals_reviewer', 'sandbox_policy'),
+    'event_msg': ('approval_policy', 'approvals_reviewer', 'permission_profile')}
+
+
+def settings_record(obj):
+    """엔진이 이어 쓸 때 승인·권한·작업 폴더를 읽는 기록(turn_context, thread_settings_applied)이면 그 설정 dict."""
+    payload = obj['payload']
+    if obj['type'] == 'turn_context':
+        return payload
+    if obj['type'] == 'event_msg' and payload.get('type') == 'thread_settings_applied':
+        if not isinstance(payload.get('thread_settings'), dict):
+            raise ValueError('설정 기록 형식이 올바르지 않습니다.')
+        return payload['thread_settings']
+    return None
+
+
+def resume_settings(parsed):
+    """엔진이 이어 쓸 때 쓰는 값(persisted_resume_settings.rs). 설정 기록이 없으면 None.
+    승인 정책·권한 프로필은 마지막 설정 기록의 값이다. 승인자는 그 기록에 없거나 null이면 앞 기록 중 가장 가까운 값이다.
+    sandbox_policy·permission_profile은 엔진이 읽지 않지만 마지막 turn_context에 함께 옮겨 쓰는 값이다."""
+    found = [settings_record(obj) for obj in parsed]
+    last = max((i for i, settings in enumerate(found) if settings is not None), default=None)
+    if last is None:
+        return None
+    result = {key: found[last].get(key) for key in ('approval_policy', 'approvals_reviewer', 'active_permission_profile')}
+    for settings in reversed(found[:last]):
+        if result['approvals_reviewer'] is not None:
+            break
+        if settings is not None:
+            result['approvals_reviewer'] = settings.get('approvals_reviewer')
+    context = next((found[i] for i in range(len(parsed) - 1, -1, -1) if parsed[i]['type'] == 'turn_context'), None)
+    for key in ('sandbox_policy', 'permission_profile'):
+        if context is not None and key in context:
+            result[key] = context[key]
+    return result
+
+
 def canonical(raw, thread_id, sessions=()):
     result = records(raw, thread_id, sessions)
     header = result[0]['payload']
     header['cwd'] = '<mapped-project>'
     header.pop('runtime_workspace_roots', None)
     for obj in result:
-        if obj['type'] == 'turn_context':
-            for key in ('cwd', 'workspace_roots', 'approval_policy', 'approvals_reviewer', 'sandbox_policy', 'permission_profile'):
-                obj['payload'].pop(key, None)
+        settings = settings_record(obj)
+        if settings is not None:
+            for key in ('cwd', 'workspace_roots', 'runtime_workspace_roots', *SETTINGS_KEYS):
+                settings.pop(key, None)
     return [digest(encoded(item)) for item in result]
 
 
@@ -210,8 +255,6 @@ def validate_member(member, sessions=()):
     roots = header.get('runtime_workspace_roots', [row['cwd']])
     if not isinstance(roots, list) or len(roots) > 100 or any(not isinstance(p, str) or not Path(p).is_absolute() for p in roots):
         raise ValueError('세션의 작업 폴더 목록이 올바르지 않습니다.')
-    if header.get('dynamic_tools') or member['data'].get('dynamicTools'):
-        raise ValueError('동적 도구가 등록된 세션은 현재 이식 지원 범위 밖입니다.')
     tables = member['data']['history']
     if set(tables) != set(TABLES):
         raise ValueError('이력 테이블 목록이 다릅니다.')
@@ -620,6 +663,9 @@ def compare(home, incoming, cwd, engine=None):
     reason = REASONS[status]
     if len(ids) > 1 or local_only:
         reason += f' · 하위 대화 {len(ids) - 1}개' + (f'({parts})' if parts and current is not None else '')
+    # 옛 Codex 앱(0.146~0.152)이 헤더에 남긴 앱 도구. 이어 쓸 수 있고, 옛 도구 호출은 현재 앱이 사용할 수 없다고 답한다.
+    if any(json.loads(item['rollout'].split(b'\n', 1)[0])['payload'].get('dynamic_tools') for item in incoming['members']):
+        reason += ' · 옛 Codex 앱 도구 기록 포함(이어서 대화 가능)'
     token = digest(encoded({'archive': incoming['archiveHash'], 'home': str(home),
         'cwd': str(cwd), 'baseline': snapshot_hash(current), 'status': status}))
     return ({'status': status, 'reason': reason, 'token': token, 'source': summary(incoming), 'target': summary(current)},
@@ -725,6 +771,25 @@ def pending(home):
     return [p for p in root.glob('*/journal.json') if json.loads(p.read_text(encoding='utf-8'))['status'] == 'pending']
 
 
+def pending_ids(home):
+    """중단된 가져오기 기록이 쓰려던 대화 ID(형식 1은 대화 하나, 형식 2는 members).
+    대상을 확정할 수 없는 기록(알 수 없는 형식, 빈 목록, 잘못된 ID)이 하나라도 있으면 None이다(모든 백업을 막는다)."""
+    ids = set()
+    for path in pending(home):
+        journal = json.loads(path.read_text(encoding='utf-8'))
+        entries = [journal] if 'version' not in journal else journal.get('members') if journal['version'] == 2 else None
+        if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_MEMBERS:
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get('id'), str):
+                return None
+            try:
+                ids.add(native_id(entry['id']))
+            except ValueError:
+                return None
+    return ids
+
+
 def save_json(path, obj):
     temp = path.with_suffix('.tmp')
     # 중단으로 남은 이전 임시 파일은 덮어쓴다. 'xb'면 복구 완료 기록이 영구히 실패한다.
@@ -751,28 +816,36 @@ def mapped(item, cwd, path, current, sessions=()):
             memory_mode='disabled', daybreak_enabled=0)
     lines = raw.splitlines(keepends=True)
     parsed = records(raw, row['id'], sessions)
-    last_context = next((i for i in range(len(parsed)-1, -1, -1) if parsed[i]['type'] == 'turn_context'), None)
     parsed[0]['payload']['cwd'] = str(cwd)
     if 'runtime_workspace_roots' in parsed[0]['payload']:
         parsed[0]['payload']['runtime_workspace_roots'] = [str(cwd)]
     changes = {0: encoded(parsed[0]) + b'\n'}
-    if last_context is not None:
-        context = parsed[last_context]['payload']
-        context['cwd'], context['workspace_roots'] = str(cwd), [str(cwd)]
-        if current is not None:
-            prior_context = next((obj['payload'] for obj in reversed(records(current['rollout'], row['id'], sessions))
-                if obj['type'] == 'turn_context'), None)
-        else:
-            prior_context = None
-        for key in ('approval_policy', 'approvals_reviewer', 'sandbox_policy', 'permission_profile'):
-            context.pop(key, None)
-            if prior_context is not None and key in prior_context:
-                context[key] = copy.deepcopy(prior_context[key])
-        if prior_context is None:
-            context.update(approval_policy='untrusted', approvals_reviewer='user', sandbox_policy={'type': 'read-only'},
-                permission_profile={'type': 'managed', 'file_system': {'type': 'restricted', 'entries': [
-                    {'path': {'type': 'special', 'value': {'kind': 'root'}}, 'access': 'read'}]}, 'network': 'restricted'})
-        changes[last_context] = encoded(parsed[last_context]) + b'\n'
+    # 엔진은 이어 쓸 때 승인·권한을 마지막 설정 기록(turn_context 또는 thread_settings_applied)에서,
+    # 작업 폴더·작업 루트는 이 대화 소유의 마지막 thread_settings_applied에서 읽는다. 세 기록을 모두 이 PC 값으로 바꾼다.
+    # 이 PC에 같은 대화가 있으면 그 대화의 현재 승인·권한을 유지하고, 없으면 읽기 전용·untrusted로 둔다.
+    want = resume_settings(records(current['rollout'], row['id'], sessions)) if current is not None else None
+    want = SAFE_SETTINGS if want is None else want
+    targets = {max((i for i, obj in enumerate(parsed) if obj['type'] == 'turn_context'), default=None),
+        max((i for i, obj in enumerate(parsed) if settings_record(obj) is not None), default=None),
+        max((i for i, obj in enumerate(parsed) if obj['type'] == 'event_msg'
+            and obj['payload'].get('type') == 'thread_settings_applied' and obj['payload'].get('thread_id') == row['id']), default=None)}
+    for index in targets - {None}:
+        obj = parsed[index]
+        settings = settings_record(obj)
+        settings['cwd'] = str(cwd)
+        roots = 'workspace_roots' if obj['type'] == 'turn_context' else 'runtime_workspace_roots'
+        if obj['type'] == 'turn_context' or roots in settings:
+            settings[roots] = [str(cwd)]
+        for key in SETTINGS_KEYS:
+            if key == 'sandbox_policy' and obj['type'] != 'turn_context':
+                continue
+            settings.pop(key, None)
+            value = want.get(key)
+            if value is None and key in REQUIRED_SETTINGS[obj['type']]:
+                value = SAFE_SETTINGS[key]  # 빈 값(없음·null)이면 엔진이 앞 기록(원래 PC 값)으로 돌아가므로 채운다
+            if value is not None:
+                settings[key] = copy.deepcopy(value)
+        changes[index] = encoded(obj) + b'\n'
     spans = []
     old_at, new_at = 0, 0
     new_lines = []
@@ -1077,8 +1150,6 @@ def main():
         elif args.action == 'export':
             # 앱 종료 대신 이 묶음이 진행 중인지(assert_idle)와 내보내는 동안 바뀌지 않았는지를 본다.
             engine = engine_version()
-            if pending(home):
-                raise ValueError('중단된 가져오기를 먼저 복구하세요.')
             thread_id = native_id(args.id)
             unreadable = (ValueError, OSError, sqlite3.Error)
             try:
@@ -1088,6 +1159,12 @@ def main():
                 snapshot = selected(home, thread_id)
             if snapshot is None:
                 raise ValueError('선택한 세션이 없습니다.')
+            # 중단된 가져오기는 그 기록의 대화만 반쯤 쓰였을 수 있으므로 그 대화만 막고, 다른 대화의 백업은 막지 않는다.
+            blocked = pending_ids(home)
+            if blocked is None:
+                raise ValueError('복구 기록이 손상돼 대상 대화를 알 수 없습니다. 중단된 가져오기를 먼저 복구하세요.')
+            if blocked & {item['data']['thread']['id'] for item in snapshot['members']}:
+                raise ValueError('중단된 가져오기를 먼저 복구하세요.')
             assert_idle(home, snapshot)
             snapshot['manifest']['engineVersion'] = engine
             write_archive(snapshot, args.output)

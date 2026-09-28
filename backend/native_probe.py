@@ -108,7 +108,8 @@ def main():
     server = HTTPServer(('127.0.0.1', 0), Fixture)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{server.server_port}/v1'
-    (home / 'config.toml').write_text('model_provider = "fixture"\nmodel = "fixture-model"\n'
+    policy = '' if args.sandbox == 'read-only' else 'approval_policy = "never"\ndefault_permissions = ":danger-full-access"\n'
+    (home / 'config.toml').write_text(policy + 'model_provider = "fixture"\nmodel = "fixture-model"\n'
         '[model_providers.fixture]\nname = "fixture"\nwire_api = "responses"\n'
         f'base_url = "{url}"\nrequires_openai_auth = false\nsupports_websockets = false\n', encoding='utf-8')
     rpc = None
@@ -132,6 +133,10 @@ def main():
         report['turns'] = rpc.call('thread/turns/list', {'threadId': thread_id, 'limit': 20})
         report['resume'] = rpc.call('thread/resume', {'threadId': thread_id,
             'excludeTurns': True, 'sandbox': 'read-only', 'approvalPolicy': 'untrusted'})
+        rpc.close()
+        # 앱이 처음 열 때처럼 요청 값 없이 다시 열면 엔진이 이 PC 설정을 thread_settings_applied로 남긴다.
+        rpc = Rpc(args.exe, home)
+        rpc.call('thread/resume', {'threadId': thread_id, 'excludeTurns': True})
         rpc.close()
         import desktop_sessions as d
         d.write_archive(d.selected(home, thread_id), home / 'first.zip')

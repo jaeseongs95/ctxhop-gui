@@ -11,7 +11,7 @@ $script:ClaudeJobCore=${function:Invoke-JobCore}
 $script:ClaudeFindExecutable=${function:Find-Executable}
 . (Join-Path $PSScriptRoot 'ProjectFiles.ps1')
 # Release integration replaces these pins only after reviewing the final candidate.
-$script:DesktopBackendSHA256='C1775722000097548E0B6C72BB000D6552F151E17A232BC1FBEA687A2D74881A'
+$script:DesktopBackendSHA256='C987065CD25BA3988DAA30F185D2D7F29317C9232AC301AB0EF69B98CB304ECB'
 $script:DesktopTransportSHA256='9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006'
 function Find-Executable([string]$Name) {
     if ($Name -eq 'ctxhop') { return (Join-Path $PSScriptRoot 'bin\ctxhop-claude.exe') }

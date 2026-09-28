@@ -95,7 +95,8 @@ The list loads all projects, archived conversations, and shared backups. You can
 - Line breaks in titles become spaces in the shared backup list. The conversation itself does not change.
 - Subagent conversations do not get their own rows. They travel with their parent conversation as one group, and the parent row's context column shows how many there are as `· N subagents`. Subagent conversations whose parent conversation is missing are not shown and are not backed up.
 - Shared backups made by an earlier build are marked `· older format`. They contain only the parent conversation, so restoring one brings back only the parent.
-- Unsupported conversations, such as ones with registered dynamic tools, stop with a reason before anything is written. If any conversation in a group is unsupported, the whole group stops.
+- Unsupported conversations stop with a reason before anything is written. If any conversation in a group is unsupported, the whole group stops.
+- Conversations that carry app tool records (dynamic tools) left by old Codex apps (engine 0.146 to 0.152) are backed up and restored too. The preview reason gets `옛 Codex 앱 도구 기록 포함(이어서 대화 가능)` (contains old Codex app tool records; can be continued). You can keep talking in them; if the model calls an old tool, the current Codex app answers that the tool is no longer available. Earlier GUI versions refuse to restore such backups, so use this version or later on both PCs.
 
 ### Back up
 
@@ -123,6 +124,7 @@ Each backup is a separate encrypted snapshot that holds the parent conversation 
    - A conversation with subagent conversations is judged as one group. If any subagent conversation diverged, the whole group counts as diverged, and you choose restore or skip for the group. The reason column counts the subagent conversations by state.
    - A restore leaves alone subagent conversations that are newer on this PC or exist only on this PC.
    - Every conversation in the group uses the working folder chosen in step 1, even a subagent conversation that originally ran in another folder.
+   - A conversation restored for the first time opens with the `untrusted` approval policy and read-only permissions (`:read-only`). The source PC's approval policy, permissions, and working folders are not carried over, even when this PC's `config.toml` grants full access. Change the conversation's permissions in the Codex app if you need to. When a restore overwrites a conversation that already exists here, that conversation keeps its approval and permission settings.
 4. Check your choices and the working folder, then approve the restore. If the Codex app is running, the backend stops and asks you to quit it. The GUI never force-closes the Codex or Claude apps. If the check token, backup file, ID, data folder, or target folder changes, run the check again.
 5. Open Codex Desktop yourself and check the UUID, the content, and the working folder. The GUI sends no prompt and no CLI resume command. Prepare the Git history (`.git`) and tools separately. For project files, see [Moving project files too](#moving-project-files-too).
 
@@ -202,7 +204,7 @@ While a `*.pending.json` remains in `%LOCALAPPDATA%\CtxHopGUI\recovery`, Claude 
 
 ### A Codex restore failed
 
-After a failure, the GUI does not apply the remaining items. It shows the recovery records from the backend (the list of `pending` folders), and keeps the source backups and those records. While an interrupted record remains, later backups and restores are blocked. **With the Codex app closed**, check and recover from the GUI folder:
+After a failure, the GUI does not apply the remaining items. It shows the recovery records from the backend (the list of `pending` folders), and keeps the source backups and those records. While an interrupted record remains, later restores are blocked, and so are backups of the conversations in that record (other conversations still back up). **With the Codex app closed**, check and recover from the GUI folder:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\backend\Invoke-Desktop.ps1 -Action pending -HomePath 'Codex data folder from the GUI settings tab'
