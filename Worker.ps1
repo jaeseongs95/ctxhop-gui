@@ -521,39 +521,136 @@ function Invoke-ConversationJob([object]$Job) {
     }
 }
 function Enable-WorkerJob {
-    # 이 Worker를 KILL_ON_JOB_CLOSE Job 객체에 넣는다. 벤더 구현·백엔드·엔진 같은 자손은 이 Job을 물려받아, Worker가 어떻게 끝나든 함께 끝난다.
-    # 그래서 다음 Worker가 작업 mutex를 잡았다면 앞 작업의 writer는 남아 있지 않다. 핸들은 일부러 닫지 않는다(프로세스가 끝날 때 닫힘).
+    # 이 Worker를 이름 있는 KILL_ON_JOB_CLOSE Job 객체에 넣는다(S3 명세 2.2절). 벤더 구현·백엔드·엔진 같은 자손은 이 Job을 물려받아,
+    # Worker가 어떻게 끝나든 함께 끝난다. 다음 Worker는 표지에 적힌 이름으로 Job을 열어 앞 writer가 끝났는지 확인한다.
+    # 핸들은 상속되지 않고(보안 속성 null) 일부러 닫지 않는다(프로세스가 끝날 때 닫힘). breakaway는 켜지 않는다.
     if (-not ('CtxHopWorkerJob' -as [type])) {
         Add-Type -TypeDefinition @"
 using System; using System.ComponentModel; using System.Runtime.InteropServices;
 public static class CtxHopWorkerJob {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, IntPtr returned);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [StructLayout(LayoutKind.Sequential)] struct Basic { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
     [StructLayout(LayoutKind.Sequential)] struct Extended { public Basic BasicLimits; public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed; }
     static IntPtr handle = IntPtr.Zero;
+    public static string Name;
     public static bool Enabled { get { return handle != IntPtr.Zero; } }
-    public static void Enable() {
+    public static IntPtr Handle { get { return handle; } }
+    public static void Enable(string name) {
         if (handle != IntPtr.Zero) return;
-        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        IntPtr job = CreateJobObject(IntPtr.Zero, name);
         if (job == IntPtr.Zero) throw new Win32Exception();
+        if (Marshal.GetLastWin32Error() == 183) { CloseHandle(job); throw new Win32Exception(183); } // 같은 이름이 이미 있음
         Extended info = new Extended(); info.BasicLimits.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         int length = Marshal.SizeOf(typeof(Extended)); IntPtr buffer = Marshal.AllocHGlobal(length);
-        try { Marshal.StructureToPtr(info, buffer, false); if (!SetInformationJobObject(job, 9, buffer, (uint)length)) throw new Win32Exception(); }
+        try { Marshal.StructureToPtr(info, buffer, false); if (!SetInformationJobObject(job, 9, buffer, (uint)length)) { CloseHandle(job); throw new Win32Exception(); } }
         finally { Marshal.FreeHGlobal(buffer); }
-        if (!AssignProcessToJobObject(job, GetCurrentProcess())) throw new Win32Exception();
-        handle = job;
+        if (!AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); throw new Win32Exception(); }
+        handle = job; Name = name;
     }
+    // 이름으로 연다(조회·종료 권한). 없으면(ERROR_FILE_NOT_FOUND) Zero, 그 밖의 실패는 예외.
+    public static IntPtr Open(string name) {
+        IntPtr job = OpenJobObject(0x0004 | 0x0008, false, name);
+        if (job != IntPtr.Zero) return job;
+        int error = Marshal.GetLastWin32Error();
+        if (error == 2) return IntPtr.Zero;
+        throw new Win32Exception(error);
+    }
+    public static void Close(IntPtr job) { if (job != IntPtr.Zero) CloseHandle(job); }
+    // JobObjectBasicProcessIdList. 할당 수가 목록 수보다 크면 버퍼를 늘려 전부 받을 때까지 다시 받는다.
+    public static int[] List(IntPtr job) {
+        for (int size = 64; size <= 65536; size *= 4) {
+            int bytes = 8 + size * IntPtr.Size; IntPtr buffer = Marshal.AllocHGlobal(bytes);
+            try {
+                if (!QueryInformationJobObject(job, 3, buffer, (uint)bytes, IntPtr.Zero)) { if (Marshal.GetLastWin32Error() == 234) continue; throw new Win32Exception(); }
+                int assigned = Marshal.ReadInt32(buffer, 0), listed = Marshal.ReadInt32(buffer, 4);
+                if (assigned > listed) continue;
+                int[] ids = new int[listed];
+                for (int i = 0; i < listed; i++) ids[i] = (int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64();
+                return ids;
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        throw new Win32Exception(234);
+    }
+    // 목록의 PID가 그사이 다른 프로세스에 재사용됐을 수 있으므로, 이 Job 소속을 확인한 것만 끝낸다.
+    public static void KillMembers(IntPtr job, int self) {
+        foreach (int id in List(job)) {
+            if (id == self) continue;
+            IntPtr process = OpenProcess(0x0001 | 0x1000, false, id);
+            if (process == IntPtr.Zero) continue;
+            try { bool member; if (IsProcessInJob(process, job, out member) && member) TerminateProcess(process, 1); } finally { CloseHandle(process); }
+        }
+    }
+    public static void Terminate(IntPtr job) { if (!TerminateJobObject(job, 1)) throw new Win32Exception(); }
 }
 "@
     }
-    [CtxHopWorkerJob]::Enable()
+    [CtxHopWorkerJob]::Enable("Local\CtxHopGUI-worker-$([guid]::NewGuid().ToString('N'))")
 }
 function Assert-WorkerJob {
     # 쓰기 작업(복원·되돌리기·닫기)은 Job 객체가 켜져 있어야 한다. 목록·미리보기는 막지 않는다.
     if (-not ('CtxHopWorkerJob' -as [type]) -or -not [CtxHopWorkerJob]::Enabled) { throw (T 'WkJobObjectFailed') }
+}
+function Get-WorkerStarted([int]$ProcessId) {
+    # PID 재사용을 가리려고 시작 시각을 함께 본다. 끝났거나 볼 수 없으면 빈 값.
+    try { $process=[Diagnostics.Process]::GetProcessById($ProcessId); try { return [string]$process.StartTime.ToFileTimeUtc() } finally { $process.Dispose() } } catch { return '' }
+}
+function Get-WorkerFields {
+    # 표지에 적는 지금 Worker의 값(S3 명세 2.4절).
+    return [ordered]@{workerJob=[CtxHopWorkerJob]::Name;workerPid=$PID;workerStarted=(Get-WorkerStarted $PID)}
+}
+function Wait-WorkerJobAlone([int]$WaitSec=60,[int]$KillSec=30) {
+    # 정상 경로(S3 명세 2.2절): Job에 이 Worker만 남을 때까지 기다린다. 넘으면 이 Job 소속만 끝내고 목록을 다시 전부 받는다.
+    # alone: 자손이 모두 스스로 끝남. killed: 남은 자손을 끝냄(attention). stuck: 끝내지 못했거나 목록을 받지 못함(attention).
+    # 부르는 쪽은 alone이 아니면 종료 기록 대신 attention을 남기고, mutex는 그 뒤에 풀린다.
+    if (-not ('CtxHopWorkerJob' -as [type]) -or -not [CtxHopWorkerJob]::Enabled) { return 'stuck' }
+    $job=[CtxHopWorkerJob]::Handle
+    try {
+        $deadline=[DateTime]::UtcNow.AddSeconds($WaitSec)
+        while (@([CtxHopWorkerJob]::List($job) | Where-Object { $_ -ne $PID }).Count) {
+            if ([DateTime]::UtcNow -gt $deadline) {
+                $deadline=[DateTime]::UtcNow.AddSeconds($KillSec)
+                do {
+                    [CtxHopWorkerJob]::KillMembers($job,$PID)
+                    Start-Sleep -Milliseconds 200
+                    if (-not @([CtxHopWorkerJob]::List($job) | Where-Object { $_ -ne $PID }).Count) { return 'killed' }
+                } while ([DateTime]::UtcNow -lt $deadline)
+                return 'stuck'
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        return 'alone'
+    } catch { return 'stuck' }
+}
+function Test-WorkerWritersGone([object]$Marker,[int]$KillSec=30) {
+    # 다음 Worker가 표지를 볼 때(S3 명세 2.2절). gone: 앞 writer가 모두 끝남. busy: 끝났다는 증거가 없음. 아무것도 바꾸지 않는다.
+    # 표지를 쓴 Worker가 자기 자신이면 gone이다(넘겨받은 뒤).
+    if ([int]$Marker.workerPid -eq $PID -and [string]$Marker.workerJob -ceq [CtxHopWorkerJob]::Name) { return 'gone' }
+    if ([string]$Marker.workerJob -notmatch '^Local\\CtxHopGUI-worker-[0-9a-f]{32}$') { return 'busy' }
+    try { $job=[CtxHopWorkerJob]::Open([string]$Marker.workerJob) } catch { return 'busy' }
+    # Job이 없으면 핸들이 모두 닫혀 소속 프로세스 종료가 시작된 것이다(KILL_ON_JOB_CLOSE).
+    if ($job -eq [IntPtr]::Zero) { return 'gone' }
+    try {
+        $members=@([CtxHopWorkerJob]::List($job))
+        # 그 Worker가 살아 있으면(같은 PID·시작 시각) Job 목록과 상관없이 busy다. mutex를 가진 스레드만 끝났을 수 있다.
+        $started=Get-WorkerStarted ([int]$Marker.workerPid)
+        if ($started -and $started -ceq [string]$Marker.workerStarted) { return 'busy' }
+        if (-not $members.Count) { return 'gone' }
+        # Worker 없이 남은 프로세스는 주인 없는 writer다. Job째 끝내고 소속이 0이 될 때까지 기다린다.
+        [CtxHopWorkerJob]::Terminate($job)
+        $deadline=[DateTime]::UtcNow.AddSeconds($KillSec)
+        while (@([CtxHopWorkerJob]::List($job)).Count) { if ([DateTime]::UtcNow -gt $deadline) { return 'busy' }; Start-Sleep -Milliseconds 100 }
+        return 'gone'
+    } catch { return 'busy' } finally { [CtxHopWorkerJob]::Close($job) }
 }
 function Invoke-JobCore([object]$Job) {
     if ($Job.action -ceq 'Restore') { Assert-WorkerJob }

@@ -531,6 +531,68 @@ Start-Sleep 120
         for ($i=0; $i -lt 40 -and (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
         Assert (-not (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue)) 'a killed worker takes its helper processes with it (Job object)'
     } finally { if (-not $probeWorker.HasExited) { $probeWorker.Kill() }; $probeWorker.Dispose() }
+    # 다음 Worker의 writer 확인(S3 명세 2.2절): 표지에 적힌 Worker가 살아 있으면 busy, Job이 사라졌으면 gone,
+    # Worker 없이 자손만 남았으면 Job째 끝내고 gone. 이름 형식이 틀리면 busy.
+    $fieldsFile=Join-Path $testDirectory 'job-fields.json'
+    Set-Content -LiteralPath $probe -Encoding UTF8 -Value @'
+param([string]$Package,[string]$PidFile)
+. (Join-Path $Package 'Worker.ps1') -LibraryOnly
+Enable-WorkerJob
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start.UseShellExecute=$false; $start.CreateNoWindow=$true
+$child=[Diagnostics.Process]::Start($start)
+$fields=Get-WorkerFields; $fields.child=$child.Id
+[IO.File]::WriteAllText($PidFile,(ConvertTo-Json -InputObject $fields))
+Start-Sleep 120
+'@
+    function Start-JobProbe {
+        if (Test-Path -LiteralPath $fieldsFile) { Remove-Item -LiteralPath $fieldsFile }
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
+        $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+        $process=[Diagnostics.Process]::Start($start)
+        for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $fieldsFile); $i++) { Start-Sleep -Milliseconds 250 }
+        Start-Sleep -Milliseconds 300
+        return @{process=$process;marker=(Get-Content -LiteralPath $fieldsFile -Raw | ConvertFrom-Json)}
+    }
+    # 끝났지만 아직 목록에 남은 프로세스는 살아 있지 않은 것으로 본다(핸들로 종료 여부를 확인).
+    function Test-Alive([int]$Id) { try { $process=[Diagnostics.Process]::GetProcessById($Id); try { return -not $process.HasExited } finally { $process.Dispose() } } catch { return $false } }
+    $probeRun=Start-JobProbe
+    try {
+        Assert ($probeRun.marker.workerJob -match '^Local\\CtxHopGUI-worker-[0-9a-f]{32}$' -and $probeRun.marker.workerStarted) "the marker names the worker's Job: $($probeRun.marker | ConvertTo-Json -Compress)"
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'busy' -and (Test-Alive $probeRun.marker.child)) 'a live worker is busy and nothing is stopped'
+        $held=[CtxHopWorkerJob]::Open($probeRun.marker.workerJob)
+        try {
+            # 이 시험이 Job 핸들을 쥐고 있으면 Worker가 끝나도 자손이 남는다(주인 없는 writer).
+            $probeRun.process.Kill(); $probeRun.process.WaitForExit()
+            Start-Sleep -Milliseconds 300
+            Assert (Test-Alive $probeRun.marker.child) 'an orphan writer survives while another handle holds the Job'
+            Assert ((Test-WorkerWritersGone $probeRun.marker 10) -eq 'gone' -and -not (Test-Alive $probeRun.marker.child)) 'an orphan writer is ended with its Job before anything else runs'
+        } finally { [CtxHopWorkerJob]::Close($held) }
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'gone') 'a Job that no longer exists means no writer is left'
+        Assert ((Test-WorkerWritersGone ([pscustomobject]@{workerJob='Global\other';workerPid=1;workerStarted='1'}) 5) -eq 'busy') 'a marker with a foreign Job name is busy'
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill() }; $probeRun.process.Dispose() }
+    $probeRun=Start-JobProbe
+    try {
+        $probeRun.process.Kill(); $probeRun.process.WaitForExit()
+        for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
+        Assert ((Test-WorkerWritersGone $probeRun.marker 5) -eq 'gone' -and -not (Test-Alive $probeRun.marker.child)) 'a killed worker leaves no Job and no writer'
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill() }; $probeRun.process.Dispose() }
+    # 정상 경로: 자손이 스스로 끝나면 alone. 남으면 이 Job 소속만 끝내고(손자 포함) 목록을 다시 받는다.
+    Assert ((Get-WorkerFields).workerJob -ceq [CtxHopWorkerJob]::Name -and (Test-WorkerWritersGone ([pscustomobject](Get-WorkerFields)) 1) -eq 'gone') 'the worker itself is never a foreign writer'
+    function Start-Helper([string]$Command) {
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -Command $Command")
+        $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+        return [Diagnostics.Process]::Start($start)
+    }
+    $helper=Start-Helper 'Start-Sleep -Milliseconds 800'
+    Assert ((Wait-WorkerJobAlone 30 5) -eq 'alone') 'a helper that ends by itself leaves the worker alone'
+    $helper.Dispose()
+    $grandFile=Join-Path $testDirectory 'grandchild.txt'
+    $helper=Start-Helper "`$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 120'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$g=[Diagnostics.Process]::Start(`$s); [IO.File]::WriteAllText('$grandFile',[string]`$g.Id); Start-Sleep 120"
+    for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $grandFile); $i++) { Start-Sleep -Milliseconds 250 }
+    $grandchild=[int](Get-Content -LiteralPath $grandFile -Raw)
+    Assert ((Wait-WorkerJobAlone 1 10) -eq 'killed' -and -not (Test-Alive $helper.Id) -and -not (Test-Alive $grandchild)) 'helpers left after the wait are ended with their own children'
+    $helper.Dispose()
     Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal
