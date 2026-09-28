@@ -234,6 +234,7 @@ This apply also saves the history it replaces in a new recovery folder. The reco
 
 - Preferences: `%LOCALAPPDATA%\CtxHopGUI\vnext-preferences.json`
 - Temporary job requests and results: `%LOCALAPPDATA%\CtxHopGUI\jobs`
+  - Each time the Worker calls a vendor implementation, it makes a `<operation>-<ID>` folder here and removes it when the call ends.
 - Backup and check files (Codex conversations and project files of both agents): `%LOCALAPPDATA%\CtxHopGUI\staging\<unique ID>`.
   - Each job makes a new folder that only the current user can open.
   - When a backup upload or a restore succeeds, the GUI deletes that job's plaintext copy.
@@ -248,10 +249,14 @@ The GUI never overwrites a whole session folder or DB.
 
 ### Integrity checks
 
-- `Worker.ps1` pins the SHA256 of `backend\desktop_sessions.py` and `bin\ctxhop.exe`, and checks them before Codex list, backup, and preview. If either file is missing or changed, the GUI stops.
+- `CodexDesktop.ps1` pins the SHA256 of `backend\desktop_sessions.py`, and `Worker.ps1` pins that of `bin\ctxhop.exe`. Both are checked before Codex list, backup, and preview. If either file is missing or changed, the GUI stops.
 - `bin\ctxhop-claude.exe` must match the pinned `0.2.0-gui.3` hash before a Claude preview or restore. It is `0.2.0-gui.1` plus companion folder backup and restore (`--sidecar-backup`) and store relocation (`remote relocate`). `build/build-exes.ps1` in the repository applies the patches in `upstream/patches` to the pinned upstream commit and rebuilds this file and `bin\ctxhop.exe` byte for byte. Earlier builds shipped source copies in `claude-source\` and `transport-source\`; from this build on, setup deletes those two folders.
 - `ClaudeWorker.ps1` is a copy of the stable `ctxhop-gui` Worker (SHA256 `D08E9A15…`). It adds the chosen language, failure reasons, the overlapping-registration check, unregistering, password change and reset, and reading ctxhop output as UTF-8. Its backup and restore decisions and its recovery records are unchanged.
-- `Worker.ps1` connects the frozen Python backend to the `bundle` command of `bin\ctxhop.exe`. The UI never parses conversation bodies, the DB, or the conversation backup format itself (the project files zip is made and read by `ProjectFiles.ps1`, below).
+- `Worker.ps1` calls the vendor implementations through the vendor contract (`docs\contract-v1.md`), and adds project files the same way for every vendor.
+  - The implementations are the two listed in `impls.json`.
+    - `CodexDesktop.ps1` connects the frozen Python backend to the `bundle` command of `bin\ctxhop.exe`.
+    - `ClaudeCode.ps1` wraps the conversation operations of `ClaudeWorker.ps1` in the contract.
+  - The UI and the Worker never parse conversation bodies, the DB, or the conversation backup format themselves. The project files zip is made and read by `ProjectFiles.ps1`, below.
 - `ProjectFiles.ps1` picks, lists, compresses, compares and restores project folders. It uses only standard .NET and, when present, `git`.
 - Screen and job text in both languages lives in `Strings.ps1` as `key=@('Korean','English')`.
 - New Codex Desktop engine versions must be verified with `backend\test_suite.py` and then added to `VERSIONS`.
@@ -266,12 +271,14 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\Test-Deskto
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-DesktopIntegration.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\Test-Strings.ps1
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-ProjectFiles.ps1
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-Contract.ps1
 & "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -X utf8 .\backend\test_suite.py --exe 'absolute path of the installed Desktop codex.exe'
 ```
 
 - The first four use a new temporary folder and synthetic metadata. They mock the backend, the transfer, Codex, and Claude.
 - `Test-DesktopIntegration.ps1` creates a test conversation in a temporary folder with the installed Codex Desktop engine. It then calls the **pinned real backend** through the Worker; only the transfer is mocked.
 - `Test-ProjectFiles.ps1` uses synthetic projects (a Git repository and a plain folder) in a temporary folder to check the exclusion rules, compression and hashes, comparison, restore (originals kept, nothing deleted) and refusal of unsafe backups.
+- `Test-Contract.ps1` checks the vendor contract with fake implementation processes: response checks, exit codes, and timeouts. It also checks the entry points of both real implementations, but only sends requests that end before any native tool runs.
 - `Test-Strings.ps1` checks that the strings in both languages pair up and share placeholders. It also looks for untranslated Hangul in the code and checks the English screens and error messages.
 - `backend\test_suite.py` uses an isolated `CODEX_HOME` and fixed localhost responses to create a paginated conversation with the real engine. It then checks porting, reading, and resuming.
 

@@ -89,6 +89,7 @@ if ($job.action -eq 'List') {
 }
 if ($job.action -eq 'Preview') {
     $data.preview=@{session=$job.nativeId;agent=$job.agent;workspace=$job.projectPath;differences='fixture'}
+    $data.receipt=''; $data.token='fixture-preview-token'
 }
 if ($job.action -eq 'Restore') { $data.restored=@{session=$job.nativeId;agent=$job.agent} }
 if ($job.action -eq 'MoveStore') {
@@ -291,6 +292,7 @@ if ($job.action -eq 'MoveStore') {
     Assert ($cancelButton.Enabled) 'A restore preview can be cancelled.'
     Finish-Fixture
     Assert ($script:Pending.job.action -eq 'Restore' -and -not $cancelButton.Enabled) 'Accepted preview should start Restore, which cannot be cancelled.'
+    Assert ($script:Pending.job.token -ceq 'fixture-preview-token' -and $script:Pending.job.receipt -ceq '') 'Restore sends back the receipt and token of the preview it confirmed.'
     Finish-Fixture
     Assert ($null -eq $script:Pending) 'Declined open should complete without another process.'
     Set-Fixtures

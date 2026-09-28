@@ -234,6 +234,7 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\backend\Invoke-D
 
 - 선택값: `%LOCALAPPDATA%\CtxHopGUI\vnext-preferences.json`
 - 임시 작업 요청·결과: `%LOCALAPPDATA%\CtxHopGUI\jobs`
+  - Worker가 벤더 구현을 부를 때마다 이 안에 `<작업>-<ID>` 폴더를 만들고, 호출이 끝나면 지웁니다.
 - 백업·검사 파일(Codex 대화, 두 에이전트의 프로젝트 파일): `%LOCALAPPDATA%\CtxHopGUI\staging\고유ID`
   - 작업마다 현재 사용자만 열 수 있는 새 폴더를 만듭니다.
   - 백업 업로드나 복원이 성공하면 그 작업의 평문 사본을 지웁니다.
@@ -248,10 +249,14 @@ GUI는 세션 폴더나 DB 전체를 통째로 덮어쓰지 않습니다.
 
 ### 무결성 검사
 
-- `Worker.ps1`은 `backend\desktop_sessions.py`와 `bin\ctxhop.exe`의 SHA256을 고정해 두고, Codex 목록·백업·미리보기 전에 확인합니다. 파일이 없거나 바뀌면 멈춥니다.
+- `CodexDesktop.ps1`은 `backend\desktop_sessions.py`의 SHA256을, `Worker.ps1`은 `bin\ctxhop.exe`의 SHA256을 고정해 둡니다. Codex 목록·백업·미리보기 전에 확인하고, 파일이 없거나 바뀌면 멈춥니다.
 - `bin\ctxhop-claude.exe`는 Claude 미리보기·복원 전에 고정한 `0.2.0-gui.3` 해시와 같아야 합니다. `0.2.0-gui.1`에 대화 옆 폴더 백업·복원(`--sidecar-backup`)과 저장소 옮기기(`remote relocate`)를 더한 판입니다. 저장소의 `build/build-exes.ps1`이 고정한 upstream 커밋에 `upstream/patches`의 패치를 적용해 이 파일과 `bin\ctxhop.exe`를 바이트까지 같게 다시 만듭니다. 이전 판은 소스 사본을 `claude-source\`·`transport-source\`에 담았고, 이 판부터 설치할 때 두 폴더를 지웁니다.
 - `ClaudeWorker.ps1`은 안정판 `ctxhop-gui`의 Worker(SHA256 `D08E9A15…`)를 복사한 것입니다. 여기에 언어 적용, 실패 이유 표시, 겹친 등록 차단, 등록 해제, 암호 변경·초기화, ctxhop 출력을 UTF-8로 읽기를 더했습니다. 백업·복원 판단과 복구 기록 동작은 바꾸지 않았습니다.
-- `Worker.ps1`은 고정한 Python 백엔드와 `bin\ctxhop.exe`의 `bundle` 명령을 연결합니다. UI는 대화 본문·DB·대화 백업 형식을 직접 해석하지 않습니다(프로젝트 파일 zip은 아래 `ProjectFiles.ps1`이 만들고 읽습니다).
+- `Worker.ps1`은 벤더 계약(`docs\contract-v1.md`)으로 벤더 구현을 부르고, 프로젝트 파일을 벤더와 상관없이 덧붙입니다.
+  - 벤더 구현은 `impls.json`에 적힌 두 개입니다.
+    - `CodexDesktop.ps1`: 고정한 Python 백엔드와 `bin\ctxhop.exe`의 `bundle` 명령을 연결합니다.
+    - `ClaudeCode.ps1`: `ClaudeWorker.ps1`의 대화 작업을 계약에 맞춰 감쌉니다.
+  - UI와 Worker는 대화 본문·DB·대화 백업 형식을 직접 해석하지 않습니다. 프로젝트 파일 zip은 아래 `ProjectFiles.ps1`이 만들고 읽습니다.
 - `ProjectFiles.ps1`은 프로젝트 파일의 폴더 고르기·목록·압축·비교·복원을 맡습니다. 표준 .NET과, 있으면 `git`만 씁니다.
 - 화면과 작업 메시지의 한국어·영어 문장은 `Strings.ps1`에 `키=@('한국어','English')`로 모여 있습니다.
 - Codex Desktop이 새 엔진 버전으로 업데이트되면 `backend\test_suite.py`로 다시 검증한 뒤 `VERSIONS`에 추가해야 합니다.
@@ -266,12 +271,14 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\Test-Deskto
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-DesktopIntegration.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\Test-Strings.ps1
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-ProjectFiles.ps1
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Test-Contract.ps1
 & "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -X utf8 .\backend\test_suite.py --exe '설치된 Desktop codex.exe 절대경로'
 ```
 
 - 앞의 네 개는 새 임시 폴더와 합성 메타데이터를 쓰며, 백엔드·전송·Codex·Claude 실행을 mock으로 대신합니다.
 - `Test-DesktopIntegration.ps1`은 설치된 Codex Desktop 엔진으로 임시 폴더에 시험 대화를 만든 뒤, **고정한 실제 백엔드**를 Worker로 호출합니다. 전송만 mock입니다.
 - `Test-ProjectFiles.ps1`은 임시 폴더의 합성 프로젝트(Git 저장소와 일반 폴더)로 제외 규칙, 압축·해시, 비교, 복원(원본 보관·지우지 않음), 위험한 백업 거부를 확인합니다.
+- `Test-Contract.ps1`은 가짜 구현 프로세스로 벤더 계약의 응답 검사·종료 코드·시간 초과를 확인합니다. 실제 두 구현의 진입점도 확인하는데, 네이티브 도구를 부르기 전에 끝나는 요청만 보냅니다.
 - `Test-Strings.ps1`은 두 언어 문장의 짝과 자리표시자를 확인합니다. 코드에 남은 번역 안 된 한글과 영어 화면·오류 메시지도 봅니다.
 - `backend\test_suite.py`는 격리한 `CODEX_HOME`과 localhost 고정 응답으로 실제 엔진의 paginated 대화를 만들고 이식·읽기·재개를 확인합니다.
 

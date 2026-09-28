@@ -197,16 +197,19 @@ function Get-ProjectFileHash([string]$Path, [Security.Cryptography.HashAlgorithm
     $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare)
     try { return [BitConverter]::ToString($Sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant() } finally { $stream.Dispose(); if ($own) { $Sha.Dispose() } }
 }
-function Get-ProjectManifest([object]$List) {
+function Get-ProjectManifest([object]$List, [long]$Limit=[long]::MaxValue) {
     # 올리기 전에 같은 내용이 이미 백업돼 있는지 보려고 내용 해시만 먼저 구한다. 읽지 못한 파일은 빼고 목록으로 돌려준다.
-    $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new()
+    # 파일 크기 합이 $Limit를 넘으면 더 읽지 않고 overLimit으로 돌려준다.
+    $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new(); [long]$total=0
     $sha=[Security.Cryptography.SHA256]::Create()
     try {
         foreach ($file in $List.files) {
+            try { $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare) } catch { $unreadable.Add($file.path); continue }
             try {
-                $stream=[IO.FileStream]::new($file.full,[IO.FileMode]::Open,[IO.FileAccess]::Read,$script:ProjectShare)
-                try { $entries.Add([pscustomobject]@{path=$file.path;size=$stream.Length;sha256=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}) } finally { $stream.Dispose() }
-            } catch { $unreadable.Add($file.path) }
+                $total+=$stream.Length
+                if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
+                $entries.Add([pscustomobject]@{path=$file.path;size=$stream.Length;sha256=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()})
+            } catch { $unreadable.Add($file.path) } finally { $stream.Dispose() }
         }
     } finally { $sha.Dispose() }
     return [pscustomobject]@{hash=(Get-ProjectContentHash $entries.ToArray());files=$entries.Count;unreadable=$unreadable.ToArray()}
@@ -221,9 +224,10 @@ function Copy-ProjectStream([IO.Stream]$From, [IO.Stream]$To, [long]$Limit) {
     }
     return $total
 }
-function New-ProjectSnapshot([object]$List, [string]$ZipPath) {
+function New-ProjectSnapshot([object]$List, [string]$ZipPath, [long]$Limit=[long]::MaxValue) {
     # files/<상대 경로>와 manifest.json을 담은 zip. 파일을 넣으면서 해시를 구하므로 manifest는 실제로 넣은 내용과 같다.
-    $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new()
+    # 실제로 읽은 압축 전 총량이 $Limit를 넘으면 멈추고 overLimit으로 돌려준다. 만들다 만 zip은 부르는 쪽이 지운다.
+    $entries=[Collections.Generic.List[object]]::new(); $unreadable=[Collections.Generic.List[string]]::new(); [long]$total=0
     $zip=[IO.Compression.ZipFile]::Open($ZipPath,[IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($file in $List.files) {
@@ -232,7 +236,9 @@ function New-ProjectSnapshot([object]$List, [string]$ZipPath) {
             try {
                 $entry=$zip.CreateEntry('files/'+$file.path.Replace('\','/'),[IO.Compression.CompressionLevel]::Optimal)
                 $crypto=[Security.Cryptography.CryptoStream]::new($entry.Open(),$sha,[Security.Cryptography.CryptoStreamMode]::Write)
-                try { $size=Copy-ProjectStream $source $crypto ([long]::MaxValue); $crypto.FlushFinalBlock() } finally { $crypto.Dispose() }
+                try { $size=Copy-ProjectStream $source $crypto ($Limit-$total); if ($size -le $Limit-$total) { $crypto.FlushFinalBlock() } } finally { $crypto.Dispose() }
+                $total+=$size
+                if ($total -gt $Limit) { return [pscustomobject]@{overLimit=$true;bytes=$total} }
                 $entries.Add([pscustomobject]@{path=$file.path;size=$size;sha256=(Get-ProjectHex $sha.Hash)})
             } finally { $sha.Dispose(); $source.Dispose() }
         }

@@ -1,0 +1,4 @@
+{
+  "codex-desktop": ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-File", "CodexDesktop.ps1"],
+  "claude-code": ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-File", "ClaudeCode.ps1"]
+}

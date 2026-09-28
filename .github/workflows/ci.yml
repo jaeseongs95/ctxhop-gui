@@ -25,7 +25,7 @@ jobs:
         run: |
           $pkg = Join-Path $env:RUNNER_TEMP 'out\ctxhop-gui-vnext'
           $failed = @()
-          foreach ($t in 'Test-Strings', 'Test-ProjectFiles', 'Test-DesktopWorker', 'Test-DesktopGUI', 'Test-ClaudeWorker', 'Test-ClaudeGUI') {
+          foreach ($t in 'Test-Strings', 'Test-ProjectFiles', 'Test-Contract', 'Test-DesktopWorker', 'Test-DesktopGUI', 'Test-ClaudeWorker', 'Test-ClaudeGUI') {
             & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $pkg "$t.ps1")
             "$t exit=$LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) { $failed += $t }
