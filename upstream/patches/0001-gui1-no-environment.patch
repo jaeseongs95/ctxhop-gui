@@ -1,0 +1,670 @@
+ctxhop patch 0001 (both exes): gui.1, resume --no-environment.
+Base: CCCCY-ci/ctxhop b84de46c6fa0cc68f10b7852f4230b9da6bc75f1 (upstream main, "release: CtxHop v0.2.0").
+Go: cmd/ctxhop/discovery.go, resume.go, resume_test.go; new resume_no_environment_test.go.
+Records: new PATCH-NOTES.md, Run-Regression.ps1, binary-manifest.json, freeze-manifest.json (gui.1 text as shipped).
+.gitignore: back to the v0.2.0 tag (b8a18e9) version, which both shipped source trees carry.
+
+diff --git a/.gitignore b/.gitignore
+index a1926b5ab4864093f1c0213a192fabb635c73e82..d17c0ac9faf9a398eea83e6f760c8ecec325975d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,12 +17,7 @@
+ !.github/
+ !.github/workflows/
+ !.github/workflows/*.yml
+-# Local agent instructions and project notes are kept on the developer
+-# workspace and are never part of the repository.
+-/AGENTS.md
+-/.agents/
+-/docs/
+-/UI_REVIEW_BACKLOG.md
++docs/
+ # Keep only the build and release entry points versioned. Ad-hoc local scripts
+ # remain ignored.
+ scripts/*
+diff --git a/PATCH-NOTES.md b/PATCH-NOTES.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..caa35219cde15179290b47641190d2e0b434b38a
+--- /dev/null
++++ b/PATCH-NOTES.md
+@@ -0,0 +1,55 @@
++# CtxHop 0.2.0-gui.1 local patch
++
++Upstream base: `v0.2.0`, commit `b8a18e917a3e93b2e961e8e12c82a4953a98779d`.
++
++The GUI's clean preview can become stale before a separate resume reads remote metadata again. Upstream resume can then apply filtered settings, MCP configuration and skills after restoring the native session. This patch adds a request-local `--no-environment` flag at the shared resume parser and execution path used by both `resume` and `session resume`.
++
++With the flag set, resume skips the environment conflict gate and never calls `applyEnvironmentComponents`. The JSON result includes `environmentSkipped: true`, including preview responses and native restores with no environment metadata. Environment preview remains read-only and may still report observed remote components. The existing workspace context flag and native restore behavior remain separate.
++
++Production changes:
++
++- `cmd/ctxhop/resume.go`: flag, report field, conflict gate and environment apply guard.
++- `cmd/ctxhop/discovery.go`: flag advertised for both command spellings.
++
++Regression changes:
++
++- `cmd/ctxhop/resume_test.go`: parsing, explicit false, positional flag normalization and both help paths.
++- `cmd/ctxhop/resume_no_environment_test.go`: actual encrypted remote and native restore integration for Claude Code and Codex. It creates a clean preview, adds applicable settings/MCP/skill metadata to the isolated remote, checks the changed preview, checks preview JSON with the flag, restores with the flag, verifies native records and verifies no environment targets or environment backups exist. A control using the same bodies without the flag writes all three component targets through the actual providers. A project settings override then creates an environment conflict; the ordinary restore rejects it, while the flagged restore succeeds and preserves all environment file bytes.
++
++All fixture directories are descendants of `D:\Go\temp`, following the copied `AGENTS.md`. No actual user session, config, encryption key or remote store was used. The source fixture uses only native restore, with no custom session migration or session database conversion.
++
++## Build and verification
++
++The build used the official portable `go1.27.1.windows-amd64.zip` from `https://go.dev/dl/`, with metadata obtained from `https://go.dev/dl/?mode=json` and the ZIP SHA-256 checked before extraction:
++
++`a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d`
++
++The toolchain and build caches are scoped to `C:\Users\Lenovo\AppData\Local\Temp\ctxhop-go-gui1`. The reusable regression runner keeps its GOPATH and GOCACHE under `D:\Go\temp\ctxhop-go-regression-work` regardless of the supplied executable path; GOTOOLCHAIN is `local`. There was no system Go installation, global PATH edit or official CtxHop installation.
++
++Build command, executed from this source directory with the same process-local Go environment as the runner:
++
++```powershell
++go build -trimpath -ldflags '-s -w -X main.version=0.2.0-gui.1 -X main.commit=b8a18e9+gui.1 -X main.date=2026-09-26' -o 'D:\세션연동\ctxhop-gui\bin\ctxhop.exe' ./cmd/ctxhop
++```
++
++Re-run verification with an explicit local Go executable (Go 1.26 or newer is required by go.mod):
++
++```powershell
++& '.\Run-Regression.ps1' -GoExe 'C:\Users\Lenovo\AppData\Local\Temp\ctxhop-go-gui1\go\bin\go.exe'
++```
++
++`Run-Regression.ps1` passed on 2026-09-26. Raw stdout is saved in `verification-results/targeted-regression.txt` and `verification-results/relevant-suites.txt`. `go vet ./cmd/ctxhop` exited 0 with no output; `verification-results/vet.txt` is empty. The passing suites were cmd/ctxhop, internal/environment, internal/adapter, internal/syncflow and internal/syncer.
++
++Binary: `D:\세션연동\ctxhop-gui\bin\ctxhop.exe`; size 11,735,040 bytes. Version stdout: `ctxhop 0.2.0-gui.1`. Both `help resume` and `help session resume` list `--no-environment`.
++
++Binary SHA-256:
++
++`a1702ce1839af90c0ddb87e7c07f1be7899be8ebdd9117fe680d2ec9739c233d`
++
++The machine-readable metadata is in `binary-manifest.json`. The adjacent `../ctxhop-no-environment.patch` contains the production and regression source diffs against the pristine upstream source, with relative paths and LF line endings. `git -c core.autocrlf=false apply --check` passed against the pristine comparison files.
++
++## Scope and limitations
++
++This patch protects the filtered environment component application path on both native adapters. The GUI must pass `--no-environment` on the actual restore, verify `environmentSkipped` is exactly JSON boolean true, and use the pinned local binary. The flag does not disable an explicitly requested `--workspace` restore, which is an independent upstream operation. The GUI does not request workspace restore.
++
++The verified fixtures invoke the actual in-process command entry point (`runSessionWithStreams`) using a directory backend, encrypted local test material, real native adapters and real filesystem environment providers. They do not stub or spy on environment application. The built executable was separately smoke-tested for version and both help paths. No actual user's restore was executed; live remote behavior and the GUI wrapper's binary pinning are separate integration checks. The portable Go toolchain and caches are verification dependencies and must not be bundled with the GUI.
+diff --git a/Run-Regression.ps1 b/Run-Regression.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c026c5f76a6dd214dc39a6392ef8a6aac7fa44f
+--- /dev/null
++++ b/Run-Regression.ps1
+@@ -0,0 +1,48 @@
++param(
++    [Parameter(Mandatory = $true)]
++    [string]$GoExe,
++    [string]$LogDir = (Join-Path $PSScriptRoot 'verification-results')
++)
++
++$ErrorActionPreference = 'Stop'
++$taskGoExe = (Resolve-Path -LiteralPath $GoExe).Path
++$taskWorkRoot = 'D:\Go\temp\ctxhop-go-regression-work'
++$taskEnvironment = @{
++    TMP = 'D:\Go\temp'
++    TEMP = 'D:\Go\temp'
++    GOTMPDIR = 'D:\Go\temp'
++    GOTOOLCHAIN = 'local'
++    GOPATH = (Join-Path $taskWorkRoot 'gopath')
++    GOCACHE = (Join-Path $taskWorkRoot 'gocache')
++}
++$taskPrevious = @{}
++foreach ($taskName in $taskEnvironment.Keys) {
++    $taskPrevious[$taskName] = [Environment]::GetEnvironmentVariable($taskName, 'Process')
++}
++Push-Location $PSScriptRoot
++try {
++    New-Item -ItemType Directory -Path 'D:\Go\temp' -Force | Out-Null
++    if (-not (Test-Path -LiteralPath 'D:\Go\temp' -PathType Container)) {
++        throw 'AGENTS.md requires the available test root D:\Go\temp.'
++    }
++    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
++    foreach ($taskName in $taskEnvironment.Keys) {
++        [Environment]::SetEnvironmentVariable($taskName, $taskEnvironment[$taskName], 'Process')
++    }
++    & $taskGoExe test ./cmd/ctxhop -run 'TestResumeNoEnvironmentFlagAndHelp|TestSessionResumeNoEnvironmentAfterRemoteChange' -count=1 -v 2>&1 |
++        Tee-Object -FilePath (Join-Path $LogDir 'targeted-regression.txt')
++    if ($LASTEXITCODE -ne 0) { throw 'Targeted regression failed.' }
++    & $taskGoExe test ./cmd/ctxhop ./internal/environment ./internal/adapter ./internal/syncflow ./internal/syncer -count=1 2>&1 |
++        Tee-Object -FilePath (Join-Path $LogDir 'relevant-suites.txt')
++    if ($LASTEXITCODE -ne 0) { throw 'Relevant upstream suites failed.' }
++    Set-Content -LiteralPath (Join-Path $LogDir 'vet.txt') -Value '' -NoNewline
++    & $taskGoExe vet ./cmd/ctxhop 2>&1 |
++        Tee-Object -FilePath (Join-Path $LogDir 'vet.txt')
++    if ($LASTEXITCODE -ne 0) { throw 'go vet failed.' }
++}
++finally {
++    foreach ($taskName in $taskPrevious.Keys) {
++        [Environment]::SetEnvironmentVariable($taskName, $taskPrevious[$taskName], 'Process')
++    }
++    Pop-Location
++}
+diff --git a/binary-manifest.json b/binary-manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccf8d4c45fec8003873e0dcbb696407e686bc0f6
+--- /dev/null
++++ b/binary-manifest.json
+@@ -0,0 +1,10 @@
++{
++  "path": "D:\\세션연동\\ctxhop-gui\\bin\\ctxhop.exe",
++  "size": 11735040,
++  "sha256": "a1702ce1839af90c0ddb87e7c07f1be7899be8ebdd9117fe680d2ec9739c233d",
++  "version": "0.2.0-gui.1",
++  "upstreamTag": "v0.2.0",
++  "upstreamCommit": "b8a18e917a3e93b2e961e8e12c82a4953a98779d",
++  "goVersion": "go1.27.1 windows/amd64",
++  "goArchiveSHA256": "a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d"
++}
+diff --git a/cmd/ctxhop/discovery.go b/cmd/ctxhop/discovery.go
+index 5b30d6d76c31d6b68344c1a6b7cd493f34714704..7b303afdd5eed92de41c8f47db57d79a3e02e24e 100644
+--- a/cmd/ctxhop/discovery.go
++++ b/cmd/ctxhop/discovery.go
+@@ -29,7 +29,7 @@ var commandOptions = map[string][]string{
+ 	"uninstall":             {"--dir"},
+ 	"status":                {"--json", "--remote"},
+ 	"list":                  {"--json"},
+-	"resume":                {"--json", "--preview", "--workspace", "--allow-limited", "--allow-divergent", "--no-workspace-context", "--replace-existing", "--version", "--agent", "--replica"},
++	"resume":                {"--json", "--preview", "--workspace", "--allow-limited", "--allow-divergent", "--no-workspace-context", "--no-environment", "--replace-existing", "--version", "--agent", "--replica"},
+ 	"history":               {"--json"},
+ 	"history cleanup":       {"--remote-id", "--path"},
+ 	"history prune":         {"--remote-id", "--path", "--keep", "--before"},
+@@ -56,7 +56,7 @@ var commandOptions = map[string][]string{
+ 	"session reconcile":     {"--json", "--agent", "--native"},
+ 	"session migrate":       {"--json", "--preview", "--publish-v2", "--rollback"},
+ 	"session show":          {"--json"},
+-	"session resume":        {"--json", "--preview", "--workspace", "--allow-limited", "--allow-divergent", "--no-workspace-context", "--replace-existing", "--version", "--agent", "--replica"},
++	"session resume":        {"--json", "--preview", "--workspace", "--allow-limited", "--allow-divergent", "--no-workspace-context", "--no-environment", "--replace-existing", "--version", "--agent", "--replica"},
+ 	"remote delete-session": {"--remote-id", "--path"},
+ 	"remote delete-project": {"--path"},
+ 	"remote delete-all":     {},
+diff --git a/cmd/ctxhop/resume.go b/cmd/ctxhop/resume.go
+index 6f1c4e25fbddb65810fd39f51375f6399e14b62c..c192b054771e94e9299cf2d94bef96c996ce4762 100644
+--- a/cmd/ctxhop/resume.go
++++ b/cmd/ctxhop/resume.go
+@@ -31,6 +31,7 @@ type resumeOptions struct {
+ 	allowLimited       bool
+ 	allowDivergent     bool
+ 	noWorkspaceContext bool
++	noEnvironment      bool
+ 	replaceExisting    bool
+ 	version            int
+ 	session            string
+@@ -39,31 +40,32 @@ type resumeOptions struct {
+ }
+ 
+ type resumeReport struct {
+-	Preview         bool                      `json:"preview,omitempty"`
+-	Session         string                    `json:"session"`
+-	LogicalSession  string                    `json:"logicalSession,omitempty"`
+-	Agent           string                    `json:"agent,omitempty"`
+-	ReplicaID       string                    `json:"replicaId,omitempty"`
+-	LocalState      string                    `json:"localState,omitempty"`
+-	RemoteRecords   uint64                    `json:"remoteRecordCount,omitempty"`
+-	LocalRecords    uint64                    `json:"localRecordCount,omitempty"`
+-	AppendRecords   uint64                    `json:"appendRecordCount,omitempty"`
+-	Title           string                    `json:"title"`
+-	Workspace       string                    `json:"workspace"`
+-	Differences     int                       `json:"differences"`
+-	Replaced        bool                      `json:"replaced"`
+-	Merged          bool                      `json:"merged"`
+-	ContextInjected bool                      `json:"contextInjected"`
+-	Sources         []string                  `json:"sources"`
+-	OmittedAgents   []string                  `json:"omittedAgents,omitempty"`
+-	OmittedReplicas []string                  `json:"omittedReplicas,omitempty"`
+-	SelectedHeads   []string                  `json:"selectedHeads,omitempty"`
+-	OmittedHeads    []string                  `json:"omittedHeads,omitempty"`
+-	IncludedByAgent map[string]uint64         `json:"includedContributionsByAgent,omitempty"`
+-	OmittedByAgent  map[string]uint64         `json:"omittedContributionsByAgent,omitempty"`
+-	UnreadableHeads []string                  `json:"unreadableHeads,omitempty"`
+-	Environment     *environmentPreviewReport `json:"environment,omitempty"`
+-	WorkspaceState  *projectStateReport       `json:"workspaceState,omitempty"`
++	Preview            bool                      `json:"preview,omitempty"`
++	Session            string                    `json:"session"`
++	LogicalSession     string                    `json:"logicalSession,omitempty"`
++	Agent              string                    `json:"agent,omitempty"`
++	ReplicaID          string                    `json:"replicaId,omitempty"`
++	LocalState         string                    `json:"localState,omitempty"`
++	RemoteRecords      uint64                    `json:"remoteRecordCount,omitempty"`
++	LocalRecords       uint64                    `json:"localRecordCount,omitempty"`
++	AppendRecords      uint64                    `json:"appendRecordCount,omitempty"`
++	Title              string                    `json:"title"`
++	Workspace          string                    `json:"workspace"`
++	Differences        int                       `json:"differences"`
++	Replaced           bool                      `json:"replaced"`
++	Merged             bool                      `json:"merged"`
++	ContextInjected    bool                      `json:"contextInjected"`
++	Sources            []string                  `json:"sources"`
++	OmittedAgents      []string                  `json:"omittedAgents,omitempty"`
++	OmittedReplicas    []string                  `json:"omittedReplicas,omitempty"`
++	SelectedHeads      []string                  `json:"selectedHeads,omitempty"`
++	OmittedHeads       []string                  `json:"omittedHeads,omitempty"`
++	IncludedByAgent    map[string]uint64         `json:"includedContributionsByAgent,omitempty"`
++	OmittedByAgent     map[string]uint64         `json:"omittedContributionsByAgent,omitempty"`
++	UnreadableHeads    []string                  `json:"unreadableHeads,omitempty"`
++	Environment        *environmentPreviewReport `json:"environment,omitempty"`
++	EnvironmentSkipped bool                      `json:"environmentSkipped,omitempty"`
++	WorkspaceState     *projectStateReport       `json:"workspaceState,omitempty"`
+ }
+ 
+ type resumeCandidate struct {
+@@ -143,6 +145,7 @@ func parseResumeOptions(args []string) (resumeOptions, error) {
+ 	flags.BoolVar(&options.allowLimited, "allow-limited", false, "allow restore when structural compatibility is limited")
+ 	flags.BoolVar(&options.allowDivergent, "allow-divergent", false, "allow restore despite a divergent workspace")
+ 	flags.BoolVar(&options.noWorkspaceContext, "no-workspace-context", false, "do not inject workspace differences into the restored session")
++	flags.BoolVar(&options.noEnvironment, "no-environment", false, "do not restore settings, MCP configuration, or skills")
+ 	flags.BoolVar(&options.replaceExisting, "replace-existing", false, "replace an existing local session")
+ 	flags.IntVar(&options.version, "version", -1, "select a zero-based remote fork version")
+ 	flags.StringVar(&options.agent, "agent", "", "select the source Agent for a Session Hub resume")
+@@ -366,7 +369,7 @@ func collectResumeWithPromptMode(ctx context.Context, c *config.Config, configDi
+ 		}
+ 		environmentPreview := buildEnvironmentPreviewReport(ctx, localState, environmentSession)
+ 		environmentReport = &environmentPreview
+-		if !options.preview && environmentReportHasConflict(environmentPreview) {
++		if !options.preview && !options.noEnvironment && environmentReportHasConflict(environmentPreview) {
+ 			return resumeReport{}, errors.New("resume: environment conflicts require manual resolution")
+ 		}
+ 
+@@ -380,24 +383,25 @@ func collectResumeWithPromptMode(ctx context.Context, c *config.Config, configDi
+ 	}
+ 
+ 	baseReport := resumeReport{
+-		Preview:         options.preview,
+-		Session:         candidate.Summary.NativeID,
+-		LogicalSession:  selection.LogicalSession,
+-		Agent:           selection.AgentName,
+-		ReplicaID:       selection.ReplicaID,
+-		LocalState:      selection.LocalState.State,
+-		RemoteRecords:   selection.LocalState.RemoteRecords,
+-		LocalRecords:    selection.LocalState.LocalRecords,
+-		AppendRecords:   selection.LocalState.AppendRecords,
+-		Title:           safeListText(candidate.Summary.Title),
+-		Environment:     environmentReport,
+-		OmittedAgents:   append([]string(nil), selection.OmittedAgents...),
+-		OmittedReplicas: append([]string(nil), selection.OmittedReplicas...),
+-		SelectedHeads:   append([]string(nil), selection.SelectedHeads...),
+-		OmittedHeads:    append([]string(nil), selection.OmittedHeads...),
+-		IncludedByAgent: cloneResumeCounts(selection.IncludedByAgent),
+-		OmittedByAgent:  cloneResumeCounts(selection.OmittedByAgent),
+-		UnreadableHeads: append([]string(nil), selection.UnreadableHeads...),
++		Preview:            options.preview,
++		Session:            candidate.Summary.NativeID,
++		LogicalSession:     selection.LogicalSession,
++		Agent:              selection.AgentName,
++		ReplicaID:          selection.ReplicaID,
++		LocalState:         selection.LocalState.State,
++		RemoteRecords:      selection.LocalState.RemoteRecords,
++		LocalRecords:       selection.LocalState.LocalRecords,
++		AppendRecords:      selection.LocalState.AppendRecords,
++		Title:              safeListText(candidate.Summary.Title),
++		Environment:        environmentReport,
++		EnvironmentSkipped: options.noEnvironment,
++		OmittedAgents:      append([]string(nil), selection.OmittedAgents...),
++		OmittedReplicas:    append([]string(nil), selection.OmittedReplicas...),
++		SelectedHeads:      append([]string(nil), selection.SelectedHeads...),
++		OmittedHeads:       append([]string(nil), selection.OmittedHeads...),
++		IncludedByAgent:    cloneResumeCounts(selection.IncludedByAgent),
++		OmittedByAgent:     cloneResumeCounts(selection.OmittedByAgent),
++		UnreadableHeads:    append([]string(nil), selection.UnreadableHeads...),
+ 	}
+ 	if workspaceInspection != nil {
+ 		baseReport.WorkspaceState = &workspaceInspection.Report
+@@ -447,7 +451,7 @@ func collectResumeWithPromptMode(ctx context.Context, c *config.Config, configDi
+ 			return resumeReport{}, fmt.Errorf("resume: target session was restored, but workspace restore failed: %w", err)
+ 		}
+ 	}
+-	if environmentSession != nil && environmentReport != nil {
++	if !options.noEnvironment && environmentSession != nil && environmentReport != nil {
+ 		if err := applyEnvironmentComponents(ctx, localState, environmentSession, environmentReport); err != nil {
+ 			return resumeReport{}, fmt.Errorf("resume: target session was restored, but environment restore failed: %w", err)
+ 		}
+diff --git a/cmd/ctxhop/resume_no_environment_test.go b/cmd/ctxhop/resume_no_environment_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..faaf301a22d54ab61ae271f77cc83e4ba3d80449
+--- /dev/null
++++ b/cmd/ctxhop/resume_no_environment_test.go
+@@ -0,0 +1,232 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/CCCCY-ci/ctxhop/internal/adapter"
++	"github.com/CCCCY-ci/ctxhop/internal/crypto"
++	"github.com/CCCCY-ci/ctxhop/internal/environment"
++	"github.com/CCCCY-ci/ctxhop/internal/remote"
++	"github.com/CCCCY-ci/ctxhop/internal/sessionhub"
++	"github.com/CCCCY-ci/ctxhop/internal/syncer"
++)
++
++// Exercise the command's real encrypted remote read, native session restore,
++// and environment provider path, including a remote change after preview.
++func TestSessionResumeNoEnvironmentAfterRemoteChange(t *testing.T) {
++	for _, agent := range []string{"claude-code", "codex"} {
++		t.Run(agent, func(t *testing.T) {
++			ctx := context.Background()
++			projectRoot, homeA, homeB := t.TempDir(), t.TempDir(), t.TempDir()
++			configDir, remoteRoot := t.TempDir(), t.TempDir()
++			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(t.TempDir(), "missing-claude"))
++			t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "missing-codex"))
++			t.Setenv("CTXHOP_CONFIG_DIR", configDir)
++			t.Chdir(projectRoot)
++			runResumeGit(t, projectRoot, "init", "-q")
++			store, err := remote.NewDir(remoteRoot)
++			if err != nil {
++				t.Fatal(err)
++			}
++			cleanupResumeRemoteRoot(t, remoteRoot)
++			keyfile, _, err := crypto.NewKeyfile("passphrase")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := syncer.PublishKeyfile(ctx, store, keyfile); err != nil {
++				t.Fatal(err)
++			}
++			dataKey, err := keyfile.UnlockWithPassphrase("passphrase")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer dataKey.Close()
++			public, err := keyfile.IdentityPublicKey()
++			if err != nil {
++				t.Fatal(err)
++			}
++			identifierKey, err := dataKey.IdentifierKey()
++			if err != nil {
++				t.Fatal(err)
++			}
++			const identity = "manual:no-environment-regression"
++			c := newCodexRoundTripConfig(t, configDir, remoteRoot, public, identifierKey, "devicea", projectRoot, identity)
++			projectID, err := crypto.ProjectID(identifierKey, identity)
++			if err != nil {
++				t.Fatal(err)
++			}
++			const nativeID = "no-environment-native-session"
++			var source, target adapter.SessionLayout
++			settingsName, model, settingsFile, projectSettings := "codex-session-settings", "gpt-fixture", "config.toml", filepath.Join(projectRoot, ".codex", "config.toml")
++			mcpBody := `{"command":"node","args":["fixture-server.js"]}`
++			mcpFile := filepath.Join(homeB, "config.toml")
++			if agent == "claude-code" {
++				source, target = adapter.Layout{Home: homeA}, adapter.Layout{Home: homeB}
++				settingsName, model, settingsFile = "claude-session-settings", "claude-fixture", "settings.json"
++				projectSettings = filepath.Join(projectRoot, ".claude", "settings.json")
++				mcpBody = `{"type":"stdio","command":"node","args":["fixture-server.js"]}`
++				mcpFile = filepath.Join(homeB, ".claude.json")
++				t.Setenv("CLAUDE_CONFIG_DIR", homeB)
++				record, err := json.Marshal(map[string]any{"type": "user", "cwd": projectRoot, "timestamp": "2026-08-25T10:00:00Z", "message": map[string]any{"role": "user", "content": "native-fixture-marker"}})
++				if err != nil {
++					t.Fatal(err)
++				}
++				if err := source.ReplaceSession(projectRoot, nativeID, [][]byte{record}); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				source, target = adapter.CodexLayout{Home: homeA}, adapter.CodexLayout{Home: homeB}
++				t.Setenv("CODEX_HOME", homeB)
++				writeCodexRoundTripSession(t, source.(adapter.CodexLayout), projectRoot, nativeID, [][]byte{
++					codexRoundTripRecord(t, "2026-08-25T10:00:00Z", "session_meta", map[string]any{"id": nativeID, "cwd": projectRoot, "cli_version": "0.149.0"}),
++					codexRoundTripRecord(t, "2026-08-25T10:01:00Z", "event_msg", map[string]any{"text": "native-fixture-marker"}),
++				})
++			}
++			refs, err := source.DiscoverSessions(projectRoot)
++			if err != nil || len(refs) != 1 {
++				t.Fatalf("source sessions = %v, %v", refs, err)
++			}
++			installation := adapter.Installation{DataDir: homeA, Version: "0.149.0", Compatibility: adapter.CompatFull}
++			space := adapter.PathSpace{ProjectRoot: projectRoot, AgentHome: homeA}
++			summary := pushDiscoveredSessionsWithOptions(ctx, c.Device.ID, identifierKey, projectID, identity, source, installation, space, store, public, newCodexRoundTripPusher(t, configDir), configDir, projectRoot, refs, pushSessionOptions{})
++			if summary.Pushed != 1 || summary.Failed != 0 {
++				t.Fatalf("fixture push = %+v", summary)
++			}
++			hubID, err := sessionhub.DeriveHubKey(identifierKey, sessionhub.DefaultHubLogicalID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			v2ProjectID, err := sessionhub.DeriveProjectKey(identifierKey, hubID, identity)
++			if err != nil {
++				t.Fatal(err)
++			}
++			logicalID, err := sessionhub.DeriveNativeLogicalSessionKey(identifierKey, v2ProjectID, agent, nativeID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			args := []string{"resume", logicalID, "--agent", agent, "--json", "--allow-limited", "--allow-divergent", "--no-workspace-context"}
++			runResume := func(extra ...string) (resumeReport, error) {
++				t.Helper()
++				var output bytes.Buffer
++				err := runSessionWithStreams(append(append([]string(nil), args...), extra...), strings.NewReader("passphrase\n"), &output, io.Discard)
++				var report resumeReport
++				if err == nil {
++					err = json.Unmarshal(output.Bytes(), &report)
++				}
++				return report, err
++			}
++			cleanPreview, err := runResume("--preview")
++			if err != nil || cleanPreview.Environment == nil || len(cleanPreview.Environment.Changes) != 0 {
++				t.Fatalf("clean preview = %+v, %v", cleanPreview, err)
++			}
++
++			// The preview is now stale: publish applicable components without
++			// changing the native records, exactly at the race boundary.
++			var components []environment.ComponentContent
++			var references []environment.Reference
++			for _, fixture := range []struct{ kind, name, media, body string }{
++				{"settings", settingsName, "application/json", `{"model":"` + model + `"}`},
++				{"mcp", "fixture-server", "application/json", mcpBody},
++				{"skill", "fixture-skill", "text/markdown", "# Native fixture skill\n"},
++			} {
++				component, err := environment.NewComponentContent(fixture.kind, fixture.name, "global", "", "portable", fixture.media, []byte(fixture.body))
++				if err != nil {
++					t.Fatal(err)
++				}
++				components = append(components, component)
++				references = append(references, environment.Reference{Kind: fixture.kind, Name: fixture.name, Portability: "portable"})
++			}
++			legacyID, err := crypto.SessionID(identifierKey, projectID, nativeID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			objectLayout, err := syncer.NewObjectLayout(projectID, legacyID, c.Device.ID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := syncer.PutEnvironmentManifest(ctx, store, public, objectLayout, references, components); err != nil {
++				t.Fatal(err)
++			}
++			changedPreview, err := runResume("--preview")
++			if err != nil || changedPreview.Environment == nil || len(changedPreview.Environment.Changes) != 3 {
++				t.Fatalf("changed preview = %+v, %v", changedPreview, err)
++			}
++			for _, change := range changedPreview.Environment.Changes {
++				if change.State != environment.ComponentStateMissing {
++					t.Fatalf("fixture component is not applicable: %+v", change)
++				}
++			}
++			skippedPreview, err := runResume("--preview", "--no-environment")
++			if err != nil || !skippedPreview.Preview || !skippedPreview.EnvironmentSkipped {
++				t.Fatalf("no-environment preview = %+v, %v", skippedPreview, err)
++			}
++			report, err := runResume("--no-environment")
++			if err != nil || !report.EnvironmentSkipped || report.LogicalSession != logicalID {
++				t.Fatalf("native no-environment resume = %+v, %v", report, err)
++			}
++			data, err := target.ReadSession(adapter.SessionRef{NativeID: nativeID, ProjectPath: projectRoot})
++			if err != nil || !bytes.Contains(bytes.Join(data.Records, nil), []byte("native-fixture-marker")) {
++				t.Fatalf("native session was not restored: %v", err)
++			}
++			paths := []string{filepath.Join(homeB, settingsFile), mcpFile, filepath.Join(homeB, "skills", "fixture-skill", "SKILL.md"), filepath.Join(configDir, "state", "environment-backups")}
++			for _, path := range paths {
++				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
++					t.Fatalf("--no-environment wrote %s: %v", path, err)
++				}
++			}
++
++			// Positive control: these exact remote bodies really do reach the
++			// providers and create all three environment targets without the flag.
++			control, err := runResume("--replace-existing")
++			if err != nil || control.EnvironmentSkipped || control.Environment == nil || control.Environment.Status != "applied" {
++				t.Fatalf("environment apply control = %+v, %v", control, err)
++			}
++			for _, path := range paths[:3] {
++				if _, err := os.Stat(path); err != nil {
++					t.Fatalf("positive control did not create %s: %v", path, err)
++				}
++			}
++
++			// A project override also must not block a session-only restore.
++			body := []byte("model = \"different-fixture\"\n")
++			if agent == "claude-code" {
++				body = []byte(`{"model":"different-fixture"}`)
++			}
++			if err := os.MkdirAll(filepath.Dir(projectSettings), 0o700); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(projectSettings, body, 0o600); err != nil {
++				t.Fatal(err)
++			}
++			if _, err := runResume("--replace-existing"); err == nil || !strings.Contains(err.Error(), "environment conflicts") {
++				t.Fatalf("fixture did not produce an environment conflict: %v", err)
++			}
++			var before [][]byte
++			for _, path := range append(paths[:3:3], projectSettings) {
++				content, err := os.ReadFile(path)
++				if err != nil {
++					t.Fatal(err)
++				}
++				before = append(before, content)
++			}
++			conflictReport, err := runResume("--replace-existing", "--no-environment")
++			if err != nil || !conflictReport.EnvironmentSkipped {
++				t.Fatalf("no-environment conflict resume = %+v, %v", conflictReport, err)
++			}
++			for index, path := range append(paths[:3:3], projectSettings) {
++				after, err := os.ReadFile(path)
++				if err != nil || !bytes.Equal(before[index], after) {
++					t.Fatalf("no-environment changed conflict fixture %s: %v", path, err)
++				}
++			}
++		})
++	}
++}
+diff --git a/cmd/ctxhop/resume_test.go b/cmd/ctxhop/resume_test.go
+index 31dc431f6a21f5e6eb4b4cc66353f6e445ac8304..d94431b9d4d3a0f3802a68e1c968e58753691b16 100644
+--- a/cmd/ctxhop/resume_test.go
++++ b/cmd/ctxhop/resume_test.go
+@@ -43,6 +43,31 @@ func TestParseResumeOptionsUsesPreviewAndWorkspaceScopes(t *testing.T) {
+ 	}
+ }
+ 
++func TestResumeNoEnvironmentFlagAndHelp(t *testing.T) {
++	for _, args := range [][]string{
++		{"--no-environment", "native-session"},
++		{"native-session", "--no-environment", "--no-workspace-context"},
++	} {
++		options, err := parseResumeOptions(args)
++		if err != nil || !options.noEnvironment || options.session != "native-session" {
++			t.Fatalf("parse %v = %+v, %v", args, options, err)
++		}
++	}
++	options, err := parseResumeOptions([]string{"--no-environment=false", "native-session"})
++	if err != nil || options.noEnvironment {
++		t.Fatalf("explicit false = %+v, %v", options, err)
++	}
++	for _, path := range [][]string{{"resume"}, {"session", "resume"}} {
++		var output bytes.Buffer
++		if err := writeCommandDiscovery(&output, path); err != nil {
++			t.Fatal(err)
++		}
++		if !strings.Contains(output.String(), "--no-environment") {
++			t.Fatalf("help %v does not advertise --no-environment: %s", path, output.String())
++		}
++	}
++}
++
+ func TestSafeResumePlanErrorPrioritizesContextFailure(t *testing.T) {
+ 	timeout := safeResumePlanError(errors.Join(syncer.ErrIncompleteRemoteSession, context.DeadlineExceeded))
+ 	if got, want := timeout.Error(), "resume: timed out while downloading the remote session; retry on a stable connection"; got != want {
+diff --git a/freeze-manifest.json b/freeze-manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..163f714798ebc9c873372481c2f421f269da275f
+--- /dev/null
++++ b/freeze-manifest.json
+@@ -0,0 +1,73 @@
++{
++  "frozenDate": "2026-09-26",
++  "binaryVersion": "0.2.0-gui.1",
++  "upstreamTag": "v0.2.0",
++  "upstreamCommit": "b8a18e917a3e93b2e961e8e12c82a4953a98779d",
++  "files": [
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\bin\\ctxhop.exe",
++      "sha256": "a1702ce1839af90c0ddb87e7c07f1be7899be8ebdd9117fe680d2ec9739c233d",
++      "size": 11735040
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\ctxhop-no-environment.patch",
++      "sha256": "beac931ff1451c8ead4636a5a1c360e2ac7daea69eb2d1e6ad3de1b14f5d07da",
++      "size": 24751
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\cmd\\ctxhop\\resume.go",
++      "sha256": "b923967a9634be8f8a5d19033661bbcd5e1eb1066ba33110635e285b10e437f9",
++      "size": 33140
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\cmd\\ctxhop\\discovery.go",
++      "sha256": "5fc55087f7bccd70ee1f203f4f6a4e8de6e14d076ade2881cd8910fd6336bf71",
++      "size": 6805
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\cmd\\ctxhop\\resume_test.go",
++      "sha256": "c107d956a22a73b7044e1072f0e4f982db2cda4cce97f392ae366dcbc9c4d92d",
++      "size": 19495
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\cmd\\ctxhop\\resume_no_environment_test.go",
++      "sha256": "0db2148bdd2cf05f4d6c26064cea63faf5092d44b102127546ca8330438e1580",
++      "size": 10097
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\Run-Regression.ps1",
++      "sha256": "6c43de45e4b54188f28d6bb80dcc59bd8e19441dead87f3c0e8fede757dcea9a",
++      "size": 2112
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\PATCH-NOTES.md",
++      "sha256": "bebfe560da7d6d894a31a0bdb85f2f04a9ed9069ee08d16e9325ba22a5b5b794",
++      "size": 5319
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\binary-manifest.json",
++      "sha256": "5dc79362848580f2473a3610eb211e16b9b7d0ff56e1d63e1f2cdea37f769241",
++      "size": 421
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\verification-results\\targeted-regression.txt",
++      "sha256": "53b9e4738467d2498726f7e8ef82bfa46be29958edff08406049f0cd3ab9e8e7",
++      "size": 709
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\verification-results\\relevant-suites.txt",
++      "sha256": "d03055fc167db2e6bda03d217fafab1be4c38e4413432026886125ff0f5b1331",
++      "size": 284
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\verification-results\\vet.txt",
++      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++      "size": 0
++    },
++    {
++      "path": "D:\\세션연동\\ctxhop-gui\\patched-source\\verification-results\\results.json",
++      "sha256": "d09222dbc2626383a58848b558c9beba0eac508885a695afca14b848cc0ccebf",
++      "size": 218
++    }
++  ]
++}

@@ -1,0 +1,5 @@
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop	17.192s
+ok  	github.com/CCCCY-ci/ctxhop/internal/environment	0.658s
+ok  	github.com/CCCCY-ci/ctxhop/internal/adapter	1.025s
+ok  	github.com/CCCCY-ci/ctxhop/internal/syncflow	1.504s
+ok  	github.com/CCCCY-ci/ctxhop/internal/syncer	3.138s

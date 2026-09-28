@@ -66,6 +66,11 @@ Name: "{autodesktop}\CtxHop GUI vNext"; Filename: "{#PowerShell}"; Parameters: "
 ; Offered only when Setup is not elevated, so the GUI and its worker never start as administrator.
 Filename: "{#PowerShell}"; Parameters: "{#GuiArgs}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,CtxHop GUI vNext}"; Flags: postinstall nowait skipifsilent runminimized 64bit; Check: not IsAdmin
 
+[InstallDelete]
+; Earlier builds shipped these source copies; the source now lives in the ctxhop-gui repository.
+Type: filesandordirs; Name: "{app}\claude-source"
+Type: filesandordirs; Name: "{app}\transport-source"
+
 [UninstallDelete]
 ; Python bytecode cache only; a user-made backend\runtime.json stays.
 Type: filesandordirs; Name: "{app}\backend\__pycache__"

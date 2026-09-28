@@ -28,6 +28,7 @@ Download either the installer or the zip from [Releases](https://github.com/jaes
 - While a GUI task (list, backup, restore, setup) is running, setup and uninstall ask you to wait until it finishes, then continue.
 - To remove it, go to Windows **Settings** → **Apps** → **Installed apps** and uninstall **CtxHop GUI vNext**. GUI settings and job folders in `%LOCALAPPDATA%\CtxHopGUI` and the ctxhop configuration are left in place. A `backend\runtime.json` you created stays in the install folder.
 - The installer is built from [`installer/CtxHop-GUI-vNext.iss`](installer/CtxHop-GUI-vNext.iss) (Inno Setup 6.7).
+- The release package (zip and installer) is built by `build/build.ps1` in the repository from the files in git alone (Go 1.27.1, Inno Setup 6.7).
 
 **Zip**
 
@@ -248,7 +249,7 @@ The GUI never overwrites a whole session folder or DB.
 ### Integrity checks
 
 - `Worker.ps1` pins the SHA256 of `backend\desktop_sessions.py` and `bin\ctxhop.exe`, and checks them before Codex list, backup, and preview. If either file is missing or changed, the GUI stops.
-- `bin\ctxhop-claude.exe` must match the pinned `0.2.0-gui.3` hash before a Claude preview or restore. It is `0.2.0-gui.1` plus companion folder backup and restore (`--sidecar-backup`) and store relocation (`remote relocate`); its source, patch and build record are in `claude-source\`.
+- `bin\ctxhop-claude.exe` must match the pinned `0.2.0-gui.3` hash before a Claude preview or restore. It is `0.2.0-gui.1` plus companion folder backup and restore (`--sidecar-backup`) and store relocation (`remote relocate`). `build/build-exes.ps1` in the repository applies the patches in `upstream/patches` to the pinned upstream commit and rebuilds this file and `bin\ctxhop.exe` byte for byte. Earlier builds shipped source copies in `claude-source\` and `transport-source\`; from this build on, setup deletes those two folders.
 - `ClaudeWorker.ps1` is a copy of the stable `ctxhop-gui` Worker (SHA256 `D08E9A15…`). It adds the chosen language, failure reasons, the overlapping-registration check, unregistering, password change and reset, and reading ctxhop output as UTF-8. Its backup and restore decisions and its recovery records are unchanged.
 - `Worker.ps1` connects the frozen Python backend to the `bundle` command of `bin\ctxhop.exe`. The UI never parses conversation bodies, the DB, or the conversation backup format itself (the project files zip is made and read by `ProjectFiles.ps1`, below).
 - `ProjectFiles.ps1` picks, lists, compresses, compares and restores project folders. It uses only standard .NET and, when present, `git`.

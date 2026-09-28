@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Build the package from git (both exes must match the pinned hashes)
+        shell: powershell
+        run: .\build\build.ps1 -Out "$env:RUNNER_TEMP\out" -Tag 00000000 -NoInstaller
+      - name: Test suites that need no Codex engine
+        shell: powershell
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'out\ctxhop-gui-vnext'
+          $failed = @()
+          foreach ($t in 'Test-Strings', 'Test-ProjectFiles', 'Test-DesktopWorker', 'Test-DesktopGUI', 'Test-ClaudeWorker', 'Test-ClaudeGUI') {
+            & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $pkg "$t.ps1")
+            "$t exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+          }
+          if ($failed) { throw "failed: $($failed -join ', ')" }

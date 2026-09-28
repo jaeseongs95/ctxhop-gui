@@ -1,0 +1,5 @@
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop	20.667s
+ok  	github.com/CCCCY-ci/ctxhop/internal/desktopbundle	2.119s
+ok  	github.com/CCCCY-ci/ctxhop/internal/crypto	4.789s
+ok  	github.com/CCCCY-ci/ctxhop/internal/remote	1.834s
+ok  	github.com/CCCCY-ci/ctxhop/internal/syncer	3.823s

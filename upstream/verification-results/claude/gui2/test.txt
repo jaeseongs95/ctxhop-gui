@@ -1,0 +1,23 @@
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop	44.199s
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop-installer	0.280s
+ok  	github.com/CCCCY-ci/ctxhop/internal/adapter	1.292s
+ok  	github.com/CCCCY-ci/ctxhop/internal/atomicfile	0.433s
+ok  	github.com/CCCCY-ci/ctxhop/internal/config	0.642s
+ok  	github.com/CCCCY-ci/ctxhop/internal/crypto	6.620s
+ok  	github.com/CCCCY-ci/ctxhop/internal/diagnostic	0.716s
+ok  	github.com/CCCCY-ci/ctxhop/internal/environment	0.675s
+?   	github.com/CCCCY-ci/ctxhop/internal/gitstate	[no test files]
+ok  	github.com/CCCCY-ci/ctxhop/internal/logging	0.505s
+ok  	github.com/CCCCY-ci/ctxhop/internal/project	34.530s
+ok  	github.com/CCCCY-ci/ctxhop/internal/remote	3.847s
+ok  	github.com/CCCCY-ci/ctxhop/internal/sessionhub	0.673s
+ok  	github.com/CCCCY-ci/ctxhop/internal/syncer	4.378s
+ok  	github.com/CCCCY-ci/ctxhop/internal/syncflow	1.603s
+?   	github.com/CCCCY-ci/ctxhop/internal/workspace	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/fingerprint	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/mvp	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/pathscan	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/restore	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/rewrite	[no test files]
+?   	github.com/CCCCY-ci/ctxhop/poc/touched	[no test files]
+EXIT CODE 0

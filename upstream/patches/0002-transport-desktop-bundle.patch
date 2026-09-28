@@ -1,0 +1,1558 @@
+ctxhop patch 0002 (bin/ctxhop.exe only, after 0001): Codex Desktop bundle transport.
+Go: new cmd/ctxhop/bundle.go (registers the "bundle" command in init), bundle_test.go, internal/desktopbundle/*.
+Records: new docs/desktop-bundle-transport.md, transport-manifest.json, transport-scope-check.json (as shipped).
+
+diff --git a/cmd/ctxhop/bundle.go b/cmd/ctxhop/bundle.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae748ada2010f17d71f56ab3eddc5378f5c3ed6e
+--- /dev/null
++++ b/cmd/ctxhop/bundle.go
+@@ -0,0 +1,130 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"flag"
++	"fmt"
++	"io"
++	"os"
++	"time"
++
++	"github.com/CCCCY-ci/ctxhop/internal/config"
++	"github.com/CCCCY-ci/ctxhop/internal/desktopbundle"
++)
++
++type bundleOptions struct{ action, input, metadata, id, output string }
++
++func init() {
++	commands = append(commands, command{name: "bundle", summary: "transfer encrypted opaque Desktop archives", run: runBundle})
++	commandSubcommands["bundle"] = []string{"put", "list", "get"}
++	commandOptions["bundle put"] = []string{"--input", "--metadata", "--json"}
++	commandOptions["bundle list"] = []string{"--json"}
++	commandOptions["bundle get"] = []string{"--id", "--output", "--json"}
++}
++
++func runBundle(args []string) error {
++	return runBundleWithStreams(args, os.Stdin, os.Stdout, os.Stderr)
++}
++
++func parseBundleOptions(args []string) (bundleOptions, error) {
++	var options bundleOptions
++	if len(args) == 0 {
++		return options, errors.New("bundle: put, list, or get is required")
++	}
++	options.action = args[0]
++	flags := flag.NewFlagSet("bundle", flag.ContinueOnError)
++	flags.SetOutput(io.Discard)
++	jsonOutput := flags.Bool("json", false, "required machine-readable output")
++	switch options.action {
++	case "put":
++		flags.StringVar(&options.input, "input", "", "opaque archive path")
++		flags.StringVar(&options.metadata, "metadata", "", "whitelisted metadata JSON path")
++	case "list":
++	case "get":
++		flags.StringVar(&options.id, "id", "", "opaque bundle ID")
++		flags.StringVar(&options.output, "output", "", "new output archive path")
++	default:
++		return options, errors.New("bundle: unknown action")
++	}
++	if flags.Parse(args[1:]) != nil || flags.NArg() != 0 || !*jsonOutput {
++		return options, errors.New("bundle: invalid arguments; --json is required")
++	}
++	if options.action == "put" && (options.input == "" || options.metadata == "") {
++		return options, errors.New("bundle put: --input and --metadata are required")
++	}
++	if options.action == "get" {
++		if options.output == "" {
++			return options, errors.New("bundle get: --output is required")
++		}
++		if err := desktopbundle.ValidateID(options.id); err != nil {
++			return options, err
++		}
++	}
++	return options, nil
++}
++
++func runBundleWithStreams(args []string, input io.Reader, output, prompt io.Writer) error {
++	options, err := parseBundleOptions(args)
++	if err != nil {
++		return err
++	}
++	if input == nil || output == nil || prompt == nil {
++		return errors.New("bundle: command streams are required")
++	}
++	var metadata desktopbundle.Metadata
++	if options.action == "put" {
++		metadata, err = desktopbundle.ReadMetadataFile(options.metadata)
++		if err != nil {
++			return err
++		}
++	}
++	configDir, err := config.Dir()
++	if err != nil {
++		return err
++	}
++	c, err := config.Load(configDir)
++	if err != nil {
++		return err
++	}
++	if config.ValidateDeviceID(c.Device.ID) != nil {
++		return errors.New("bundle: invalid configured device ID")
++	}
++	if options.action == "put" {
++		if configuredDeviceMode(c) == config.DeviceModeDisabled {
++			return errors.New("bundle put: device is disabled")
++		}
++	} else if err := devicePullError("bundle", c); err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
++	defer cancel()
++	var access *domainAccess
++	if options.action == "put" {
++		access, err = openAuthorizedDomain(ctx, c, configDir, "bundle")
++	} else {
++		access, err = openDomainForRead(ctx, c, configDir, input, prompt, "bundle")
++	}
++	if err != nil {
++		return err
++	}
++	defer access.close()
++	var report any
++	switch options.action {
++	case "put":
++		report, err = desktopbundle.Put(ctx, access.Store, access.Public, c.Device.ID, options.input, metadata)
++	case "list":
++		var bundles []desktopbundle.Info
++		bundles, err = desktopbundle.List(ctx, access.Store, access.Identities, access.allowedDevices(), prompt)
++		report = struct {
++			Bundles []desktopbundle.Info `json:"bundles"`
++		}{Bundles: bundles}
++	case "get":
++		report, err = desktopbundle.Get(ctx, access.Store, access.Identities, access.allowedDevices(), options.id, options.output)
++	}
++	if err != nil {
++		return fmt.Errorf("bundle %s: %w", options.action, err)
++	}
++	return json.NewEncoder(output).Encode(report)
++}
+diff --git a/cmd/ctxhop/bundle_test.go b/cmd/ctxhop/bundle_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d7ee337551b7d5c83d8f7acb4395cf1013a2754
+--- /dev/null
++++ b/cmd/ctxhop/bundle_test.go
+@@ -0,0 +1,98 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/CCCCY-ci/ctxhop/internal/config"
++	"github.com/CCCCY-ci/ctxhop/internal/crypto"
++	"github.com/CCCCY-ci/ctxhop/internal/desktopbundle"
++	"github.com/CCCCY-ci/ctxhop/internal/remote"
++	"github.com/CCCCY-ci/ctxhop/internal/syncer"
++)
++
++func TestBundleCLIIsolatedAuthorizedRoundtrip(t *testing.T) {
++	configDir, remoteRoot, files := t.TempDir(), t.TempDir(), t.TempDir()
++	t.Setenv("CTXHOP_CONFIG_DIR", configDir)
++	store, err := remote.NewDir(remoteRoot)
++	if err != nil {
++		t.Fatal(err)
++	}
++	keyfile, _, err := crypto.NewKeyfile("test-passphrase")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := syncer.PublishKeyfile(context.Background(), store, keyfile); err != nil {
++		t.Fatal(err)
++	}
++	c := config.New()
++	c.Remote = config.Remote{Type: "dir", Path: remoteRoot}
++	c.Device.ID = "device1"
++	c.IdentityPublic = keyfile.IdentityPublic
++	if err := c.Save(configDir); err != nil {
++		t.Fatal(err)
++	}
++	m := desktopbundle.Metadata{SessionID: "12345678-1234-1234-1234-123456789abc", Title: "desktop-private-title", SourceCwd: `C:\project`, UpdatedAt: "2026-09-26T00:00:00Z", HistoryMode: "paginated", CLIVersion: "1.0", RecordCount: 4}
++	metadata, _ := json.Marshal(m)
++	input, metadataFile, output := filepath.Join(files, "archive.zip"), filepath.Join(files, "metadata.json"), filepath.Join(files, "download.zip")
++	os.WriteFile(input, []byte("desktop archive bytes"), 0600)
++	os.WriteFile(metadataFile, metadata, 0600)
++	var report bytes.Buffer
++	if err := runBundleWithStreams([]string{"put", "--input", input, "--metadata", metadataFile, "--json"}, strings.NewReader(""), &report, io.Discard); err != nil {
++		t.Fatal(err)
++	}
++	var put desktopbundle.Result
++	if err := json.Unmarshal(report.Bytes(), &put); err != nil {
++		t.Fatal(err)
++	}
++	report.Reset()
++	if err := runBundleWithStreams([]string{"list", "--json"}, strings.NewReader("test-passphrase\n"), &report, io.Discard); err != nil {
++		t.Fatal(err)
++	}
++	var list struct {
++		Bundles []desktopbundle.Info `json:"bundles"`
++	}
++	if err := json.Unmarshal(report.Bytes(), &list); err != nil || len(list.Bundles) != 1 || list.Bundles[0].Metadata != m {
++		t.Fatalf("list JSON: %s %v", report.String(), err)
++	}
++	report.Reset()
++	if err := runBundleWithStreams([]string{"get", "--id", put.ID, "--output", output, "--json"}, strings.NewReader("test-passphrase\n"), &report, io.Discard); err != nil {
++		t.Fatal(err)
++	}
++	actual, _ := os.ReadFile(output)
++	if string(actual) != "desktop archive bytes" {
++		t.Fatal("CLI roundtrip mismatch")
++	}
++	report.Reset()
++	if err := runBundleWithStreams([]string{"list", "--json"}, strings.NewReader("wrong-passphrase\n"), &report, io.Discard); err == nil || report.Len() != 0 {
++		t.Fatal("wrong domain key accepted")
++	}
++	c.IdentityPublic = bytes.Repeat([]byte{42}, 32)
++	if err := c.Save(configDir); err != nil {
++		t.Fatal(err)
++	}
++	if err := runBundleWithStreams([]string{"list", "--json"}, strings.NewReader("test-passphrase\n"), &report, io.Discard); err == nil {
++		t.Fatal("unauthorized identity domain accepted")
++	}
++}
++
++func TestBundleOptionsRejectHostileAndIncompleteRequests(t *testing.T) {
++	for _, args := range [][]string{nil, {"put"}, {"put", "--json", "--input", "x"}, {"list"}, {"list", "--json", "extra"}, {"get", "--json", "--id", "../escape", "--output", "x"}, {"list", "--json", "--input", "x"}, {"delete", "--json"}} {
++		if _, err := parseBundleOptions(args); err == nil {
++			t.Fatalf("accepted arguments: %v", args)
++		}
++	}
++	var help bytes.Buffer
++	if err := runHelp([]string{"bundle", "put"}); err != nil {
++		t.Fatal(err)
++	}
++	if err := writeCommandDiscovery(&help, []string{"bundle", "get"}); err != nil || !strings.Contains(help.String(), "--output") {
++		t.Fatal("bundle discovery missing")
++	}
++}
+diff --git a/docs/desktop-bundle-transport.md b/docs/desktop-bundle-transport.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a72ec2682d700633c6dac7bf380453b97cf9bab6
+--- /dev/null
++++ b/docs/desktop-bundle-transport.md
+@@ -0,0 +1,62 @@
++# Desktop archive transport candidate
++
++This candidate extends the patched CtxHop source with three JSON-only commands.
++It treats archive bytes as opaque and does not inspect, extract, or install them.
++The existing configured domain and device authorization apply; no new domain or
++encryption implementation is introduced.
++
++```text
++ctxhop bundle put --input FILE --metadata FILE --json
++ctxhop bundle list --json
++ctxhop bundle get --id DEVICE/SNAPSHOT --output NEWFILE --json
++```
++
++Put/get return `{ "id": "DEVICE/SNAPSHOT", "sha256": "...", "bytes": 123 }`.
++List returns `{ "bundles": [{ "id": "...", "sha256": "...", "bytes": 123,
++"metadata": { ... } }] }`. A legacy passphrase-only domain requests its password
++on stdin for list/get, with prompts sent to stderr. Managed domains use the local
++device grant and the existing generation/membership checks. Disabled devices
++cannot transfer; push-only devices cannot list/get.
++
++Metadata JSON must contain exactly `sessionId` (UUID), `title` (string),
++`sourceCwd` (string), `updatedAt` (RFC3339/RFC3339Nano string), `historyMode`
++(nonempty native backend string), `cliVersion` (nonempty string), `recordCount`
++(nonnegative integer). Unknown, duplicate, differently cased, missing and null
++fields are rejected. Metadata input is capped at 64 KiB; titles at 4096 bytes,
++source paths at 32768 bytes, history mode at 128 bytes, CLI version at 256 bytes,
++record count at one billion. Paths/titles never enter remote object names or
++diagnostics. Plaintext metadata is intentionally returned to the JSON caller.
++
++The namespace is `v1/desktop-bundles/<device>/<32 lowercase hex random snapshot>/`.
++Archive chunks have fixed names `chunk-000` through `chunk-127`, each at most
++8 MiB. Archives are capped at 1 GiB. Each chunk uses existing `crypto.Encrypt`
++bound to its exact object path. The encrypted `metadata` manifest is published
++last and contains the whitelist, whole SHA-256, length, and contiguous chunk
++lengths/digests. A failed upload can leave only its own unlisted encrypted chunks;
++the command does not perform broad cleanup or overwrite snapshots.
++
++Directory-backed objects use `os.Root` to confine file I/O. Symlinks, Windows
++junctions/reparse ancestors, alternate data streams and unsafe IDs are refused.
++Windows publication uses a native same-directory rename through existing
++`x/sys/windows` APIs, with replacement disabled and source/destination parent
++handles. Non-Windows directory publication requires filesystem hard-link support.
++An unsupported publication operation fails closed. The S3 backend retains its
++existing remote interface, with an existence check and random device-owned keys.
++
++Get reads only the bounded manifest and its validated contiguous chunk list.
++It verifies decryption authentication, each chunk length/digest and whole digest
++before creating the final destination using `O_EXCL`. Validation failure removes
++the private verification file and leaves no output. An existing output is never
++overwritten. A disk write failure after successful validation removes the newly
++created output. During that final copy, the new output may briefly be visible;
++callers must wait for successful command completion before importing it.
++
++All verification uses isolated fixtures below `D:\Go\temp`, not installed user
++stores or the shared domain. See `verification-results/bundle-targeted.txt`,
++`bundle-all-suites.txt`, `bundle-relevant-suites.txt`, `bundle-race.txt`, and
++`bundle-vet.txt`. The full `go test ./... -count=1` and related `go vet` passed.
++Race instrumentation could not run: enabling cgo reports that `gcc` is missing
++from PATH. The ordinary concurrent immutable snapshot test passed; it does not
++substitute for a race-detector run. Live cloud
++eventual consistency, remote virtual-filesystem support, full 1-GiB throughput,
++and real domain rotation are not claimed by those local tests.
+diff --git a/internal/desktopbundle/bundle.go b/internal/desktopbundle/bundle.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b1c1e39fb76a9b8578b0358cbd477553667083b
+--- /dev/null
++++ b/internal/desktopbundle/bundle.go
+@@ -0,0 +1,710 @@
++// Package desktopbundle transfers opaque Desktop archives through the existing
++// encrypted CtxHop domain. It never interprets or installs archive contents.
++package desktopbundle
++
++import (
++	"bytes"
++	"context"
++	"crypto/ecdh"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path"
++	"path/filepath"
++	"sort"
++	"strings"
++	"time"
++	"unicode/utf8"
++
++	"github.com/CCCCY-ci/ctxhop/internal/config"
++	"github.com/CCCCY-ci/ctxhop/internal/crypto"
++	"github.com/CCCCY-ci/ctxhop/internal/remote"
++)
++
++const (
++	Prefix           = "v1/desktop-bundles/"
++	ChunkBytes       = 8 << 20
++	MaxBytes         = 1 << 30
++	maxMetadataBytes = 64 << 10
++	maxManifestBytes = 128 << 10
++	sealOverhead     = 65 // existing crypto object header + GCM tag
++	maxListedObjects = 100000
++)
++
++type Metadata struct {
++	SessionID   string `json:"sessionId"`
++	Title       string `json:"title"`
++	SourceCwd   string `json:"sourceCwd"`
++	UpdatedAt   string `json:"updatedAt"`
++	HistoryMode string `json:"historyMode"`
++	CLIVersion  string `json:"cliVersion"`
++	RecordCount uint64 `json:"recordCount"`
++}
++
++type Result struct {
++	ID     string `json:"id"`
++	SHA256 string `json:"sha256"`
++	Bytes  int64  `json:"bytes"`
++}
++
++type Info struct {
++	Result
++	Metadata Metadata `json:"metadata"`
++}
++
++type chunk struct {
++	Name   string `json:"name"`
++	Bytes  int64  `json:"bytes"`
++	SHA256 string `json:"sha256"`
++}
++
++type manifest struct {
++	Version  int      `json:"version"`
++	ID       string   `json:"id"`
++	Metadata Metadata `json:"metadata"`
++	Bytes    int64    `json:"bytes"`
++	SHA256   string   `json:"sha256"`
++	Chunks   []chunk  `json:"chunks"`
++}
++
++// DecodeMetadata accepts exactly the whitelist, including all seven fields.
++func DecodeMetadata(data []byte) (Metadata, error) {
++	var m Metadata
++	if len(data) > maxMetadataBytes || strictJSON(data, &m) != nil {
++		return m, errors.New("bundle: invalid metadata JSON")
++	}
++	var fields map[string]json.RawMessage
++	if json.Unmarshal(data, &fields) != nil || len(fields) != 7 {
++		return m, errors.New("bundle: metadata requires all seven whitelist fields")
++	}
++	for _, key := range []string{"sessionId", "title", "sourceCwd", "updatedAt", "historyMode", "cliVersion", "recordCount"} {
++		if _, ok := fields[key]; !ok {
++			return m, errors.New("bundle: metadata field name is not whitelisted")
++		}
++	}
++	for _, value := range fields {
++		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++			return m, errors.New("bundle: null metadata field")
++		}
++	}
++	return m, validateMetadata(m)
++}
++
++func ReadMetadataFile(file string) (Metadata, error) {
++	root, name, err := localRoot(file)
++	if err != nil {
++		return Metadata{}, err
++	}
++	defer root.Close()
++	f, err := root.Open(name)
++	if err != nil {
++		return Metadata{}, errors.New("bundle: metadata file is unavailable")
++	}
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		return Metadata{}, errors.New("bundle: metadata must be a regular file")
++	}
++	data, err := io.ReadAll(io.LimitReader(f, maxMetadataBytes+1))
++	if err != nil {
++		return Metadata{}, errors.New("bundle: metadata file read failed")
++	}
++	return DecodeMetadata(data)
++}
++
++func validateMetadata(m Metadata) error {
++	if len(m.SessionID) != 36 {
++		return errors.New("bundle: invalid session UUID")
++	}
++	for i, ch := range m.SessionID {
++		if i == 8 || i == 13 || i == 18 || i == 23 {
++			if ch != '-' {
++				return errors.New("bundle: invalid session UUID")
++			}
++		} else if !strings.ContainsRune("0123456789abcdefABCDEF", ch) {
++			return errors.New("bundle: invalid session UUID")
++		}
++	}
++	if _, err := time.Parse(time.RFC3339Nano, m.UpdatedAt); err != nil {
++		return errors.New("bundle: updatedAt must be RFC3339")
++	}
++	for _, field := range []struct {
++		value string
++		max   int
++	}{
++		{m.Title, 4096}, {m.SourceCwd, 32768}, {m.HistoryMode, 128}, {m.CLIVersion, 256},
++	} {
++		if len(field.value) > field.max || !utf8.ValidString(field.value) || strings.ContainsAny(field.value, "\x00\r\n") {
++			return errors.New("bundle: invalid metadata string")
++		}
++	}
++	if strings.TrimSpace(m.HistoryMode) == "" || strings.TrimSpace(m.CLIVersion) == "" {
++		return errors.New("bundle: historyMode and cliVersion are required")
++	}
++	if m.RecordCount > 1000000000 {
++		return errors.New("bundle: record count exceeds limit")
++	}
++	return nil
++}
++
++// ValidateID refuses anything except one device and a fresh opaque snapshot.
++func ValidateID(id string) error {
++	parts := strings.Split(id, "/")
++	if len(parts) != 2 || config.ValidateDeviceID(parts[0]) != nil || len(parts[1]) != 32 || !lowerHex(parts[1]) {
++		return errors.New("bundle: invalid bundle ID")
++	}
++	return remote.ValidateKey(Prefix + id + "/metadata")
++}
++
++func lowerHex(value string) bool {
++	for _, ch := range value {
++		if !strings.ContainsRune("0123456789abcdef", ch) {
++			return false
++		}
++	}
++	return value != ""
++}
++
++// Put publishes encrypted chunks first and encrypted metadata last. A failed
++// upload can leave only its own unlisted ciphertext; it never deletes objects.
++func Put(ctx context.Context, store remote.Remote, public *ecdh.PublicKey, device, input string, m Metadata) (Result, error) {
++	if ctx == nil || store == nil || public == nil {
++		return Result{}, errors.New("bundle: storage and encryption context are required")
++	}
++	if err := config.ValidateDeviceID(device); err != nil {
++		return Result{}, errors.New("bundle: invalid local device ID")
++	}
++	if err := validateMetadata(m); err != nil {
++		return Result{}, err
++	}
++	root, name, err := localRoot(input)
++	if err != nil {
++		return Result{}, err
++	}
++	defer root.Close()
++	f, err := root.Open(name)
++	if err != nil {
++		return Result{}, errors.New("bundle: input is unavailable")
++	}
++	defer f.Close()
++	stat, err := f.Stat()
++	if err != nil || !stat.Mode().IsRegular() {
++		return Result{}, errors.New("bundle: input must be a regular file")
++	}
++	if stat.Size() > MaxBytes {
++		return Result{}, errors.New("bundle: input exceeds 1 GiB")
++	}
++	if err := checkDirectoryStore(store); err != nil {
++		return Result{}, err
++	}
++	entropy := make([]byte, 16)
++	rand.Read(entropy)
++	id := device + "/" + hex.EncodeToString(entropy)
++	man := manifest{Version: 1, ID: id, Metadata: m, Chunks: make([]chunk, 0)}
++	hash := sha256.New()
++	buffer := make([]byte, ChunkBytes)
++	for index := 0; ; index++ {
++		if err := ctx.Err(); err != nil {
++			return Result{}, err
++		}
++		n, readErr := io.ReadFull(f, buffer)
++		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
++			return Result{}, errors.New("bundle: input read failed")
++		}
++		if n == 0 {
++			break
++		}
++		if man.Bytes+int64(n) > MaxBytes {
++			return Result{}, errors.New("bundle: input exceeds 1 GiB")
++		}
++		body := buffer[:n]
++		name := fmt.Sprintf("chunk-%03d", index)
++		key := Prefix + id + "/" + name
++		if err := putEncrypted(ctx, store, public, key, body); err != nil {
++			return Result{}, err
++		}
++		hash.Write(body)
++		digest := sha256.Sum256(body)
++		man.Chunks = append(man.Chunks, chunk{Name: name, Bytes: int64(n), SHA256: hex.EncodeToString(digest[:])})
++		man.Bytes += int64(n)
++		if readErr != nil {
++			break
++		}
++	}
++	if man.Bytes != stat.Size() {
++		return Result{}, errors.New("bundle: input changed during upload")
++	}
++	man.SHA256 = hex.EncodeToString(hash.Sum(nil))
++	encoded, err := json.Marshal(man)
++	if err != nil || len(encoded) > maxManifestBytes {
++		return Result{}, errors.New("bundle: manifest exceeds limit")
++	}
++	if err := putEncrypted(ctx, store, public, Prefix+id+"/metadata", encoded); err != nil {
++		return Result{}, err
++	}
++	return Result{ID: id, SHA256: man.SHA256, Bytes: man.Bytes}, nil
++}
++
++// List decrypts only bounded metadata. Rejected entries never expose decrypted
++// fields to diagnostics; plaintext is returned solely in the requested JSON.
++func List(ctx context.Context, store remote.Remote, identities []*ecdh.PrivateKey, allowed map[string]struct{}, diagnostic io.Writer) ([]Info, error) {
++	if ctx == nil || store == nil {
++		return nil, errors.New("bundle: storage context is required")
++	}
++	if err := checkDirectoryStore(store); err != nil {
++		return nil, err
++	}
++	objects, err := store.List(ctx, Prefix)
++	if err != nil {
++		return nil, errors.New("bundle: metadata listing failed")
++	}
++	if len(objects) > maxListedObjects {
++		return nil, errors.New("bundle: listing exceeds object limit")
++	}
++	items := make([]Info, 0)
++	seen := make(map[string]bool)
++	for _, object := range objects {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		if !strings.HasPrefix(object.Key, Prefix) || !strings.HasSuffix(object.Key, "/metadata") {
++			continue
++		}
++		id := strings.TrimSuffix(strings.TrimPrefix(object.Key, Prefix), "/metadata")
++		if ValidateID(id) != nil || seen[id] {
++			skipDiagnostic(diagnostic)
++			continue
++		}
++		seen[id] = true
++		if !allowedID(id, allowed) {
++			continue
++		}
++		man, err := readManifest(ctx, store, identities, id)
++		if err != nil {
++			if ctx.Err() != nil {
++				return nil, ctx.Err()
++			}
++			skipDiagnostic(diagnostic)
++			continue
++		}
++		items = append(items, Info{Result: Result{ID: id, SHA256: man.SHA256, Bytes: man.Bytes}, Metadata: man.Metadata})
++	}
++	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
++	return items, nil
++}
++
++func skipDiagnostic(w io.Writer) {
++	if w != nil {
++		fmt.Fprintln(w, "bundle: skipped unreadable or invalid encrypted metadata")
++	}
++}
++
++func allowedID(id string, allowed map[string]struct{}) bool {
++	if allowed == nil {
++		return true
++	}
++	device := strings.Split(id, "/")[0]
++	_, ok := allowed[device]
++	return ok
++}
++
++// Get verifies every chunk and the complete digest in a private temporary
++// file, then creates the destination with O_EXCL. Existing files are untouched.
++func Get(ctx context.Context, store remote.Remote, identities []*ecdh.PrivateKey, allowed map[string]struct{}, id, output string) (Result, error) {
++	if ctx == nil || store == nil {
++		return Result{}, errors.New("bundle: storage context is required")
++	}
++	if err := ValidateID(id); err != nil {
++		return Result{}, err
++	}
++	if !allowedID(id, allowed) {
++		return Result{}, errors.New("bundle: source device is not authorized")
++	}
++	root, name, err := localRoot(output)
++	if err != nil {
++		return Result{}, err
++	}
++	defer root.Close()
++	if _, err := root.Lstat(name); err == nil {
++		return Result{}, errors.New("bundle: output already exists")
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return Result{}, errors.New("bundle: output is unavailable")
++	}
++	man, err := readManifest(ctx, store, identities, id)
++	if err != nil {
++		return Result{}, err
++	}
++	entropy := make([]byte, 16)
++	rand.Read(entropy)
++	tempName := ".ctxhop-bundle-" + hex.EncodeToString(entropy) + ".tmp"
++	temp, err := root.OpenFile(tempName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++	if err != nil {
++		return Result{}, errors.New("bundle: cannot create verification file")
++	}
++	defer func() { temp.Close(); root.Remove(tempName) }()
++	hash := sha256.New()
++	for _, part := range man.Chunks {
++		key := Prefix + id + "/" + part.Name
++		body, err := readEncrypted(ctx, store, identities, key, ChunkBytes)
++		if err != nil {
++			return Result{}, err
++		}
++		digest := sha256.Sum256(body)
++		if int64(len(body)) != part.Bytes || hex.EncodeToString(digest[:]) != part.SHA256 {
++			return Result{}, errors.New("bundle: chunk integrity mismatch")
++		}
++		if _, err := temp.Write(body); err != nil {
++			return Result{}, errors.New("bundle: verification write failed")
++		}
++		hash.Write(body)
++	}
++	if hex.EncodeToString(hash.Sum(nil)) != man.SHA256 {
++		return Result{}, errors.New("bundle: whole archive integrity mismatch")
++	}
++	if err := temp.Sync(); err != nil {
++		return Result{}, errors.New("bundle: verification sync failed")
++	}
++	if err := temp.Close(); err != nil {
++		return Result{}, errors.New("bundle: verification close failed")
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++	verified, err := root.Open(tempName)
++	if err != nil {
++		return Result{}, errors.New("bundle: verified input is unavailable")
++	}
++	defer verified.Close()
++	final, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++	if err != nil {
++		return Result{}, errors.New("bundle: output already exists or cannot be created")
++	}
++	complete := false
++	defer func() {
++		final.Close()
++		if !complete {
++			root.Remove(name)
++		}
++	}()
++	n, err := io.Copy(final, verified)
++	if err != nil || n != man.Bytes {
++		return Result{}, errors.New("bundle: output write failed")
++	}
++	if err := final.Sync(); err != nil {
++		return Result{}, errors.New("bundle: output sync failed")
++	}
++	if err := final.Close(); err != nil {
++		return Result{}, errors.New("bundle: output close failed")
++	}
++	complete = true
++	return Result{ID: id, SHA256: man.SHA256, Bytes: man.Bytes}, nil
++}
++
++func readManifest(ctx context.Context, store remote.Remote, identities []*ecdh.PrivateKey, id string) (manifest, error) {
++	var man manifest
++	if err := ValidateID(id); err != nil {
++		return man, err
++	}
++	data, err := readEncrypted(ctx, store, identities, Prefix+id+"/metadata", maxManifestBytes)
++	if err != nil {
++		return man, err
++	}
++	if err := strictJSON(data, &man); err != nil {
++		return man, errors.New("bundle: invalid encrypted manifest")
++	}
++	var fields map[string]json.RawMessage
++	if json.Unmarshal(data, &fields) != nil || len(fields) != 6 {
++		return man, errors.New("bundle: invalid encrypted manifest fields")
++	}
++	for _, key := range []string{"version", "id", "metadata", "bytes", "sha256", "chunks"} {
++		if _, ok := fields[key]; !ok {
++			return man, errors.New("bundle: invalid encrypted manifest field name")
++		}
++	}
++	if _, err := DecodeMetadata(fields["metadata"]); err != nil {
++		return man, errors.New("bundle: invalid encrypted metadata")
++	}
++	for _, value := range fields {
++		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++			return man, errors.New("bundle: null manifest field")
++		}
++	}
++	var chunkFields []map[string]json.RawMessage
++	if json.Unmarshal(fields["chunks"], &chunkFields) != nil {
++		return man, errors.New("bundle: invalid chunk fields")
++	}
++	for _, fields := range chunkFields {
++		if len(fields) != 3 {
++			return man, errors.New("bundle: invalid chunk fields")
++		}
++		for _, key := range []string{"name", "bytes", "sha256"} {
++			value, ok := fields[key]
++			if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++				return man, errors.New("bundle: invalid chunk fields")
++			}
++		}
++	}
++	if man.Version != 1 || man.ID != id || man.Bytes < 0 || man.Bytes > MaxBytes || len(man.SHA256) != 64 || !lowerHex(man.SHA256) || validateMetadata(man.Metadata) != nil {
++		return man, errors.New("bundle: invalid encrypted manifest")
++	}
++	expected := (man.Bytes + ChunkBytes - 1) / ChunkBytes
++	if int64(len(man.Chunks)) != expected {
++		return man, errors.New("bundle: invalid chunk count")
++	}
++	var total int64
++	for index, part := range man.Chunks {
++		wantSize := int64(ChunkBytes)
++		if index == len(man.Chunks)-1 {
++			wantSize = man.Bytes - total
++		}
++		if part.Name != fmt.Sprintf("chunk-%03d", index) || part.Bytes != wantSize || len(part.SHA256) != 64 || !lowerHex(part.SHA256) {
++			return man, errors.New("bundle: invalid chunk manifest")
++		}
++		total += part.Bytes
++	}
++	if total != man.Bytes {
++		return man, errors.New("bundle: invalid chunk total")
++	}
++	return man, nil
++}
++
++func putEncrypted(ctx context.Context, store remote.Remote, public *ecdh.PublicKey, key string, body []byte) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	sealed, err := crypto.Encrypt(public, key, body)
++	if err != nil {
++		return errors.New("bundle: encryption failed")
++	}
++	if dir, ok := store.(*remote.Dir); ok {
++		return putDir(ctx, dir, key, sealed)
++	}
++	if _, err := store.Stat(ctx, key); err == nil {
++		return errors.New("bundle: immutable object already exists")
++	} else if !errors.Is(err, remote.ErrNotFound) {
++		return errors.New("bundle: object existence check failed")
++	}
++	if err := store.Put(ctx, key, bytes.NewReader(sealed), int64(len(sealed))); err != nil {
++		return errors.New("bundle: encrypted upload failed")
++	}
++	return nil
++}
++
++func readEncrypted(ctx context.Context, store remote.Remote, identities []*ecdh.PrivateKey, key string, max int64) ([]byte, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if len(identities) == 0 || len(identities) > 128 {
++		return nil, errors.New("bundle: authorized decryption key is required")
++	}
++	var reader io.ReadCloser
++	var err error
++	if dir, ok := store.(*remote.Dir); ok {
++		reader, err = getDir(dir, key)
++	} else {
++		reader, err = store.Get(ctx, key)
++	}
++	if err != nil {
++		return nil, errors.New("bundle: encrypted object read failed")
++	}
++	sealed, readErr := io.ReadAll(io.LimitReader(reader, max+sealOverhead+1))
++	closeErr := reader.Close()
++	if readErr != nil || closeErr != nil || int64(len(sealed)) > max+sealOverhead {
++		return nil, errors.New("bundle: encrypted object exceeds limit or cannot be read")
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	for _, identity := range identities {
++		if identity == nil {
++			continue
++		}
++		if body, err := crypto.Decrypt(identity, key, sealed); err == nil {
++			if int64(len(body)) > max {
++				return nil, errors.New("bundle: decrypted object exceeds limit")
++			}
++			return body, nil
++		}
++	}
++	return nil, errors.New("bundle: encrypted object failed authentication")
++}
++
++// strictJSON rejects duplicate keys, excessive nesting, unknown fields,
++// trailing documents and invalid UTF-8 before interpreting an envelope.
++func strictJSON(data []byte, target any) error {
++	if !utf8.Valid(data) {
++		return errors.New("invalid UTF-8")
++	}
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	if err := walkJSON(decoder, 0); err != nil {
++		return err
++	}
++	if _, err := decoder.Token(); err != io.EOF {
++		return errors.New("trailing JSON")
++	}
++	decoder = json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	return decoder.Decode(target)
++}
++
++func walkJSON(decoder *json.Decoder, depth int) error {
++	if depth > 8 {
++		return errors.New("JSON nesting exceeds limit")
++	}
++	token, err := decoder.Token()
++	if err != nil {
++		return err
++	}
++	delim, ok := token.(json.Delim)
++	if !ok {
++		return nil
++	}
++	if delim != '{' && delim != '[' {
++		return errors.New("invalid JSON delimiter")
++	}
++	seen := make(map[string]bool)
++	for decoder.More() {
++		if delim == '{' {
++			key, err := decoder.Token()
++			if err != nil {
++				return err
++			}
++			name, ok := key.(string)
++			if !ok || seen[name] {
++				return errors.New("duplicate JSON key")
++			}
++			seen[name] = true
++		}
++		if err := walkJSON(decoder, depth+1); err != nil {
++			return err
++		}
++	}
++	_, err = decoder.Token()
++	return err
++}
++
++func localRoot(file string) (*os.Root, string, error) {
++	abs, err := filepath.Abs(file)
++	if err != nil || strings.TrimSpace(file) == "" {
++		return nil, "", errors.New("bundle: invalid file path")
++	}
++	if err := checkPath(abs, true); err != nil {
++		return nil, "", err
++	}
++	root, err := os.OpenRoot(filepath.Dir(abs))
++	if err != nil {
++		return nil, "", errors.New("bundle: file directory is unavailable")
++	}
++	return root, filepath.Base(abs), nil
++}
++
++func checkDirectoryStore(store remote.Remote) error {
++	if dir, ok := store.(*remote.Dir); ok {
++		if err := checkPath(dir.Root, false); err != nil {
++			return err
++		}
++		return checkPath(filepath.Join(dir.Root, filepath.FromSlash(strings.TrimSuffix(Prefix, "/"))), true)
++	}
++	return nil
++}
++
++func checkPath(name string, missing bool) error {
++	abs, err := filepath.Abs(name)
++	if err != nil {
++		return errors.New("bundle: invalid directory path")
++	}
++	// Inspect each ancestor, including Windows junctions. Root subsequently
++	// confines actual I/O even if an untrusted sync process changes an ancestor.
++	for current := abs; ; current = filepath.Dir(current) {
++		info, err := os.Lstat(current)
++		if err != nil {
++			if !missing || !errors.Is(err, os.ErrNotExist) {
++				return errors.New("bundle: path is unavailable")
++			}
++		} else {
++			reparse, err := isReparse(current, info)
++			if err != nil || reparse {
++				return errors.New("bundle: symlink or reparse path is refused")
++			}
++		}
++		if current == filepath.Dir(current) {
++			break
++		}
++	}
++	return nil
++}
++
++func dirRoot(dir *remote.Dir, key string, create bool) (*os.Root, error) {
++	if remote.ValidateKey(key) != nil {
++		return nil, errors.New("bundle: invalid object path")
++	}
++	if err := checkPath(filepath.Join(dir.Root, filepath.FromSlash(key)), true); err != nil {
++		return nil, err
++	}
++	root, err := os.OpenRoot(dir.Root)
++	if err != nil {
++		return nil, errors.New("bundle: storage root is unavailable")
++	}
++	if create {
++		if err := root.MkdirAll(filepath.FromSlash(path.Dir(key)), 0700); err != nil {
++			root.Close()
++			return nil, errors.New("bundle: cannot create object directory")
++		}
++	}
++	return root, nil
++}
++
++func getDir(dir *remote.Dir, key string) (io.ReadCloser, error) {
++	root, err := dirRoot(dir, key, false)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	f, err := root.Open(filepath.FromSlash(key))
++	if err != nil {
++		return nil, errors.New("bundle: object is unavailable")
++	}
++	info, err := f.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		f.Close()
++		return nil, errors.New("bundle: object must be a regular file")
++	}
++	return f, nil
++}
++
++func putDir(ctx context.Context, dir *remote.Dir, key string, sealed []byte) error {
++	root, err := dirRoot(dir, key, true)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	entropy := make([]byte, 16)
++	rand.Read(entropy)
++	tempKey := key + "." + hex.EncodeToString(entropy) + ".tmp"
++	f, err := root.OpenFile(filepath.FromSlash(tempKey), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++	if err != nil {
++		return errors.New("bundle: encrypted staging create failed")
++	}
++	defer func() { f.Close(); root.Remove(filepath.FromSlash(tempKey)) }()
++	if _, err := f.Write(sealed); err != nil {
++		return errors.New("bundle: encrypted staging write failed")
++	}
++	if err := f.Sync(); err != nil {
++		return errors.New("bundle: encrypted staging sync failed")
++	}
++	if err := f.Close(); err != nil {
++		return errors.New("bundle: encrypted staging close failed")
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := publishNoReplace(root, filepath.FromSlash(tempKey), filepath.FromSlash(key)); err != nil {
++		return errors.New("bundle: immutable encrypted publication failed")
++	}
++	return nil
++}
+diff --git a/internal/desktopbundle/bundle_test.go b/internal/desktopbundle/bundle_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..84e7648ce66f33e14134de35ca4d1bf851ed35a7
+--- /dev/null
++++ b/internal/desktopbundle/bundle_test.go
+@@ -0,0 +1,286 @@
++package desktopbundle
++
++import (
++	"bytes"
++	"context"
++	"crypto/ecdh"
++	"crypto/rand"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/CCCCY-ci/ctxhop/internal/crypto"
++	"github.com/CCCCY-ci/ctxhop/internal/remote"
++)
++
++func fixture(t *testing.T) (*remote.Dir, *ecdh.PrivateKey, string, Metadata) {
++	t.Helper()
++	root := t.TempDir()
++	store, err := remote.NewDir(root)
++	if err != nil {
++		t.Fatal(err)
++	}
++	identity, err := ecdh.X25519().GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	m := Metadata{SessionID: "12345678-1234-1234-1234-123456789abc", Title: "private-title-비공개", SourceCwd: `C:\private-work`, UpdatedAt: "2026-09-26T00:00:00Z", HistoryMode: "paginated", CLIVersion: "0.1.0", RecordCount: 3}
++	return store, identity, root, m
++}
++
++func publish(t *testing.T, store *remote.Dir, identity *ecdh.PrivateKey, root string, m Metadata, body []byte) Result {
++	t.Helper()
++	input := filepath.Join(t.TempDir(), "input.zip")
++	if err := os.WriteFile(input, body, 0600); err != nil {
++		t.Fatal(err)
++	}
++	result, err := Put(context.Background(), store, identity.PublicKey(), "device1", input, m)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return result
++}
++
++func TestMultiChunkRoundtripEncryptedAndImmutable(t *testing.T) {
++	store, identity, root, m := fixture(t)
++	body := bytes.Repeat([]byte("private-body-秘密\n"), (ChunkBytes*2)/len("private-body-秘密\n")+101)
++	result := publish(t, store, identity, root, m, body)
++	items, err := List(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, nil)
++	if err != nil || len(items) != 1 || items[0].Metadata != m {
++		t.Fatalf("list: %v %v", items, err)
++	}
++	output := filepath.Join(t.TempDir(), "output.zip")
++	got, err := Get(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, result.ID, output)
++	if err != nil || got != result {
++		t.Fatalf("get: %v %v", got, err)
++	}
++	actual, err := os.ReadFile(output)
++	if err != nil || !bytes.Equal(actual, body) {
++		t.Fatal("roundtrip content mismatch")
++	}
++	objects, err := store.List(context.Background(), Prefix)
++	if err != nil || len(objects) != 4 {
++		t.Fatalf("chunks: %d %v", len(objects), err)
++	}
++	for _, object := range objects {
++		sealed, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(object.Key)))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.HasPrefix(sealed, []byte("ASx1")) || bytes.Contains(sealed, []byte(m.Title)) || bytes.Contains(sealed, []byte(m.SourceCwd)) || bytes.Contains(sealed, []byte("private-body")) {
++			t.Fatal("plaintext leaked")
++		}
++	}
++	if err := putEncrypted(context.Background(), store, identity.PublicKey(), Prefix+result.ID+"/metadata", []byte("replacement")); err == nil {
++		t.Fatal("immutable metadata replaced")
++	}
++	if _, err := Get(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, result.ID, output); err == nil {
++		t.Fatal("existing output accepted")
++	}
++	actual, _ = os.ReadFile(output)
++	if !bytes.Equal(actual, body) {
++		t.Fatal("existing output changed")
++	}
++}
++
++func TestCorruptionWrongKeyChunkSwapAndNoPartialOutput(t *testing.T) {
++	for _, attack := range []string{"wrongkey", "ciphertext", "chunk-swap", "whole-digest", "chunk-digest", "traversal", "huge-envelope", "null-metadata-field"} {
++		t.Run(attack, func(t *testing.T) {
++			store, identity, root, m := fixture(t)
++			result := publish(t, store, identity, root, m, bytes.Repeat([]byte("content"), ChunkBytes/7+10))
++			keys := []*ecdh.PrivateKey{identity}
++			metadataKey := Prefix + result.ID + "/metadata"
++			man, err := readManifest(context.Background(), store, keys, result.ID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			chunkKey := Prefix + result.ID + "/chunk-000"
++			switch attack {
++			case "wrongkey":
++				other, _ := ecdh.X25519().GenerateKey(rand.Reader)
++				keys = []*ecdh.PrivateKey{other}
++			case "ciphertext":
++				file := filepath.Join(root, filepath.FromSlash(chunkKey))
++				sealed, _ := os.ReadFile(file)
++				sealed[len(sealed)-1] ^= 1
++				os.WriteFile(file, sealed, 0600)
++			case "chunk-swap":
++				sealed, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(Prefix+result.ID+"/chunk-001")))
++				os.WriteFile(filepath.Join(root, filepath.FromSlash(chunkKey)), sealed, 0600)
++			case "whole-digest":
++				man.SHA256 = strings.Repeat("0", 64)
++			case "chunk-digest":
++				man.Chunks[0].SHA256 = strings.Repeat("0", 64)
++			case "traversal":
++				man.Chunks[0].Name = "../../outside"
++			case "huge-envelope":
++				os.WriteFile(filepath.Join(root, filepath.FromSlash(metadataKey)), make([]byte, maxManifestBytes+sealOverhead+1), 0600)
++			case "null-metadata-field":
++				data, _ := json.Marshal(man)
++				data = bytes.Replace(data, []byte(`"recordCount":3`), []byte(`"recordCount":null`), 1)
++				sealed, _ := crypto.Encrypt(identity.PublicKey(), metadataKey, data)
++				os.WriteFile(filepath.Join(root, filepath.FromSlash(metadataKey)), sealed, 0600)
++			}
++			if attack == "whole-digest" || attack == "chunk-digest" || attack == "traversal" {
++				data, _ := json.Marshal(man)
++				sealed, _ := crypto.Encrypt(identity.PublicKey(), metadataKey, data)
++				os.WriteFile(filepath.Join(root, filepath.FromSlash(metadataKey)), sealed, 0600)
++			}
++			outputRoot := t.TempDir()
++			output := filepath.Join(outputRoot, "result.zip")
++			if _, err := Get(context.Background(), store, keys, nil, result.ID, output); err == nil {
++				t.Fatal("attack accepted")
++			}
++			entries, err := os.ReadDir(outputRoot)
++			if err != nil || len(entries) != 0 {
++				t.Fatalf("partial files remain: %v %v", entries, err)
++			}
++			if attack == "wrongkey" || attack == "huge-envelope" || attack == "null-metadata-field" {
++				var diagnostic bytes.Buffer
++				items, err := List(context.Background(), store, keys, nil, &diagnostic)
++				if err != nil || len(items) != 0 || diagnostic.Len() == 0 || strings.Contains(diagnostic.String(), m.Title) || strings.Contains(diagnostic.String(), m.SourceCwd) {
++					t.Fatalf("unsafe list diagnostic: %v %v", items, err)
++				}
++			}
++		})
++	}
++}
++
++func TestMetadataAndIDHostileInputs(t *testing.T) {
++	_, _, _, m := fixture(t)
++	good, _ := json.Marshal(m)
++	if _, err := DecodeMetadata(good); err != nil {
++		t.Fatal(err)
++	}
++	for _, data := range [][]byte{
++		append(append([]byte{}, good[:len(good)-1]...), []byte(`,"unexpected":"private"}`)...),
++		append(append([]byte{}, good[:len(good)-1]...), []byte(`,"title":"duplicate"}`)...),
++		bytes.Replace(good, []byte(`"recordCount":3`), []byte(`"recordCount":null`), 1),
++		bytes.Replace(good, []byte(`"historyMode":"paginated"`), []byte(`"historyMode":""`), 1),
++		bytes.Replace(good, []byte(`"title"`), []byte(`"Title"`), 1),
++		append(good, []byte(" {}")...),
++		bytes.Repeat([]byte("x"), maxMetadataBytes+1),
++	} {
++		if _, err := DecodeMetadata(data); err == nil {
++			t.Fatal("hostile metadata accepted")
++		}
++	}
++	for _, id := range []string{"../outside", "device1/../outside", `device1\abcd`, "device1/" + strings.Repeat("A", 32), "device1/" + strings.Repeat("a", 33), "C:/" + strings.Repeat("a", 32), "device1/" + strings.Repeat("a", 32) + "/child"} {
++		if ValidateID(id) == nil {
++			t.Fatalf("hostile ID accepted: %q", id)
++		}
++	}
++}
++
++func TestOversizeInputRefusedBeforePublishing(t *testing.T) {
++	store, identity, _, m := fixture(t)
++	input := filepath.Join(t.TempDir(), "huge.zip")
++	f, err := os.Create(input)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := f.Truncate(MaxBytes + 1); err != nil {
++		t.Fatal(err)
++	}
++	f.Close()
++	if _, err := Put(context.Background(), store, identity.PublicKey(), "device1", input, m); err == nil {
++		t.Fatal("oversize input accepted")
++	}
++	objects, _ := store.List(context.Background(), Prefix)
++	if len(objects) != 0 {
++		t.Fatal("oversize input published objects")
++	}
++}
++
++func TestMembershipAndEmptyArchive(t *testing.T) {
++	store, identity, root, m := fixture(t)
++	result := publish(t, store, identity, root, m, nil)
++	items, err := List(context.Background(), store, []*ecdh.PrivateKey{identity}, map[string]struct{}{"other": {}}, nil)
++	if err != nil || len(items) != 0 {
++		t.Fatal("unauthorized source listed")
++	}
++	if _, err := Get(context.Background(), store, []*ecdh.PrivateKey{identity}, map[string]struct{}{"other": {}}, result.ID, filepath.Join(t.TempDir(), "out")); err == nil {
++		t.Fatal("unauthorized source downloaded")
++	}
++	if _, err := Get(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, result.ID, filepath.Join(t.TempDir(), "empty")); err != nil {
++		t.Fatal(err)
++	}
++}
++
++type failUpload struct {
++	remote.Remote
++	puts []string
++}
++
++func (s *failUpload) Put(ctx context.Context, key string, body io.Reader, size int64) error {
++	s.puts = append(s.puts, key)
++	if strings.HasSuffix(key, "/chunk-001") {
++		return errors.New("isolated injected failure")
++	}
++	return s.Remote.Put(ctx, key, body, size)
++}
++
++func TestFailedUploadDoesNotPublishMetadataOrDeleteAdjacentData(t *testing.T) {
++	store, identity, _, m := fixture(t)
++	ctx := context.Background()
++	store.Put(ctx, "adjacent", strings.NewReader("keep"), 4)
++	input := filepath.Join(t.TempDir(), "input")
++	os.WriteFile(input, make([]byte, ChunkBytes+1), 0600)
++	failure := &failUpload{Remote: store}
++	if _, err := Put(ctx, failure, identity.PublicKey(), "device1", input, m); err == nil {
++		t.Fatal("injected upload failure ignored")
++	}
++	if len(failure.puts) != 2 || !strings.HasSuffix(failure.puts[0], "/chunk-000") || !strings.HasSuffix(failure.puts[1], "/chunk-001") {
++		t.Fatal("unexpected publication order")
++	}
++	items, err := List(ctx, store, []*ecdh.PrivateKey{identity}, nil, nil)
++	if err != nil || len(items) != 0 {
++		t.Fatal("partial upload listed")
++	}
++	if _, err := store.Stat(ctx, "adjacent"); err != nil {
++		t.Fatal("adjacent data modified")
++	}
++}
++
++func TestConcurrentImmutableSnapshots(t *testing.T) {
++	store, identity, _, m := fixture(t)
++	input := filepath.Join(t.TempDir(), "input")
++	os.WriteFile(input, []byte("snapshot"), 0600)
++	var workers sync.WaitGroup
++	results := make(chan Result, 8)
++	errors := make(chan error, 8)
++	for i := 0; i < 8; i++ {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			result, err := Put(context.Background(), store, identity.PublicKey(), "device1", input, m)
++			if err != nil {
++				errors <- err
++			} else {
++				results <- result
++			}
++		}()
++	}
++	workers.Wait()
++	close(results)
++	close(errors)
++	for err := range errors {
++		t.Fatal(err)
++	}
++	seen := make(map[string]bool)
++	for result := range results {
++		if seen[result.ID] {
++			t.Fatal("snapshot collision")
++		}
++		seen[result.ID] = true
++	}
++	items, err := List(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, nil)
++	if err != nil || len(items) != 8 {
++		t.Fatalf("concurrent snapshot count: %d %v", len(items), err)
++	}
++}
+diff --git a/internal/desktopbundle/path_other.go b/internal/desktopbundle/path_other.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..94d52084d6b209c43efa5308df0b7df65ca2649b
+--- /dev/null
++++ b/internal/desktopbundle/path_other.go
+@@ -0,0 +1,13 @@
++//go:build !windows
++
++package desktopbundle
++
++import "os"
++
++func isReparse(name string, info os.FileInfo) (bool, error) {
++	return info.Mode()&os.ModeSymlink != 0, nil
++}
++
++func publishNoReplace(root *os.Root, staging, destination string) error {
++	return root.Link(staging, destination)
++}
+diff --git a/internal/desktopbundle/path_windows.go b/internal/desktopbundle/path_windows.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8dec707884df5c87b49dcc63186b50539024129b
+--- /dev/null
++++ b/internal/desktopbundle/path_windows.go
+@@ -0,0 +1,72 @@
++//go:build windows
++
++package desktopbundle
++
++import (
++	"golang.org/x/sys/windows"
++	"os"
++	"path/filepath"
++	"unsafe"
++)
++
++func isReparse(name string, info os.FileInfo) (bool, error) {
++	path, err := windows.UTF16PtrFromString(name)
++	if err != nil {
++		return false, err
++	}
++	attributes, err := windows.GetFileAttributes(path)
++	return attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0, err
++}
++
++// Same-directory native rename is atomic, refuses replacement, and works on
++// filesystems that do not implement hard links. Handles keep it within Root.
++func publishNoReplace(root *os.Root, staging, destination string) error {
++	parent, err := root.OpenRoot(filepath.Dir(destination))
++	if err != nil {
++		return err
++	}
++	defer parent.Close()
++	directory, err := parent.Open(".")
++	if err != nil {
++		return err
++	}
++	defer directory.Close()
++	name, err := windows.NewNTUnicodeString(filepath.Base(staging))
++	if err != nil {
++		return err
++	}
++	oa := windows.OBJECT_ATTRIBUTES{
++		RootDirectory: windows.Handle(directory.Fd()), ObjectName: name,
++		Attributes: windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
++	}
++	oa.Length = uint32(unsafe.Sizeof(oa))
++	var handle windows.Handle
++	var status windows.IO_STATUS_BLOCK
++	err = windows.NtCreateFile(&handle, windows.DELETE|windows.SYNCHRONIZE, &oa, &status, nil, 0,
++		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, windows.FILE_OPEN,
++		windows.FILE_NON_DIRECTORY_FILE|windows.FILE_OPEN_REPARSE_POINT|windows.FILE_SYNCHRONOUS_IO_NONALERT, 0, 0)
++	if err != nil {
++		return err
++	}
++	defer windows.CloseHandle(handle)
++	utf16, err := windows.UTF16FromString(filepath.Base(destination))
++	if err != nil {
++		return err
++	}
++	// This native layout follows x/sys/windows' own rename test. A zero flags
++	// value intentionally omits FILE_RENAME_REPLACE_IF_EXISTS.
++	type renameInformation struct {
++		Flags          uint32
++		RootDirectory  windows.Handle
++		FileNameLength uint32
++		FileName       [1]uint16
++	}
++	var layout renameInformation
++	length := (len(utf16) - 1) * 2
++	buffer := make([]byte, int(unsafe.Offsetof(layout.FileName))+length)
++	info := (*renameInformation)(unsafe.Pointer(&buffer[0]))
++	info.RootDirectory = windows.Handle(directory.Fd())
++	info.FileNameLength = uint32(length)
++	copy(unsafe.Slice(&info.FileName[0], len(utf16)-1), utf16)
++	return windows.NtSetInformationFile(handle, &status, &buffer[0], uint32(len(buffer)), windows.FileRenameInformation)
++}
+diff --git a/internal/desktopbundle/path_windows_test.go b/internal/desktopbundle/path_windows_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbfce1155efa042260c5c28dd2ffde7323b6f749
+--- /dev/null
++++ b/internal/desktopbundle/path_windows_test.go
+@@ -0,0 +1,39 @@
++//go:build windows
++
++package desktopbundle
++
++import (
++	"context"
++	"crypto/ecdh"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++)
++
++func TestDirectoryJunctionAndOutputADSRejected(t *testing.T) {
++	store, identity, root, m := fixture(t)
++	outside := t.TempDir()
++	junction := filepath.Join(root, "v1")
++	if output, err := exec.Command("cmd.exe", "/c", "mklink", "/J", junction, outside).CombinedOutput(); err != nil {
++		t.Fatalf("create isolated junction: %v %s", err, output)
++	}
++	defer os.Remove(junction)
++	input := filepath.Join(t.TempDir(), "input")
++	os.WriteFile(input, []byte("secret"), 0600)
++	if _, err := Put(context.Background(), store, identity.PublicKey(), "device1", input, m); err == nil {
++		t.Fatal("junction publication accepted")
++	}
++	if _, err := List(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, nil); err == nil {
++		t.Fatal("junction listing accepted")
++	}
++	entries, _ := os.ReadDir(outside)
++	if len(entries) != 0 {
++		t.Fatal("junction target modified")
++	}
++	os.Remove(junction)
++	result := publish(t, store, identity, root, m, []byte("secret"))
++	if _, err := Get(context.Background(), store, []*ecdh.PrivateKey{identity}, nil, result.ID, filepath.Join(t.TempDir(), "archive:secret")); err == nil {
++		t.Fatal("Windows alternate data stream accepted")
++	}
++}
+diff --git a/transport-manifest.json b/transport-manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5772c60b01b4403ca29aadd74ae6479cc31dbcc
+--- /dev/null
++++ b/transport-manifest.json
+@@ -0,0 +1,77 @@
++{
++  "schemaVersion": "1",
++  "candidate": "desktop-bundle-candidate-20260926",
++  "go": "1.27.1 windows/amd64",
++  "sourceBase": "D:\\세션연동\\ctxhop-gui\\patched-source",
++  "scope": "new additive opaque bundle transport only; stable source/binary/user stores/shared domain unchanged",
++  "binary": {
++    "path": "D:\\세션연동\\ctxhop-gui-vnext\\bin\\ctxhop.exe",
++    "sha256": "9B14CCD3B33C75EDFD9D424D76FBAF17092364C58721C1BB9C0FD6BA73C7C006"
++  },
++  "claudeBinary": {
++    "path": "D:\\세션연동\\ctxhop-gui-vnext\\bin\\ctxhop-claude.exe",
++    "sha256": "A1702CE1839AF90C0DDB87E7C07F1BE7899BE8EBDD9117FE680D2EC9739C233D"
++  },
++  "validation": {
++    "allSuites": "PASS go test ./... -count=1",
++    "targeted": "PASS bundle security/roundtrip/order/concurrency/CLI",
++    "vet": "PASS related packages",
++    "race": "UNAVAILABLE gcc absent from PATH after enabling CGO_ENABLED=1",
++    "temporaryRoot": "D:\\Go\\temp",
++    "TMP": "D:\\Go\\temp",
++    "TEMP": "D:\\Go\\temp",
++    "GOTMPDIR": "D:\\Go\\temp"
++  },
++  "sources": [
++    {
++      "path": "cmd\\ctxhop\\bundle.go",
++      "sha256": "D4272880DA2DFD71A9D13B1205CB58E4425834E0BF14C26BCAA51525CC7CF987"
++    },
++    {
++      "path": "cmd\\ctxhop\\bundle_test.go",
++      "sha256": "FC726BFC5EEC4D3486157AB3F319A378A779856AFBE21EA23B7E038647E528D3"
++    },
++    {
++      "path": "internal\\desktopbundle\\bundle.go",
++      "sha256": "1814C88F1189FC160ED78FB5E426B2646F562AF79F9D8609941D8C9CDB7E7159"
++    },
++    {
++      "path": "internal\\desktopbundle\\bundle_test.go",
++      "sha256": "F18999193F1C0A32C2FFBB243C3FE8AF59AE0C34981820DD642A0B155CA6C877"
++    },
++    {
++      "path": "internal\\desktopbundle\\path_windows.go",
++      "sha256": "773986B0C1F4E3785362767777D20023DD0463BFDA75FD7C9B7C76892ECAE1E2"
++    },
++    {
++      "path": "internal\\desktopbundle\\path_windows_test.go",
++      "sha256": "2861090D4856919E2A8E6320DFD291E76EC09A28BC2ADE368D796D7FA738B2C1"
++    },
++    {
++      "path": "internal\\desktopbundle\\path_other.go",
++      "sha256": "7B1D997912B7CCD4A633CDEAF12B18E7C68112C920E5352B26F48A99F668F4D2"
++    },
++    {
++      "path": "docs\\desktop-bundle-transport.md",
++      "sha256": "2F4C8C98382EF7AD5163724DF652BBA809F07FB79F87459C33E4FCD1D2B354E8"
++    }
++  ],
++  "logs": [
++    {
++      "path": "verification-results\\bundle-all-suites.txt",
++      "sha256": "77BDBBC1BB47285DB1DE7D9FF5F86B0C4AB4A7096B8302F4E54B3F77A9BD1B10"
++    },
++    {
++      "path": "verification-results\\bundle-race.txt",
++      "sha256": "D4FF5FAB613FFADC69A9C029E6B8A1610D0DE14439DE12E085BF3ECC8FAB9327"
++    },
++    {
++      "path": "verification-results\\bundle-relevant-suites.txt",
++      "sha256": "C4D7B44CDCCB432199E12862F7BEAC67B5D862328E8A907FCB8789AE5227116E"
++    },
++    {
++      "path": "verification-results\\bundle-targeted.txt",
++      "sha256": "6414454E9B9434B74331F8397C63672F6DEA7D70A194AEFD574F17F7291C5C79"
++    }
++  ]
++}
+diff --git a/transport-scope-check.json b/transport-scope-check.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3778c03e85df13fdd7d275ff436d7f80539bc6f
+--- /dev/null
++++ b/transport-scope-check.json
+@@ -0,0 +1,7 @@
++{
++  "base": "D:\\세션연동\\ctxhop-gui\\patched-source",
++  "candidate": "D:\\세션연동\\ctxhop-gui-vnext\\transport-source",
++  "originalFilesCount": 402,
++  "changedOrMissingOriginalFiles": [],
++  "result": "PASS all original patched-source files preserved byte-for-byte"
++}

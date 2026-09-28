@@ -1,0 +1,13 @@
+go: downloading golang.org/x/term v0.45.0
+go: downloading golang.org/x/sys v0.47.0
+go: downloading golang.org/x/crypto v0.54.0
+=== RUN   TestSessionResumeNoEnvironmentAfterRemoteChange
+=== RUN   TestSessionResumeNoEnvironmentAfterRemoteChange/claude-code
+=== RUN   TestSessionResumeNoEnvironmentAfterRemoteChange/codex
+--- PASS: TestSessionResumeNoEnvironmentAfterRemoteChange (6.44s)
+    --- PASS: TestSessionResumeNoEnvironmentAfterRemoteChange/claude-code (3.21s)
+    --- PASS: TestSessionResumeNoEnvironmentAfterRemoteChange/codex (3.24s)
+=== RUN   TestResumeNoEnvironmentFlagAndHelp
+--- PASS: TestResumeNoEnvironmentFlagAndHelp (0.00s)
+PASS
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop	6.600s

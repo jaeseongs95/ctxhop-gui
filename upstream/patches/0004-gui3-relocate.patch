@@ -1,0 +1,441 @@
+diff --git a/cmd/ctxhop/discovery.go b/cmd/ctxhop/discovery.go
+index d9fbf67..88dc50a 100644
+--- a/cmd/ctxhop/discovery.go
++++ b/cmd/ctxhop/discovery.go
+@@ -15,7 +15,7 @@ var commandSubcommands = map[string][]string{
+ 	"hub":        {"create", "list", "use"},
+ 	"passphrase": {"change", "reset"},
+ 	"project":    {"bind", "unbind", "mode", "list", "discover", "move"},
+-	"remote":     {"delete-session", "delete-project", "delete-all"},
++	"remote":     {"delete-session", "delete-project", "delete-all", "relocate"},
+ 	"session":    {"attach", "discover", "list", "migrate", "reconcile", "resume", "show", "switch"},
+ }
+ 
+@@ -60,6 +60,7 @@ var commandOptions = map[string][]string{
+ 	"remote delete-session": {"--remote-id", "--path"},
+ 	"remote delete-project": {"--path"},
+ 	"remote delete-all":     {},
++	"remote relocate":       {"--path"},
+ }
+ 
+ // writeCommandDiscovery is the compact command browser behind
+diff --git a/cmd/ctxhop/main.go b/cmd/ctxhop/main.go
+index 41f11ea..eda22ec 100644
+--- a/cmd/ctxhop/main.go
++++ b/cmd/ctxhop/main.go
+@@ -49,7 +49,7 @@ var commands = []command{
+ 	{name: "hook", summary: "install Agent session lifecycle hooks"},
+ 	{name: "doctor", summary: "diagnose agent, backend and configuration problems"},
+ 	{name: "device", summary: "inspect or change local device settings"},
+-	{name: "remote", summary: "delete scoped or all remote data"},
++	{name: "remote", summary: "delete scoped or all remote data, or relocate a directory store"},
+ 	{name: "hub", summary: "create, list, or select a Session Hub"},
+ 	{name: "project", summary: "bind projects and manage synchronization policy"},
+ 	{name: "session", summary: "inspect logical Session Hub sessions"},
+diff --git a/cmd/ctxhop/remote_lifecycle.go b/cmd/ctxhop/remote_lifecycle.go
+index a684a27..87b8be7 100644
+--- a/cmd/ctxhop/remote_lifecycle.go
++++ b/cmd/ctxhop/remote_lifecycle.go
+@@ -24,6 +24,7 @@ const (
+ 	remoteActionDeleteSession = "delete-session"
+ 	remoteActionDeleteProject = "delete-project"
+ 	remoteActionDeleteAll     = "delete-all"
++	remoteActionRelocate      = "relocate"
+ )
+ 
+ type remoteOptions struct {
+@@ -117,6 +118,8 @@ func runRemoteWithStreams(args []string, input io.Reader, output, prompt io.Writ
+ 			return remoteDeletionError(options.action, removed, err)
+ 		}
+ 		return writeRemoteDeletionResult(output, options.action, removed)
++	case remoteActionRelocate:
++		return relocateRemote(ctx, c, configDir, options.path, output)
+ 	default:
+ 		return fmt.Errorf("remote: unsupported action %q", options.action)
+ 	}
+@@ -124,7 +127,7 @@ func runRemoteWithStreams(args []string, input io.Reader, output, prompt io.Writ
+ 
+ func parseRemoteOptions(args []string) (remoteOptions, error) {
+ 	if len(args) == 0 {
+-		return remoteOptions{}, errors.New("remote: expected delete-session, delete-project, or delete-all")
++		return remoteOptions{}, errors.New("remote: expected delete-session, delete-project, delete-all, or relocate")
+ 	}
+ 	action := strings.ToLower(strings.TrimSpace(args[0]))
+ 	switch action {
+@@ -166,8 +169,22 @@ func parseRemoteOptions(args []string) (remoteOptions, error) {
+ 			return remoteOptions{}, fmt.Errorf("remote delete-all: unexpected argument %q", flags.Arg(0))
+ 		}
+ 		return remoteOptions{action: action}, nil
++	case remoteActionRelocate:
++		flags := flag.NewFlagSet("remote relocate", flag.ContinueOnError)
++		flags.SetOutput(io.Discard)
++		path := flags.String("path", "", "existing directory that holds this sync domain")
++		if err := flags.Parse(args[1:]); err != nil {
++			return remoteOptions{}, fmt.Errorf("remote relocate: %w", err)
++		}
++		if flags.NArg() != 0 {
++			return remoteOptions{}, fmt.Errorf("remote relocate: unexpected argument %q", flags.Arg(0))
++		}
++		if strings.TrimSpace(*path) == "" {
++			return remoteOptions{}, errors.New("remote relocate: --path is required")
++		}
++		return remoteOptions{action: action, path: *path}, nil
+ 	default:
+-		return remoteOptions{}, fmt.Errorf("remote: unknown action %q; expected delete-session, delete-project, or delete-all", args[0])
++		return remoteOptions{}, fmt.Errorf("remote: unknown action %q; expected delete-session, delete-project, delete-all, or relocate", args[0])
+ 	}
+ }
+ 
+diff --git a/cmd/ctxhop/remote_relocate.go b/cmd/ctxhop/remote_relocate.go
+new file mode 100644
+index 0000000..e8022bc
+--- /dev/null
++++ b/cmd/ctxhop/remote_relocate.go
+@@ -0,0 +1,78 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/CCCCY-ci/ctxhop/internal/config"
++)
++
++// relocateRemote points this device's directory backend at another path that
++// already holds the same sync domain, for example a copy of the store in a new
++// cloud-drive folder. The domain stays pinned: the candidate configuration gets
++// the fingerprint derived from the new path, and it is saved only after the
++// store there authorizes this device (managed keyfile) or carries the pinned
++// public identity (legacy keyfile). Nothing is copied or deleted remotely.
++func relocateRemote(ctx context.Context, c *config.Config, configDir, newPath string, output io.Writer) error {
++	const command = "remote relocate"
++	if c == nil {
++		return fmt.Errorf("%s: configuration is unavailable", command)
++	}
++	if !strings.EqualFold(strings.TrimSpace(c.Remote.Type), "dir") {
++		return fmt.Errorf("%s: only a directory backend can be relocated", command)
++	}
++	// A configuration that no longer matches its own pin is not trusted as the
++	// starting point of a move.
++	if err := validateConfiguredDomain(c, command); err != nil {
++		return err
++	}
++	target, err := filepath.Abs(strings.TrimSpace(newPath))
++	if err != nil {
++		return fmt.Errorf("%s: the new path cannot be resolved", command)
++	}
++	target = filepath.Clean(target)
++	if info, err := os.Stat(target); err != nil || !info.IsDir() {
++		return fmt.Errorf("%s: %s is not an existing directory", command, target)
++	}
++
++	candidate := *c
++	candidate.Remote.Path = target
++	current, err := syncDomainNamespace(c.Remote)
++	if err != nil {
++		return fmt.Errorf("%s: %w", command, err)
++	}
++	next, err := syncDomainNamespace(candidate.Remote)
++	if err != nil {
++		return fmt.Errorf("%s: %w", command, err)
++	}
++	if current == next {
++		return fmt.Errorf("%s: this device already uses %s", command, target)
++	}
++	overlaps, err := configuredRemotePathOverlaps(configDir, &candidate)
++	if err != nil {
++		return fmt.Errorf("%s: %w", command, err)
++	}
++	if overlaps {
++		return fmt.Errorf("%s: the new path overlaps the local configuration directory %s", command, configDir)
++	}
++	if strings.TrimSpace(c.DomainFingerprint) != "" {
++		if candidate.DomainFingerprint, err = syncDomainFingerprint(&candidate); err != nil {
++			return fmt.Errorf("%s: derive the new sync domain fingerprint: %w", command, err)
++		}
++	}
++
++	access, err := openAuthorizedDomain(ctx, &candidate, configDir, command)
++	if err != nil {
++		return err
++	}
++	access.close()
++	if err := candidate.Save(configDir); err != nil {
++		return fmt.Errorf("%s: save the configuration: %w", command, err)
++	}
++	_, err = fmt.Fprintf(output, "remote relocated: %s\n", target)
++	return err
++}
+diff --git a/cmd/ctxhop/remote_relocate_test.go b/cmd/ctxhop/remote_relocate_test.go
+new file mode 100644
+index 0000000..3219308
+--- /dev/null
++++ b/cmd/ctxhop/remote_relocate_test.go
+@@ -0,0 +1,263 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/CCCCY-ci/ctxhop/internal/config"
++)
++
++// initRelocateDevice runs the real init against remoteRoot (a managed domain,
++// as a user gets it) and returns the new configuration directory.
++func initRelocateDevice(t *testing.T, remoteRoot, pass, name string) string {
++	t.Helper()
++	line := string(rune(10))
++	configDir := t.TempDir()
++	t.Setenv("CTXHOP_CONFIG_DIR", configDir)
++	input := strings.NewReader(pass + line + pass + line + "saved" + line)
++	if err := runInitWithIO([]string{"--backend", "dir", "--path", remoteRoot, "--device-name", name, "--no-hook"}, input, ioDiscard{}, "test-ctxhop"); err != nil {
++		t.Fatalf("init %s: %v", name, err)
++	}
++	return configDir
++}
++
++func isolateRelocateAgents(t *testing.T) {
++	t.Helper()
++	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(t.TempDir(), "missing-claude"))
++	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "missing-codex"))
++}
++
++func readConfigBytes(t *testing.T, configDir string) []byte {
++	t.Helper()
++	data, err := os.ReadFile(filepath.Join(configDir, "config.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return data
++}
++
++func TestRemoteRelocateMovesBothDevicesToACopiedStore(t *testing.T) {
++	const pass = "relocate passphrase"
++	line := string(rune(10))
++	isolateRelocateAgents(t)
++	oldRoot := t.TempDir()
++	firstConfig := initRelocateDevice(t, oldRoot, pass, "first")
++	before, err := config.Load(firstConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	invitePath := filepath.Join(t.TempDir(), "invite.json")
++	if err := runDeviceWithIO([]string{"invite", "--output", invitePath}, ioDiscard{}); err != nil {
++		t.Fatalf("create invite: %v", err)
++	}
++	secondConfig := t.TempDir()
++	t.Setenv("CTXHOP_CONFIG_DIR", secondConfig)
++	if err := runInitWithIO([]string{"--invite", invitePath, "--device-name", "second", "--no-hook"}, strings.NewReader(pass+line+pass+line+"yes"+line), ioDiscard{}, "test-ctxhop"); err != nil {
++		t.Fatalf("second init: %v", err)
++	}
++
++	// The user copies the store folder (for example inside a cloud drive) and relocates each device.
++	newRoot := filepath.Join(t.TempDir(), "moved store")
++	if err := os.CopyFS(newRoot, os.DirFS(oldRoot)); err != nil {
++		t.Fatal(err)
++	}
++	for _, configDir := range []string{firstConfig, secondConfig} {
++		t.Setenv("CTXHOP_CONFIG_DIR", configDir)
++		var output bytes.Buffer
++		if err := runRemoteWithIO([]string{"relocate", "--path", newRoot}, strings.NewReader(""), &output); err != nil {
++			t.Fatalf("relocate %s: %v", configDir, err)
++		}
++		if !strings.Contains(output.String(), "remote relocated: "+newRoot) {
++			t.Fatalf("relocate output = %q", output.String())
++		}
++		after, err := config.Load(configDir)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if after.Remote.Path != newRoot || after.DomainFingerprint == before.DomainFingerprint {
++			t.Fatalf("relocated config remote=%q fingerprint=%q (before %q)", after.Remote.Path, after.DomainFingerprint, before.DomainFingerprint)
++		}
++		if fingerprint, err := syncDomainFingerprint(after); err != nil || fingerprint != after.DomainFingerprint {
++			t.Fatalf("stored fingerprint %q, derived %q, %v", after.DomainFingerprint, fingerprint, err)
++		}
++		access, err := openAuthorizedDomain(t.Context(), after, configDir, "test")
++		if err != nil {
++			t.Fatalf("open relocated domain: %v", err)
++		}
++		access.close()
++	}
++
++	// New invitations name the new store.
++	t.Setenv("CTXHOP_CONFIG_DIR", firstConfig)
++	if err := runDeviceWithIO([]string{"invite", "--output", invitePath}, ioDiscard{}); err != nil {
++		t.Fatalf("invite after relocate: %v", err)
++	}
++	var invite deviceInvite
++	data, err := os.ReadFile(invitePath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := json.Unmarshal(data, &invite); err != nil {
++		t.Fatal(err)
++	}
++	if invite.Remote.Path != newRoot {
++		t.Fatalf("invite remote path = %q, want %q", invite.Remote.Path, newRoot)
++	}
++}
++
++func TestRemoteRelocateRefusesAStoreOfAnotherDomain(t *testing.T) {
++	isolateRelocateAgents(t)
++	otherRoot := t.TempDir()
++	initRelocateDevice(t, otherRoot, "other passphrase", "other")
++	configDir := initRelocateDevice(t, t.TempDir(), "relocate passphrase", "first")
++	emptyRoot := t.TempDir()
++	original := readConfigBytes(t, configDir)
++	for _, target := range []string{emptyRoot, otherRoot} {
++		err := runRemoteWithIO([]string{"relocate", "--path", target}, strings.NewReader(""), ioDiscard{})
++		if err == nil {
++			t.Fatalf("relocate to %s succeeded", target)
++		}
++		if !bytes.Equal(readConfigBytes(t, configDir), original) {
++			t.Fatalf("configuration changed after refused relocate to %s: %v", target, err)
++		}
++	}
++}
++
++func TestRemoteRelocateRejectsUnusableTargets(t *testing.T) {
++	isolateRelocateAgents(t)
++	remoteRoot := t.TempDir()
++	configDir := initRelocateDevice(t, remoteRoot, "relocate passphrase", "first")
++	file := filepath.Join(t.TempDir(), "file")
++	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	// A copy of the store inside the configuration directory would pass the key check, so the overlap check must refuse it.
++	insideConfig := filepath.Join(configDir, "store")
++	if err := os.CopyFS(insideConfig, os.DirFS(remoteRoot)); err != nil {
++		t.Fatal(err)
++	}
++	original := readConfigBytes(t, configDir)
++	cases := map[string]struct {
++		args []string
++		want string
++	}{
++		"same path":     {[]string{"relocate", "--path", remoteRoot}, "already uses"},
++		"missing path":  {[]string{"relocate", "--path", filepath.Join(t.TempDir(), "missing")}, "not an existing directory"},
++		"file":          {[]string{"relocate", "--path", file}, "not an existing directory"},
++		"config dir":    {[]string{"relocate", "--path", configDir}, "overlaps"},
++		"inside config": {[]string{"relocate", "--path", insideConfig}, "overlaps"},
++		"no path":       {[]string{"relocate"}, "--path is required"},
++		"argument":      {[]string{"relocate", "--path", remoteRoot, "extra"}, "unexpected argument"},
++	}
++	for name, tc := range cases {
++		if err := runRemoteWithIO(tc.args, strings.NewReader(""), ioDiscard{}); err == nil || !strings.Contains(err.Error(), tc.want) {
++			t.Fatalf("%s: relocate = %v, want an error containing %q", name, err, tc.want)
++		}
++		if !bytes.Equal(readConfigBytes(t, configDir), original) {
++			t.Fatalf("%s: configuration changed", name)
++		}
++	}
++
++	// Only a directory backend moves; an S3 configuration is refused before anything else.
++	c, err := config.Load(configDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	s3 := *c
++	s3.Remote = config.Remote{Type: "s3", Endpoint: "https://s3.example.test", Bucket: "bucket"}
++	s3Dir := t.TempDir()
++	if err := s3.Save(s3Dir); err != nil {
++		t.Fatal(err)
++	}
++	if err := relocateRemote(t.Context(), &s3, s3Dir, remoteRoot, ioDiscard{}); err == nil || !strings.Contains(err.Error(), "directory backend") {
++		t.Fatalf("relocate of an S3 configuration = %v", err)
++	}
++
++	// A configuration whose Remote was edited by hand no longer matches its pin, even when the new place holds the store.
++	moved := filepath.Join(t.TempDir(), "moved")
++	if err := os.CopyFS(moved, os.DirFS(remoteRoot)); err != nil {
++		t.Fatal(err)
++	}
++	c, err = config.Load(configDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c.Remote.Path = moved
++	if err := c.Save(configDir); err != nil {
++		t.Fatal(err)
++	}
++	edited := readConfigBytes(t, configDir)
++	if err := runRemoteWithIO([]string{"relocate", "--path", remoteRoot}, strings.NewReader(""), ioDiscard{}); err == nil || !strings.Contains(err.Error(), "does not match") {
++		t.Fatalf("relocate from an edited configuration = %v", err)
++	}
++	if !bytes.Equal(readConfigBytes(t, configDir), edited) {
++		t.Fatal("edited configuration changed")
++	}
++}
++
++func TestRemoteRelocateKeepsLegacyIdentityPin(t *testing.T) {
++	configDir, remoteRoot, _, _ := preparePassphraseCommand(t, "alpha-secret-6f2d")
++	t.Setenv("CTXHOP_CONFIG_DIR", configDir)
++	moved := filepath.Join(t.TempDir(), "moved")
++	if err := os.CopyFS(moved, os.DirFS(remoteRoot)); err != nil {
++		t.Fatal(err)
++	}
++	otherConfig, otherRoot, _, _ := preparePassphraseCommand(t, "other-secret-2c1a")
++	_ = otherConfig
++	original := readConfigBytes(t, configDir)
++	if err := runRemoteWithIO([]string{"relocate", "--path", otherRoot}, strings.NewReader(""), ioDiscard{}); err == nil || !strings.Contains(err.Error(), "identity") {
++		t.Fatalf("relocate to another legacy domain = %v", err)
++	}
++	if !bytes.Equal(readConfigBytes(t, configDir), original) {
++		t.Fatal("configuration changed after refused legacy relocate")
++	}
++	if err := runRemoteWithIO([]string{"relocate", "--path", moved}, strings.NewReader(""), ioDiscard{}); err != nil {
++		t.Fatalf("relocate legacy domain: %v", err)
++	}
++	c, err := config.Load(configDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.Remote.Path != moved || validateConfiguredDomain(c, "test") != nil {
++		t.Fatalf("legacy relocated config = %+v", c.Remote)
++	}
++	// A configuration written before fingerprint pins stays without one; relocate
++	// checks the keyfile identity there and does not change the pin mode.
++	c.DomainFingerprint = ""
++	if err := c.Save(configDir); err != nil {
++		t.Fatal(err)
++	}
++	if err := runRemoteWithIO([]string{"relocate", "--path", remoteRoot}, strings.NewReader(""), ioDiscard{}); err != nil {
++		t.Fatalf("relocate unpinned configuration: %v", err)
++	}
++	if c, err = config.Load(configDir); err != nil {
++		t.Fatal(err)
++	}
++	if c.Remote.Path != remoteRoot || c.DomainFingerprint != "" {
++		t.Fatalf("unpinned relocated config remote=%q gained fingerprint %q", c.Remote.Path, c.DomainFingerprint)
++	}
++}
++
++func TestParseRemoteRelocateOptions(t *testing.T) {
++	options, err := parseRemoteOptions([]string{"relocate", "--path", `G:\My Drive\store`})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if options.action != remoteActionRelocate || options.path != `G:\My Drive\store` {
++		t.Fatalf("relocate options = %+v", options)
++	}
++	if got, ok := commandHelpPath([]string{"remote", "relocate", "--help"}); !ok || strings.Join(got, " ") != "remote relocate" {
++		t.Fatalf("relocate help path = %v, %v", got, ok)
++	}
++	var remoteHelp, relocateHelp strings.Builder
++	if err := writeCommandDiscovery(&remoteHelp, []string{"remote"}); err != nil || !strings.Contains(remoteHelp.String(), " remote relocate\n") {
++		t.Fatalf("remote discovery = %q, %v", remoteHelp.String(), err)
++	}
++	if err := writeCommandDiscovery(&relocateHelp, []string{"remote", "relocate"}); err != nil || !strings.Contains(relocateHelp.String(), "--path") {
++		t.Fatalf("remote relocate discovery = %q, %v", relocateHelp.String(), err)
++	}
++}

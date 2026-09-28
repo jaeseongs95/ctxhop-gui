@@ -1,0 +1,43 @@
+=== RUN   TestMultiChunkRoundtripEncryptedAndImmutable
+--- PASS: TestMultiChunkRoundtripEncryptedAndImmutable (0.18s)
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/wrongkey
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/ciphertext
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/chunk-swap
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/whole-digest
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/chunk-digest
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/traversal
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/huge-envelope
+=== RUN   TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/null-metadata-field
+--- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput (0.52s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/wrongkey (0.06s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/ciphertext (0.07s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/chunk-swap (0.06s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/whole-digest (0.08s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/chunk-digest (0.07s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/traversal (0.06s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/huge-envelope (0.06s)
+    --- PASS: TestCorruptionWrongKeyChunkSwapAndNoPartialOutput/null-metadata-field (0.06s)
+=== RUN   TestMetadataAndIDHostileInputs
+--- PASS: TestMetadataAndIDHostileInputs (0.00s)
+=== RUN   TestOversizeInputRefusedBeforePublishing
+--- PASS: TestOversizeInputRefusedBeforePublishing (0.00s)
+=== RUN   TestMembershipAndEmptyArchive
+--- PASS: TestMembershipAndEmptyArchive (0.01s)
+=== RUN   TestFailedUploadDoesNotPublishMetadataOrDeleteAdjacentData
+--- PASS: TestFailedUploadDoesNotPublishMetadataOrDeleteAdjacentData (0.04s)
+=== RUN   TestConcurrentImmutableSnapshots
+--- PASS: TestConcurrentImmutableSnapshots (0.03s)
+=== RUN   TestDirectoryJunctionAndOutputADSRejected
+--- PASS: TestDirectoryJunctionAndOutputADSRejected (0.06s)
+PASS
+ok  	github.com/CCCCY-ci/ctxhop/internal/desktopbundle	1.733s
+=== RUN   TestBundleCLIIsolatedAuthorizedRoundtrip
+--- PASS: TestBundleCLIIsolatedAuthorizedRoundtrip (0.27s)
+=== RUN   TestBundleOptionsRejectHostileAndIncompleteRequests
+ctxhop bundle put [arguments]
+  transfer encrypted opaque Desktop archives
+  options: --help, --input, --json, --metadata
+--- PASS: TestBundleOptionsRejectHostileAndIncompleteRequests (0.00s)
+PASS
+ok  	github.com/CCCCY-ci/ctxhop/cmd/ctxhop	0.553s

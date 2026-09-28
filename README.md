@@ -28,6 +28,7 @@ Claude Code와 Codex Desktop 대화를 한 창에서 백업하고 다른 PC에�
 - GUI 작업(목록·백업·복원·설정)이 진행 중이면 설치와 제거가 그 작업이 끝날 때까지 기다리라고 안내합니다. 작업이 끝난 뒤 계속합니다.
 - 지울 때는 Windows **설정** → **앱** → **설치된 앱**에서 **CtxHop GUI vNext**를 제거합니다. `%LOCALAPPDATA%\CtxHopGUI`의 GUI 설정·작업 폴더와 ctxhop 설정은 지우지 않습니다. 직접 만든 `backend\runtime.json`은 설치 폴더에 남습니다.
 - 설치 파일을 만드는 스크립트는 [`installer/CtxHop-GUI-vNext.iss`](installer/CtxHop-GUI-vNext.iss)(Inno Setup 6.7)입니다.
+- 릴리스 패키지(zip, 설치 파일)는 저장소의 `build/build.ps1`이 git에 있는 파일만으로 만듭니다(Go 1.27.1, Inno Setup 6.7).
 
 **zip**
 
@@ -248,7 +249,7 @@ GUI는 세션 폴더나 DB 전체를 통째로 덮어쓰지 않습니다.
 ### 무결성 검사
 
 - `Worker.ps1`은 `backend\desktop_sessions.py`와 `bin\ctxhop.exe`의 SHA256을 고정해 두고, Codex 목록·백업·미리보기 전에 확인합니다. 파일이 없거나 바뀌면 멈춥니다.
-- `bin\ctxhop-claude.exe`는 Claude 미리보기·복원 전에 고정한 `0.2.0-gui.3` 해시와 같아야 합니다. `0.2.0-gui.1`에 대화 옆 폴더 백업·복원(`--sidecar-backup`)과 저장소 옮기기(`remote relocate`)를 더한 판이며, 소스·패치·빌드 기록은 `claude-source\`에 있습니다.
+- `bin\ctxhop-claude.exe`는 Claude 미리보기·복원 전에 고정한 `0.2.0-gui.3` 해시와 같아야 합니다. `0.2.0-gui.1`에 대화 옆 폴더 백업·복원(`--sidecar-backup`)과 저장소 옮기기(`remote relocate`)를 더한 판입니다. 저장소의 `build/build-exes.ps1`이 고정한 upstream 커밋에 `upstream/patches`의 패치를 적용해 이 파일과 `bin\ctxhop.exe`를 바이트까지 같게 다시 만듭니다. 이전 판은 소스 사본을 `claude-source\`·`transport-source\`에 담았고, 이 판부터 설치할 때 두 폴더를 지웁니다.
 - `ClaudeWorker.ps1`은 안정판 `ctxhop-gui`의 Worker(SHA256 `D08E9A15…`)를 복사한 것입니다. 여기에 언어 적용, 실패 이유 표시, 겹친 등록 차단, 등록 해제, 암호 변경·초기화, ctxhop 출력을 UTF-8로 읽기를 더했습니다. 백업·복원 판단과 복구 기록 동작은 바꾸지 않았습니다.
 - `Worker.ps1`은 고정한 Python 백엔드와 `bin\ctxhop.exe`의 `bundle` 명령을 연결합니다. UI는 대화 본문·DB·대화 백업 형식을 직접 해석하지 않습니다(프로젝트 파일 zip은 아래 `ProjectFiles.ps1`이 만들고 읽습니다).
 - `ProjectFiles.ps1`은 프로젝트 파일의 폴더 고르기·목록·압축·비교·복원을 맡습니다. 표준 .NET과, 있으면 `git`만 씁니다.
