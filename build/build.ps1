@@ -25,7 +25,7 @@ $Out = (Resolve-Path -LiteralPath $Out).Path
 $exeArgs = @('-Out', (Join-Path $Out 'exes'), '-GoExe', $GoExe, '-TempDir', $TempDir)
 if ($GoWork) { $exeArgs += @('-GoWork', $GoWork) }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-exes.ps1') @exeArgs
-if ($LASTEXITCODE -ne 0) { throw "build-exes.ps1 failed (exit $LASTEXITCODE: number of exes that differ, or a build error)" }
+if ($LASTEXITCODE -ne 0) { throw "build-exes.ps1 failed (exit $($LASTEXITCODE)): exes that differ from the pins, or a build error" }
 
 # Committed bytes only: no autocrlf conversion, nothing from the working tree.
 $pkg = Join-Path $Out 'ctxhop-gui-vnext'
