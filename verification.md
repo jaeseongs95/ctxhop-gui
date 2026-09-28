@@ -413,6 +413,52 @@
   - 실제 두 PC 왕복과 앱 화면 확인은 아직 하지 않았습니다.
   - 백업할 때 엔진 버전 정확 일치와 DB 구조 고정은 그대로입니다. Codex가 업데이트되면 새 판이 나올 때까지 백업·복원이 멈춥니다.
 
+## 새 저장소로 이전 (2026-09-28, `20260927.7` 공개 뒤)
+
+- **이력**: 포크 `jaeseongs95/ctxhop`의 `gui/ctxhop-gui-vnext`를 새 저장소 `jaeseongs95/ctxhop-gui`로 옮겼습니다.
+  - `git subtree split`으로 PR #1~#12의 squash 커밋 12개를 가져왔습니다. 커밋 메시지의 `#번호`는 옛 포크의 PR 번호입니다.
+  - 옮긴 트리는 포크 `fafce92`의 `gui/ctxhop-gui-vnext`와 같습니다.
+- **git만으로 빌드**: `build/build.ps1`이 `git archive`로 커밋된 파일을 꺼내고, `build/build-exes.ps1`이 두 실행 파일을 다시 빌드한 뒤 패키지·zip·설치 파일을 만듭니다.
+  - upstream: `CCCCY-ci/ctxhop` `b84de46`(upstream main의 "release: CtxHop v0.2.0").
+    - 태그 `v0.2.0`(`b8a18e9`)과 부모가 같고 Go 파일도 같습니다.
+    - 패치 0001은 `b84de46`의 `.gitignore`에 맞춰 만들었습니다.
+  - 패치(`upstream/patches`):
+    - `ctxhop.exe` = 0001 + 0002
+    - `ctxhop-claude.exe` = 0001 + 0003 + 0004
+    - 0003과 0004는 이전 패키지 `claude-source\`에 있던 패치와 바이트가 같습니다.
+  - 빌드 조건:
+    - Go `go1.27.1 windows/amd64`(공식 zip SHA-256 `a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d`)
+    - `-buildvcs=false -trimpath`, `CGO_ENABLED=0`, `GOAMD64=v1`
+    - ldflags는 처음 배포할 때와 같은 문자열입니다. `-X` 문자열이 빌드 ID에 들어가 해시를 바꾸기 때문입니다.
+    - Go 모듈은 `go.sum`으로 고정됩니다.
+  - 결과: 두 실행 파일이 이 PC에서 고정 해시와 바이트까지 같았습니다(`9B14CCD3…C006`, `45186B10…650B`).
+    - 조사 서브에이전트는 GitHub에서 받은 upstream과 빈 Go 캐시로 따로 빌드해 같은 결과를 얻었습니다.
+    - 이 저장소의 스크립트로 세 번 빌드해 세 번 모두 같았습니다.
+  - 패키지에는 `build-info.json`을 넣습니다. 저장소 커밋, upstream 커밋, 패치·실행 파일 해시, Go 버전이 들어 있습니다.
+  - zip과 설치 파일은 파일 시각이 들어가므로 빌드마다 해시가 다릅니다. 안에 든 파일은 같습니다.
+- **패키지 변화(`.7` 대비)**:
+  - 뺀 것: `claude-source\`와 `transport-source\`(소스 사본 816개)
+  - 더한 것: `LICENSE`, `build-info.json`
+  - 옮긴 것: Go 시험 로그는 저장소의 `upstream/verification-results`로 옮겼습니다.
+  - 줄바꿈: `backend\test_guard_shim.py`는 패키지에서 CRLF였는데, 이제 git 원본대로 LF입니다.
+  - 그 밖의 파일은 `.7` 패키지와 바이트가 같습니다. 예외는 README 두 판(빌드 안내)과 설치 스크립트(`[InstallDelete]`)입니다.
+- **설치 파일**: `[InstallDelete]`로 설치 폴더의 `claude-source`와 `transport-source` 두 폴더만 지웁니다.
+  - `.7` 시험용 빌드 위에 덮어 설치했습니다.
+    - 버전은 `2026.09.28`이었고, 패키지 파일 32개가 같았습니다.
+    - 더해진 파일은 제거 프로그램과 기존 `backend\runtime.json`뿐이었습니다.
+    - 설치된 사본의 시험 7종, 작업 중 대기, 제거, 인터넷 출처 표시를 통과했습니다.
+  - 두 폴더 안에 junction이 있거나 `claude-source` 자체가 junction이어도, 설치 파일은 링크만 지웠습니다. 링크가 가리키던 폴더의 파일은 그대로 남았습니다.
+  - 설치 폴더에 사용자가 둔 다른 파일과 `backend\runtime.json`은 남습니다. 두 폴더 안에 사용자가 넣은 파일은 폴더와 함께 지워집니다.
+- **git에서 만든 패키지의 시험 7종**이 모두 통과했습니다: 1768 / 145 / 201 / 80 / 165 / 49 groups·828 / 49. DesktopIntegration은 실제 엔진으로 돌렸습니다.
+- **CI**: windows-latest에서 두 실행 파일을 다시 빌드해 해시를 확인하고, 엔진이 필요 없는 시험 6종을 돌립니다.
+- **공개 전 이력 검사**: 새 저장소의 모든 커밋과 파일을 검사했습니다.
+  - 상류가 공개하지 않는 작업 메모(`AGENTS.md`, `.agents/`, `docs/acceptance/`)는 없습니다.
+  - 비밀 형식(토큰, 개인 키)도 없습니다.
+  - 걸린 경로 두 종류는 모두 공개해도 되는 값이었습니다.
+    - `C:\Users\Lenovo`: upstream gui.1 기록이며, 포크 `main`에 이미 공개돼 있습니다.
+    - `C:\Users\me`, `C:\Users\fixture`: 시험용 가짜 경로입니다.
+  - 커밋 작성자는 포크에 이미 공개된 두 신원입니다.
+
 ## 실행한 검사 (Windows PowerShell 5.1, Python 3.12.14 Codex 번들, 엔진 `0.158.0-alpha.2.1`)
 
 | 검사 | 결과 | 원시 로그 |
