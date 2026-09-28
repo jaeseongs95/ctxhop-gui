@@ -233,6 +233,75 @@ try {
     $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.both;sha256=$brokenHash} } catch { $failure=$_ }
     Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed' -and [IO.File]::Exists((Join-Path $recoveryRoot "$($ops.both)\journal.json"))) 'a record whose closed name already exists is not overwritten'
     Remove-Item -LiteralPath $recoveryRoot -Recurse
+    # Claude 복구 기록(S3 명세 3.4절): 작업 ID 이름의 pending에 쓰기 전 상태(prepared)를 남기고, 되돌리기는 확인한 unknown만 한다.
+    $oldClaudeDir=$env:CLAUDE_CONFIG_DIR; $oldJournal=$script:TestJournalRoot; $realClosed=${function:Assert-AgentClosed}
+    try {
+        $env:CLAUDE_CONFIG_DIR=Join-Path $testDirectory 'claude-home'; $script:TestJournalRoot=Join-Path $testDirectory 'claude-recovery'
+        ${function:Assert-AgentClosed}={ param($Agent) if ($script:ClaudeOpen) { throw 'Claude Code를 종료하세요.' } }; $script:ClaudeOpen=$false
+        function Write-ClaudeFile([string]$Path,[string]$Text) { $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path)); [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false)) }
+        function Get-TextSha([string]$Text) { $sha=[Security.Cryptography.SHA256]::Create(); try { Get-ProjectHex ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))) } finally { $sha.Dispose() } }
+        $claudeJob=[pscustomobject]@{agent='claude-code'}
+        function Get-ClaudeState([string]$Op) { return (Invoke-Vendor $claudeJob 'recover' @{mode='status';operationId=$Op}).state }
+        function New-ClaudeCase([string]$Id) {
+            # 복원 전 상태를 만들고 Begin-Restore를 부른 뒤, ctxhop resume이 한 일(대화·옆 폴더 교체, companion 원본)을 흉내 낸다.
+            $folder=Join-Path $env:CLAUDE_CONFIG_DIR 'projects\D--work'
+            $case=@{id=$Id;op=[guid]::NewGuid().ToString('N');conversation=(Join-Path $folder "$Id.jsonl");side=(Join-Path $folder $Id)}
+            Write-ClaudeFile $case.conversation 'conv-before'; Write-ClaudeFile (Join-Path $case.side 'subagents\a.jsonl') 'side-a'; Write-ClaudeFile (Join-Path $case.side 'tool-results\t.txt') 't-before'
+            $case.journal=Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$Id;remoteId='r';projectPath='D:\work';operationId=$case.op})
+            Write-ClaudeFile $case.conversation 'conv-after'; Write-ClaudeFile (Join-Path $case.side 'tool-results\t.txt') 't-after'; Write-ClaudeFile (Join-Path $case.side 'subagents\new.jsonl') 'new'
+            Write-ClaudeFile (Join-Path $script:TestJournalRoot "$($case.op).companion\tool-results\t.txt") 't-before'
+            return $case
+        }
+        $case=New-ClaudeCase '22222222-2222-4222-8222-222222222222'
+        $record=Get-Content -LiteralPath $case.journal -Raw | ConvertFrom-Json
+        Assert ([IO.Path]::GetFileName($case.journal) -ceq "$($case.op).pending.json" -and $record.operationId -ceq $case.op) 'the Claude record is named after the operation ID'
+        Assert ($record.prepared.conversation.before -eq (Get-TextSha 'conv-before') -and (Get-Content -LiteralPath $record.prepared.conversation.beforeCopy -Raw) -eq 'conv-before' -and @($record.prepared.sidecar.files).Count -eq 2) "the record keeps the state before the restore: $($record.prepared | ConvertTo-Json -Compress -Depth 5)"
+        Throws { Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$case.id;remoteId='r';projectPath='D:\work';operationId=$case.op}) } '이미 있어'
+        Throws { Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$case.id;remoteId='r';projectPath='D:\work';operationId='X'}) } '작업 ID'
+        Assert ((Get-ClaudeState $case.op) -ceq 'pending' -and (Get-ClaudeState ([guid]::NewGuid().ToString('N'))) -ceq 'absent') 'a pending record and a missing one'
+        $rows=@((Invoke-Vendor $claudeJob 'recover' @{mode='list'}).records)
+        $classes=@{}; foreach ($file in @($rows[0].files)) { $classes[[IO.Path]::GetFileName($file.target)]=$file.class }
+        Assert ($rows.Count -eq 1 -and $rows[0].canRollback -and $classes['a.jsonl'] -eq 'original' -and $classes['t.txt'] -eq 'unknown' -and $classes['new.jsonl'] -eq 'unknown' -and $classes["$($case.id).jsonl"] -eq 'unknown') "Claude files are never owned; changed and new files are unknown: $($classes | ConvertTo-Json -Compress)"
+        # 확인하지 않은 기본 되돌리기는 아무것도 바꾸지 않는다.
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and (Get-Content -LiteralPath $case.conversation -Raw) -eq 'conv-after' -and (Get-ClaudeState $case.op) -ceq 'pending') 'a rollback without confirmation changes nothing'
+        $script:ClaudeOpen=$true
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'busy') 'an open Claude Code stops the rollback'
+        $script:ClaudeOpen=$false
+        $confirmed=@($rows[0].files | Where-Object class -eq 'unknown' | ForEach-Object { @{target=$_.target;current=$_.current} })
+        $rolled=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op;confirmedUnknown=$confirmed}
+        Assert ($rolled.effect -ceq 'rolled_back' -and (Get-ClaudeState $case.op) -ceq 'rolled_back') 'confirmed unknown files are rolled back and the record says so'
+        Assert ((Get-Content -LiteralPath $case.conversation -Raw) -eq 'conv-before' -and (Get-Content -LiteralPath (Join-Path $case.side 'tool-results\t.txt') -Raw) -eq 't-before' -and -not (Test-Path -LiteralPath (Join-Path $case.side 'subagents\new.jsonl')) -and (Get-Content -LiteralPath (Join-Path $case.side 'subagents\a.jsonl') -Raw) -eq 'side-a') 'the conversation and its companion folder are back as before'
+        $kept=@(Get-ChildItem -LiteralPath (Join-Path $script:TestJournalRoot "$($case.op).rollback\rollback") -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw } | Sort-Object)
+        Assert (($kept -join '|') -eq 'conv-after|new|t-after') "every file moved aside is kept: $($kept -join '|')"
+        # companion에 원본이 없으면 그 파일은 되돌리지 못함으로 남고, 기록은 pending이다.
+        $case=New-ClaudeCase '33333333-3333-4333-8333-333333333333'
+        Remove-Item -LiteralPath (Join-Path $script:TestJournalRoot "$($case.op).companion") -Recurse
+        $row=@((Invoke-Vendor $claudeJob 'recover' @{mode='list'}).records | Where-Object recordId -eq $case.op)[0]
+        $confirmed=@($row.files | Where-Object class -eq 'unknown' | ForEach-Object { @{target=$_.target;current=$_.current} })
+        Assert (@($row.files | Where-Object { $_.class -eq 'unrestorable' -and $_.target -like '*t.txt' }).Count -eq 1) 'a companion file that is missing cannot be rolled back'
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='rollback';recordId=$case.op;confirmedUnknown=$confirmed} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'needs_attention' -and (Get-ClaudeState $case.op) -ceq 'pending' -and (Get-Content -LiteralPath (Join-Path $case.side 'tool-results\t.txt') -Raw) -eq 't-after') 'the rollback is not complete and the record stays pending'
+        # 닫기: 창에서 본 해시와 같을 때만.
+        $failure=$null; try { $null=Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=('0'*64)} } catch { $failure=$_ }
+        Assert ($failure.Exception.Data['vendorResult'].reasonCode -ceq 'changed' -and (Get-ClaudeState $case.op) -ceq 'pending') 'a record that differs from what was shown is not closed'
+        Assert ((Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=$row.sha256}).effect -ceq 'resolved' -and (Get-ClaudeState $case.op) -ceq 'resolved') 'a record is closed when it matches'
+        Assert ((Invoke-Vendor $claudeJob 'recover' @{mode='resolve';recordId=$case.op;sha256=$row.sha256}).effect -ceq 'resolved') 'closing again succeeds'
+        # Complete-Restore가 completed를 옮긴 뒤 pending을 지우기 전에 멈춘 경우: 상태는 complete이고, 다음 작업이 pending을 마무리한다.
+        $op=[guid]::NewGuid().ToString('N'); $twin=@{operationId=$op;nativeId='n';started='s';restoredSha256='x'} | ConvertTo-Json
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.pending.json") (@{operationId=$op;nativeId='n';started='s'} | ConvertTo-Json); Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.completed.json") $twin
+        Assert ((Get-ClaudeState $op) -ceq 'complete') 'a completed record with its pending twin is complete'
+        Assert-NoPending
+        Assert (-not (Test-Path -LiteralPath (Join-Path $script:TestJournalRoot "$op.pending.json")) -and (Get-ClaudeState $op) -ceq 'complete') 'the leftover pending is finished by the next check'
+        $op=[guid]::NewGuid().ToString('N')
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.pending.json") (@{operationId=$op;nativeId='n';started='s'} | ConvertTo-Json); Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.completed.json") (@{operationId=$op;nativeId='other';started='s';restoredSha256='x'} | ConvertTo-Json)
+        Assert ((Get-ClaudeState $op) -ceq 'unreadable') 'a pending with a completed record of another restore is unreadable'
+        Throws { Assert-NoPending } '중단'
+        Write-ClaudeFile (Join-Path $script:TestJournalRoot "$op.rolledback.json") '{}'
+        Remove-Item -LiteralPath (Join-Path $script:TestJournalRoot "$op.completed.json")
+        Assert ((Get-ClaudeState $op) -ceq 'unreadable') 'a pending with a rolled back record is unreadable'
+    } finally { $env:CLAUDE_CONFIG_DIR=$oldClaudeDir; $script:TestJournalRoot=$oldJournal; ${function:Assert-AgentClosed}=$realClosed }
     Assert (-not (Test-Path -LiteralPath $previewStage)) 'successful restore removes its plaintext staging copy'
     $odd=Join-Path $staging 'not-a-stage'; $null=New-Item -ItemType Directory -Path $odd
     Assert ((Remove-DesktopStage $odd) -match '지우지 못했습니다' -and (Test-Path -LiteralPath $odd)) 'cleanup refuses folders it did not create'
@@ -260,7 +329,7 @@ try {
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
     # 안정판 ctxhop-gui\Worker.ps1(최종 감사 D08E9A15…)에서 문장만 Strings.ps1로 옮긴 판에, ctxhop 0.2.0-gui.3 고정과
     # Claude 세션 옆 폴더(하위 에이전트·도구 결과) 복원 확인, ctxhop 출력 UTF-8 읽기, 저장소 옮기기를 더한 판과 바이트 동일해야 한다.
-    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq '4E601995783B6890901D09C5A0CF4F2B4D71D9618A2D9939310EB8D0379D0CB7') 'Claude worker copy must match the reviewed version'
+    Assert ((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'ClaudeWorker.ps1') -Algorithm SHA256).Hash -eq 'E4BA86F04447C30C5CA950831FEA2BEC2C2D9995ECD0A18920F695A77FC2D2B4') 'Claude worker copy must match the reviewed version'
     Throws {Assert-FrozenFile (Join-Path $testDirectory 'nonexistent.py') ''} '준비되지'
     Throws {Assert-BundleId '../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'} '잘못된'
     Throws {Assert-BundleId 'peer-a/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'} '잘못된'
