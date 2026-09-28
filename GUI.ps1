@@ -329,6 +329,8 @@ function Show-JournalDialog([object]$Journal) {
     $ui=New-JournalDialog $Journal
     try { if ((Show-Dialog $ui.dialog) -ne 'OK') { return }; $choice=$ui.dialog.Tag } finally { $ui.dialog.Dispose() }
     $row=$choice.row
+    # Claude 파일은 "이 복원이 씀"이 없어 기본 되돌리기로는 끝나지 않는다. 그래서 되돌리기도 알 수 없는 파일 확인으로 간다.
+    if ($choice.action -eq 'rollback' -and $row.agent -eq 'claude-code' -and @($row.files | Where-Object { $_ -and $_.class -eq 'unknown' }).Count) { $choice.action='unknown' }
     if ($choice.action -eq 'open') { if (Test-Folder $row.path) { $null=[Diagnostics.Process]::Start((Join-Path $env:WINDIR 'explorer.exe'),('"'+$row.path+'"')) }; return }
     $job=Base-Job 'Rollback'
     if ($row.agent) { $job.agent=[string]$row.agent }

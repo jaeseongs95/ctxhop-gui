@@ -373,7 +373,8 @@ try {
             @{choice=@{action='rollback';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and $j.operationId -eq ('1'*32) -and -not $j.confirmedUnknown };ask='복원 전 상태로'},
             @{choice=@{action='unknown';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and @($j.confirmedUnknown).Count -eq 1 -and $j.confirmedUnknown[0].target -eq 'D:\합성\b.txt' -and $j.confirmedUnknown[0].current -eq ('b'*64) };ask='D:\합성\b.txt'},
             @{choice=@{action='resolve';row=$journal.rows[1]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.recordId -eq ('2'*32) -and $j.agent -eq 'claude-code' -and $j.sha256 -eq 'CD' };ask='다시 되돌릴 수 없습니다'},
-            @{choice=@{action='resolve';row=$journal.rows[2]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.projectRecord -eq 'D:\예전 기록' -and $j.sha256 -eq 'EF' };ask='0개'}
+            @{choice=@{action='resolve';row=$journal.rows[2]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.projectRecord -eq 'D:\예전 기록' -and $j.sha256 -eq 'EF' };ask='0개'},
+            @{choice=@{action='rollback';row=[pscustomobject]@{kind='vendor';recordRef=('3'*32);agent='claude-code';canRollback=$true;files=@($unknownFile)}};check={ param($j) $j.action -eq 'Rollback' -and $j.recordId -eq ('3'*32) -and @($j.confirmedUnknown).Count -eq 1 };ask='모르는 파일'}
         )
         foreach ($case in $cases) {
             $script:JournalChoice=$case.choice

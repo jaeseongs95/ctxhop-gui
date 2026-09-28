@@ -546,7 +546,7 @@
 - **GUI**: 설정 탭의 **중단된 복원** 창에서 되돌리기·알 수 없는 파일도 되돌리기·폴더 열기·해결했음을 합니다. 미해결 항목이 있으면 복원·백업·열기를 막고, 막힐 때 창을 엽니다.
 - **계약**: `recover`(`status`·`list`·`rollback`·`resolve`)와 `guard`를 두 구현이 처리합니다. `restore` 요청에 `operationId`가 들어갑니다.
 - **고정 해시**: `ClaudeWorker.ps1`은 `prepared`, 작업 ID 이름, `completed` 원자 기록, 남은 `pending` 마무리 때문에 `E4BA86F0…D2B4`로 바뀌었습니다. 백엔드는 `apply --run`과 `guard` 동작 때문에 `DEF1FDB9…B349`입니다.
-- **검사**(LF 사본, Windows PowerShell 5.1): Strings 2062, ProjectFiles 186, Contract 95, DesktopWorker 866, DesktopGUI 98, ClaudeWorker 828, ClaudeGUI 166, 통합 108이 모두 통과했습니다. 백엔드 단위 시험은 백엔드를 마지막으로 바꾼 `2a94904`에서 42/42로 두 번 통과했습니다.
+- **검사**(LF 사본, Windows PowerShell 5.1): Strings 2062, ProjectFiles 186, Contract 95, DesktopWorker 866, DesktopGUI 100, ClaudeWorker 828, ClaudeGUI 166, 통합 108이 모두 통과했습니다. 백엔드 단위 시험은 백엔드를 마지막으로 바꾼 `2a94904`에서 42/42로 두 번 통과했습니다.
   - 변이 검사: 계획 재확인, 치운 파일 해시, 첫 실패에서 멈춤, 되돌리기의 mismatch·보존 사본·`.part`·충돌·확인 스냅숏·재시작 조건, Job의 살아 있는 Worker·Job 종료·자손 종료·이름 없음, Claude 짝 기록·기록 이름 중복·해시 확인·옆 폴더 원본, Worker의 성공 증거·`local_newer`·원래 기록 조회(R37-N1)·writer 확인·차단·겹침·실패 뒤 대화 호출을 각각 되돌려 보면 시험이 실패했습니다.
   - 결과가 달라지지 않는 변이 두 개가 남았습니다. 목록의 자동 정리는 `complete`만 결정표로 보내므로 모드 조건을 넓혀도 같고, 방금 쓴 종료 기록을 다시 확인하는 줄은 지워도 같습니다(방어용).
 
