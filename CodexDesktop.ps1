@@ -5,7 +5,7 @@ $ErrorActionPreference='Stop'
 $implArgs=$args   # Worker.ps1을 dot-source하면 $args가 바뀔 수 있어 먼저 보관한다.
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 # Release integration replaces this pin only after reviewing the final candidate.
-$script:DesktopBackendSHA256='C987065CD25BA3988DAA30F185D2D7F29317C9232AC301AB0EF69B98CB304ECB'
+$script:DesktopBackendSHA256='7BD1B4EBBC33A318B0DDDE1F55409DE88B8076AAEB47E880C55ADEDC61245AA2'
 function Get-DesktopRuntime {
     $backend=Join-Path $PSScriptRoot 'backend\desktop_sessions.py'
     Assert-FrozenFile $backend $script:DesktopBackendSHA256
@@ -142,8 +142,9 @@ $script:CodexDesktopOps=@{
     restore={ param($R)
         $record=Read-DesktopReceipt $R
         if ($R.choice -cne 'incoming') { throw (T 'WkChoiceRequired') }
+        $run=Assert-OperationId $R.operationId
         if ($record.preview.status -eq 'blocked') { throw (T 'WkBlockedRestore') }
-        try { $applied=Invoke-DesktopBackend @('apply','--home',$record.home,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--choice','incoming') }
+        try { $applied=Invoke-DesktopBackend @('apply','--home',$record.home,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--choice','incoming','--run',$run) }
         catch {
             # 백엔드는 가져오기에 실패하면 이 홈에 남은 복구 기록(pending) 목록을 준다. 비었으면 쓰기 전 실패이고, 목록이 없으면 알 수 없다.
             $pending=$_.Exception.Data['backendResult'].pending

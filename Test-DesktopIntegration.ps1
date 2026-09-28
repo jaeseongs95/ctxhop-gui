@@ -3,6 +3,7 @@
 # 암호화 bundle 전송만 mock이다. 실제 사용자 저장소와 공유 Drive는 읽거나 쓰지 않는다.
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
+Enable-WorkerJob   # 복원 시험은 실제 Worker처럼 Job 객체 안에서 돈다.
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
 # 벤더 계약 경계: Codex 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.

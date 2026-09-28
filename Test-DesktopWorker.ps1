@@ -3,6 +3,7 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'ClaudeCode.ps1') -LibraryOnly
+Enable-WorkerJob   # 복원 시험은 실제 Worker처럼 Job 객체 안에서 돈다.
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
 # 벤더 계약 경계: 실제 구현의 처리기를 이 프로세스에서 부르되 요청·응답은 JSON을 거치고 Worker와 같은 응답 검사를 한다.
@@ -144,6 +145,8 @@ try {
     $null=Invoke-JobCore $job
     $apply=$script:Calls[-1].arguments
     Assert ($apply[0] -eq 'apply' -and $apply[[array]::IndexOf($apply,'--token')+1] -ceq 'exact-token-A') 'apply must pass exact inspect token'
+    Assert ($apply[[array]::IndexOf($apply,'--run')+1] -cmatch '^[0-9a-f]{32}$') 'apply names its recovery record after the operation ID from Worker'
+    foreach ($bad in @('../x',('A'*32),('a'*31),$null,32)) { Throws {Assert-OperationId $bad} '작업 ID' }
     Assert (-not (Test-Path -LiteralPath $previewStage)) 'successful restore removes its plaintext staging copy'
     $odd=Join-Path $staging 'not-a-stage'; $null=New-Item -ItemType Directory -Path $odd
     Assert ((Remove-DesktopStage $odd) -match '지우지 못했습니다' -and (Test-Path -LiteralPath $odd)) 'cleanup refuses folders it did not create'
@@ -474,6 +477,33 @@ try {
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($answer.ok -eq $false -and $answer.error -match 'Codex Desktop') 'Worker process reports the job error in the result file'
     Assert ($answer.vendor.status -eq 'unsupported' -and $answer.vendor.reasonCode -eq 'open_manually' -and $null -eq $answer.vendorOutcome) 'the result file keeps the contract status and reason code for the GUI'
+    # Worker가 어떻게 끝나든 벤더 구현·백엔드 같은 자손도 함께 끝나야, 다음 Worker가 작업 mutex만으로 앞 작업의 writer가 없다고 볼 수 있다.
+    # Job 객체를 켜기 전에는 복원을 거부하는지도 같은 프로세스에서 본다.
+    $probe=Join-Path $testDirectory 'job-probe.ps1'; $pidFile=Join-Path $testDirectory 'job-child.txt'
+    Set-Content -LiteralPath $probe -Encoding UTF8 -Value @'
+param([string]$Package,[string]$PidFile)
+. (Join-Path $Package 'Worker.ps1') -LibraryOnly
+$before=try { Assert-WorkerJob; 'allowed' } catch { 'refused' }
+Enable-WorkerJob
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start.UseShellExecute=$false; $start.CreateNoWindow=$true
+$child=[Diagnostics.Process]::Start($start)
+[IO.File]::WriteAllText($PidFile,"$($child.Id) $before")
+Start-Sleep 120
+'@
+    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+    $probeWorker=[Diagnostics.Process]::Start($start)
+    try {
+        for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $pidFile); $i++) { Start-Sleep -Milliseconds 250 }
+        Start-Sleep -Milliseconds 300
+        $childId,$before=(Get-Content -LiteralPath $pidFile -Raw).Trim() -split ' '
+        Assert ($before -eq 'refused') 'restore is refused until the worker runs inside its Job object'
+        Assert ([bool](Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue)) 'the helper process runs while the worker runs'
+        $probeWorker.Kill(); $probeWorker.WaitForExit()
+        for ($i=0; $i -lt 40 -and (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
+        Assert (-not (Get-Process -Id ([int]$childId) -ErrorAction SilentlyContinue)) 'a killed worker takes its helper processes with it (Job object)'
+    } finally { if (-not $probeWorker.HasExited) { $probeWorker.Kill() }; $probeWorker.Dispose() }
     Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal

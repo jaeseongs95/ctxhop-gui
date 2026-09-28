@@ -899,7 +899,10 @@ def write_stage(path, raw):
         os.fsync(stream.fileno())
 
 
-def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
+def apply(home, archive, cwd, token, choice, guard=None, failpoint=None, run_name=None):
+    # run_name: 부르는 쪽의 작업 ID. 복구 기록 폴더 이름이 되어, 응답을 잃어도 이 작업의 기록을 찾을 수 있다.
+    if run_name is not None and not re.fullmatch('[a-f0-9]{32}', run_name):
+        raise ValueError('복구 작업 이름이 올바르지 않습니다.')
     if choice == 'skip':
         return {'status': 'skipped'}
     if choice != 'incoming':
@@ -942,9 +945,9 @@ def apply(home, archive, cwd, token, choice, guard=None, failpoint=None):
         previous = local_edges.get(edge['child_thread_id'])
         if statuses[edge['child_thread_id']] in WRITE and (previous is None or previous['status'] != edge['status']):
             edges.append({**edge, 'previous': None if previous is None else previous['status']})
-    run = home / '.ctxhop-desktop-recovery' / uuid.uuid4().hex
+    run = home / '.ctxhop-desktop-recovery' / (run_name or uuid.uuid4().hex)
     no_reparse(run)
-    run.mkdir(parents=True)
+    run.mkdir(parents=True)  # 같은 이름이 이미 있으면 실패한다(작업 ID 재사용 거부).
     if current is not None:
         if engine:
             # 복구 사본으로 되살릴 때(inspect → apply) 이 PC 엔진과 비교되므로 실제 버전을 기록한다.
@@ -1191,7 +1194,7 @@ def main():
         elif args.action == 'recover':
             result = recover(home, args.run)
         else:
-            result = apply(home, args.archive, args.cwd, args.token, args.choice)
+            result = apply(home, args.archive, args.cwd, args.token, args.choice, run_name=args.run)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

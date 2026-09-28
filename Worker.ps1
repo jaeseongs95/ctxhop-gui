@@ -195,6 +195,11 @@ function Invoke-Impl([hashtable]$Ops,[object[]]$Arguments) {
     [IO.File]::Move("$file.tmp",$file)
     exit 0
 }
+function Assert-OperationId([object]$Id) {
+    # Worker가 복원마다 만드는 작업 ID(GUID N 형식). 벤더는 이 이름으로 첫 쓰기 전에 복구 기록을 만든다.
+    if ($Id -isnot [string] -or $Id -cnotmatch '^[0-9a-f]{32}$') { throw (T 'WkOperationIdInvalid') }
+    return $Id
+}
 function Get-SourceStamp([string]$SourceCwd,[string[]]$Cwds,[string[]]$Edits) {
     # 백업할 작업 폴더를 정하는 입력(시작 폴더·작업 폴더·고친 파일)의 SHA-256. describe와 backup 사이에 바뀌었는지 비교한다.
     $text=ConvertTo-Json -InputObject ([ordered]@{sourceCwd=$SourceCwd;cwds=@($Cwds | Sort-Object);edits=@($Edits | Sort-Object)}) -Compress
@@ -497,7 +502,9 @@ function Invoke-ConversationJob([object]$Job) {
             # GUI는 복원(incoming)만 작업으로 보낸다. 건너뛰기·유지는 작업을 만들지 않는다.
             $choice=if ($Job.choice) {[string]$Job.choice} else {'incoming'}
             if ($Job.projectReceipt) { Assert-ProjectPairing $Job }
-            $restored=Invoke-Vendor $Job 'restore' ($ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$choice})
+            # 작업 ID: 벤더는 이 이름으로 첫 쓰기 전에 복구 기록을 만든다(S3 명세 2.1절).
+            $operationId=[guid]::NewGuid().ToString('N')
+            $restored=Invoke-Vendor $Job 'restore' ($ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$choice;operationId=$operationId})
             $result=@{message=[string]$restored.message;effect=$restored.effect;nativeId=$restored.nativeId;restored=$restored.view;project=$null}
             if ($Job.projectReceipt) {
                 # 대화를 가져왔거나 이미 같을 때만 프로젝트 파일도 복원한다. 이 PC 대화가 더 새로우면 파일도 그대로 둔다.
@@ -513,7 +520,43 @@ function Invoke-ConversationJob([object]$Job) {
         Open { return @{message=[string](Invoke-Vendor $Job 'open' $ids).message} }
     }
 }
+function Enable-WorkerJob {
+    # 이 Worker를 KILL_ON_JOB_CLOSE Job 객체에 넣는다. 벤더 구현·백엔드·엔진 같은 자손은 이 Job을 물려받아, Worker가 어떻게 끝나든 함께 끝난다.
+    # 그래서 다음 Worker가 작업 mutex를 잡았다면 앞 작업의 writer는 남아 있지 않다. 핸들은 일부러 닫지 않는다(프로세스가 끝날 때 닫힘).
+    if (-not ('CtxHopWorkerJob' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System; using System.ComponentModel; using System.Runtime.InteropServices;
+public static class CtxHopWorkerJob {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [StructLayout(LayoutKind.Sequential)] struct Basic { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
+    [StructLayout(LayoutKind.Sequential)] struct Extended { public Basic BasicLimits; public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed; }
+    static IntPtr handle = IntPtr.Zero;
+    public static bool Enabled { get { return handle != IntPtr.Zero; } }
+    public static void Enable() {
+        if (handle != IntPtr.Zero) return;
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        Extended info = new Extended(); info.BasicLimits.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        int length = Marshal.SizeOf(typeof(Extended)); IntPtr buffer = Marshal.AllocHGlobal(length);
+        try { Marshal.StructureToPtr(info, buffer, false); if (!SetInformationJobObject(job, 9, buffer, (uint)length)) throw new Win32Exception(); }
+        finally { Marshal.FreeHGlobal(buffer); }
+        if (!AssignProcessToJobObject(job, GetCurrentProcess())) throw new Win32Exception();
+        handle = job;
+    }
+}
+"@
+    }
+    [CtxHopWorkerJob]::Enable()
+}
+function Assert-WorkerJob {
+    # 쓰기 작업(복원·되돌리기·닫기)은 Job 객체가 켜져 있어야 한다. 목록·미리보기는 막지 않는다.
+    if (-not ('CtxHopWorkerJob' -as [type]) -or -not [CtxHopWorkerJob]::Enabled) { throw (T 'WkJobObjectFailed') }
+}
 function Invoke-JobCore([object]$Job) {
+    if ($Job.action -ceq 'Restore') { Assert-WorkerJob }
     if ($Job.action -in @('List','Backup','Preview','Restore','Open')) { return (Invoke-ConversationJob $Job) }
     # 설정·저장소 작업은 벤더와 무관한 ctxhop 설정 작업이라 ClaudeWorker가 그대로 한다.
     if ($Job.agent -eq 'codex-desktop') { $Job.agent='claude-code' }
@@ -525,6 +568,7 @@ try {
     Set-Language ([string]$job.language)
     Write-Host "CtxHop vNext: $($job.action) / $($job.agent)" -ForegroundColor Cyan
     Write-Host (T 'WkConsolePasswordHint')
+    try { Enable-WorkerJob } catch { Write-Host (T 'WkJobObjectFailed') }
     $data=Invoke-Job $job
     @{ok=$true;data=$data} | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $ResultFile -Encoding UTF8
 } catch {
