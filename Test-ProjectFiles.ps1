@@ -363,6 +363,29 @@ try {
     $undo=Undo-ProjectRestorePlan $case.files $case.record $op
     $entry=@((Get-Content -LiteralPath (Join-Path $case.record 'rollback.json') -Raw | ConvertFrom-Json).files)[0]
     Assert (-not $undo.complete -and $undo.files[0].state -ne 'done' -and $entry.mismatch -and (Read-Text (Join-Path $case.record 'rollback\3')) -eq 'orphan' -and (Read-Text $case.a) -eq 'new') 'a displaced file without a record is kept as a mismatch and nothing else changes'
+    # 계획을 세운 뒤 복원 폴더·하위 폴더·상위 폴더가 정션으로 바뀌면(R38-03), 바깥 파일이 after와 같아도 분류·되돌리기가 건드리지 않는다.
+    foreach ($shape in 'sub','root','parent') {
+        $base=Join-Path $testDirectory "jn-$shape"; $dir=Join-Path $base 'proj'
+        Write-Fixture $dir @{'sub\a.txt'='old'}
+        $zip=New-TestZip (Join-Path $testDirectory "jn-$shape.zip") @{'sub\a.txt'='new'}
+        $record=Join-Path $testDirectory "jn-$shape-rec"
+        $plan=New-ProjectRestorePlan $zip $dir $record
+        $null=Invoke-ProjectRestorePlan $zip $plan.files $record
+        $outsideBase=Join-Path $testDirectory "jn-$shape-outside"
+        Write-Fixture $outsideBase @{'proj\sub\a.txt'='new';'sub\a.txt'='new'}
+        $junction=switch ($shape) { sub { Join-Path $dir 'sub' } root { $dir } parent { $base } }
+        $pointsTo=switch ($shape) { sub { Join-Path $outsideBase 'sub' } root { Join-Path $outsideBase 'proj' } parent { $outsideBase } }
+        Rename-Item -LiteralPath $junction -NewName ([IO.Path]::GetFileName($junction)+'-moved')
+        $null=New-Item -ItemType Junction -Path $junction -Target $pointsTo
+        try {
+            $outsideFile=if ($shape -eq 'sub') { Join-Path $outsideBase 'sub\a.txt' } else { Join-Path $outsideBase 'proj\sub\a.txt' }
+            $view=Get-ProjectUndoView $plan.files
+            Assert ($view[0].class -eq 'unrestorable') "a planned file behind a new junction ($shape) cannot be rolled back: $($view | ConvertTo-Json -Compress)"
+            $undo=Undo-ProjectRestorePlan $plan.files $record $op
+            $undoConfirmed=Undo-ProjectRestorePlan $plan.files $record $op @([pscustomobject]@{target=$plan.files[0].target;current=(Get-Sha 'new')})
+            Assert (-not $undo.complete -and -not $undoConfirmed.complete -and (Read-Text $outsideFile) -eq 'new' -and -not @(Get-ChildItem -LiteralPath $outsideBase -Recurse -Force -Filter '.ctxhop-rb-*').Count -and -not (Test-Path -LiteralPath (Join-Path $record 'rollback'))) "neither rollback touches the outside file ($shape)"
+        } finally { [IO.Directory]::Delete($junction) }
+    }
     # 대상 안의 정션을 거쳐 쓰지 않는다.
     $null=New-Item -ItemType Junction -Path (Join-Path $victim 'link') -Target $outsideDir
     $viaLink=New-TestZip (Join-Path $testDirectory 'link.zip') @{'link\secret.txt'='overwritten'}

@@ -378,6 +378,20 @@ function Save-ProjectJson([string]$Path, [object]$Value) {
     if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temp,$Path,[NullString]::Value) } else { [IO.File]::Move($temp,$Path) }
 }
 function Get-ProjectState([string]$Path) { if ([IO.File]::Exists($Path)) { return (Get-ProjectFileHash $Path) }; return 'absent' }
+function Test-ProjectUndoTarget([object]$File) {
+    # 저장된 계획으로 되돌릴 때마다 지금 경로를 새로 검사한다(R38-03). 계획을 세운 뒤 폴더가 링크·정션으로 바뀌었을 수 있다.
+    # 계획의 복원 폴더(target에서 상대 경로를 뺀 곳)가 복원할 수 있는 위치이고, 드라이브 루트부터 target까지 링크·정션이 없어야 한다.
+    # 상대 경로가 없는 항목(Claude 대화 파일 등)은 부르는 쪽이 목록을 만들 때 검사한다.
+    if (-not $File.path) { return $true }
+    $target=[string]$File.target; $suffix='\'+([string]$File.path).TrimStart('\')
+    if (-not $target.EndsWith($suffix,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $root=ConvertTo-ProjectPath $target.Substring(0,$target.Length-$suffix.Length)
+    if (-not $root -or (Test-ProjectTooBroad $root) -or (Test-ProjectUnder $root (Get-ProjectIgnoredRoots).settings)) { return $false }
+    $full=[IO.Path]::GetFullPath($target)
+    if ($full -ine $target -or -not (Test-ProjectInside $full $root)) { return $false }
+    $cache=@{}
+    return ((Test-ProjectLinkFree $root ([IO.Path]::GetPathRoot($root)) $cache) -and (Test-ProjectLinkFree $full $root $cache))
+}
 function Get-ProjectUndoClass([object]$File, [string]$Current) {
     # 이미 원래대로(original) / 이 작업이 씀(owned) / 알 수 없음(unknown). 되돌릴 원본 사본이 없거나 다르면 되돌리지 못함(unrestorable).
     if ($Current -eq $File.before) { return 'original' }
@@ -387,7 +401,11 @@ function Get-ProjectUndoClass([object]$File, [string]$Current) {
 }
 function Get-ProjectUndoView([object[]]$Files) {
     # 되돌리기 전에 보여 줄 파일별 분류. 아무것도 쓰지 않는다.
-    return @(foreach ($file in $Files) { $current=Get-ProjectState $file.target; [pscustomobject]@{index=[int]$file.index;target=$file.target;class=(Get-ProjectUndoClass $file $current);current=$current} })
+    # 지금 경로가 링크·정션을 거치면 읽지도 않고 되돌리지 못함으로 보인다.
+    return @(foreach ($file in $Files) {
+        if (-not (Test-ProjectUndoTarget $file)) { [pscustomobject]@{index=[int]$file.index;target=$file.target;class='unrestorable';current=''}; continue }
+        $current=Get-ProjectState $file.target; [pscustomobject]@{index=[int]$file.index;target=$file.target;class=(Get-ProjectUndoClass $file $current);current=$current}
+    })
 }
 function Undo-ProjectRestorePlan([object[]]$Files, [string]$Record, [string]$Operation, [object[]]$Confirmed=@()) {
     # 계획의 파일을 복원 전 상태로 되돌린다(S3 명세 3.3절). 이 작업이 쓴 파일(after와 같음)은 되돌리고, 알 수 없는 파일은 사용자가 확인한
@@ -406,6 +424,8 @@ function Undo-ProjectFile([object]$File, [hashtable]$Entries, [scriptblock]$Save
     $part=Join-Path $folder ".ctxhop-rb-$Operation-$index.part"; $prev=Join-Path $folder ".ctxhop-rb-$Operation-$index.prev"
     $entry=$Entries[$index]
     $out=[ordered]@{index=$index;target=$target;class='';current='';state='attention';reason=''}
+    # 경로가 안전하지 않으면 읽거나 쓰지 않고 멈춘다. 원본 사본과 보존 사본은 그대로 남는다.
+    if (-not (Test-ProjectUndoTarget $File)) { $out.reason=T 'PfTargetUnsafe' $target; return [pscustomobject]$out }
     try {
         if (-not [IO.File]::Exists($prev)) {
             # 남은 .part는 원본 사본과 같을 때만 버린다(사본이 따로 있음). 다르면 남기고 멈춘다.

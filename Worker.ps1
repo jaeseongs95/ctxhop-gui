@@ -63,6 +63,8 @@ function Invoke-Bundle([string[]]$Arguments) {
 # 구현(CodexDesktop.ps1, ClaudeCode.ps1)은 이 파일을 라이브러리로 불러 Invoke-Impl로 요청을 읽고 op 처리기를 부른다.
 # 구현은 콘솔을 물려받는다(ctxhop 암호 입력, 대화 열기). 결과는 응답 파일 하나로만 받는다.
 $script:ImplsFile=Join-Path $PSScriptRoot 'impls.json'
+# 자손이 스스로 끝나기를 기다리는 시간과, 그 뒤 Job 소속을 끝내며 기다리는 시간(초, S3 명세 2.2절).
+$script:WorkerWaitSec=60; $script:WorkerKillSec=30
 $script:ContractStatus=@{
     probe=@('ok','failed'); list=@('ok','unsupported','failed'); open=@('ok','unsupported','failed'); recover=@('ok','unsupported','failed')
     describe=@('ok','busy','unsupported','failed'); backup=@('ok','busy','changed','unsupported','failed')
@@ -520,7 +522,7 @@ function Test-DoneRecord([Collections.IDictionary]$Marker) {
 }
 function Close-Marker([Collections.IDictionary]$Marker,[string]$Outcome,[string]$VendorState,[hashtable]$Project) {
     # 자손이 모두 끝난 뒤, 종료 기록을 먼저 쓰고 확인한 다음 표지를 지운다(S3 명세 2.2·2.4절).
-    if ((Wait-WorkerJobAlone) -ne 'alone') { $null=Set-MarkerAttention $Marker (T 'WkWorkerHelpersLeft'); throw (T 'WkWorkerHelpersLeft') }
+    if ((Wait-WorkerJobAlone $script:WorkerWaitSec $script:WorkerKillSec) -ne 'alone') { return (Set-MarkerAttention $Marker (T 'WkWorkerHelpersLeft')) }
     # 표지 없던 프로젝트 기록은 그 폴더에 resolved.json(기록 해시)을 남겨 목록에서 뺀다.
     if ($Marker.recordKind -eq 'project' -and -not (Test-ProjectRecordResolved ([string]$Marker.recordRef))) { Save-ProjectJson (Join-Path $Marker.recordRef 'resolved.json') ([ordered]@{version=1;operationId=$Marker.operationId;outcome=$Outcome;sha256=(Get-ProjectRecordSha ([string]$Marker.recordRef));at=(Get-ProjectStamp)}) }
     $dir=Join-Path (Get-JournalDir) 'done'; $null=[IO.Directory]::CreateDirectory($dir)
@@ -528,6 +530,16 @@ function Close-Marker([Collections.IDictionary]$Marker,[string]$Outcome,[string]
     if (-not (Test-DoneRecord $Marker)) { return (Set-MarkerAttention $Marker (T 'WkJournalDoneMismatch')) }
     [IO.File]::Delete((Join-Path (Get-JournalDir) "$($Marker.operationId).json"))
     return $Outcome
+}
+function Test-MarkerEngineClosed([Collections.IDictionary]$Marker) {
+    # 되돌릴 프로젝트 계획이 있으면 그 기록의 엔진 guard를 부른다. 벤더를 모르는 기록(예전 판 프로젝트 기록)은 모든 벤더를 본다.
+    # 모두 ok면 빈 값, 아니면 이유를 돌려준다.
+    try { if (-not (Read-ProjectPlan ([string]$Marker.projectRecovery))) { return '' } } catch { return '' }
+    $agents=if ($Marker.agent) { @([string]$Marker.agent) } else { @((Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties.Name) }
+    foreach ($agent in $agents) {
+        try { $null=Invoke-Vendor ([pscustomobject]@{agent=$agent;home=[string]$Marker.home}) 'guard' @{} } catch { return (T 'WkRollbackEngineOpen' $agent $_.Exception.Message) }
+    }
+    return ''
 }
 function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]]$Confirmed,[string]$VendorState,[bool]$OkEqual) {
     # 상태 결정표(S3 명세 2.5절). 앞 writer 확인(Enter-Marker)을 통과한 뒤에만 부른다.
@@ -543,6 +555,9 @@ function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]
     $auto=$VendorState -in @('absent','rolled_back','none') -and $Mode -in @('restore','rollback')
     $user=$VendorState -in @('pending','resolved') -and $Mode -eq 'rollback'
     if (-not ($auto -or $user)) { return 'waiting' }
+    # 프로젝트 파일을 처음 되돌리기 전에 엔진이 모두 닫혔는지 본다(R38-02). 닫혀 있지 않거나 확인하지 못하면 아무것도 바꾸지 않는다.
+    $guard=Test-MarkerEngineClosed $Marker
+    if ($guard) { return (Set-MarkerAttention $Marker $guard) }
     if ($Marker.phase -ne 'rollback') { $Marker.phaseBefore=$Marker.phase; $Marker.phase='rollback'; Save-Marker $Marker }
     try { $project=Undo-MarkerProject $Marker $Confirmed } catch { return (Set-MarkerAttention $Marker $_.Exception.Message) }
     if (-not $project.complete) { return (Set-MarkerAttention $Marker (T 'WkRollbackIncomplete')) }
@@ -724,6 +739,18 @@ function Invoke-ProjectFolders([Collections.IDictionary]$Marker,[object[]]$Folde
     $written=0; $backedUp=0; foreach ($entry in $summary) { $written+=$entry.written; $backedUp+=$entry.backedUp }
     return @{folders=$summary;recovery=$recovery;failure=$failure;message=(T 'WkProjectRestored' @($summary | Where-Object { $_.state -eq 'restored' }).Count $written $backedUp @($summary | ForEach-Object { @($_.failed) } | Where-Object { $_ }).Count $recovery)}
 }
+function Complete-RestoreMarker([Collections.IDictionary]$Marker,[bool]$VendorSkipped,[bool]$OkEqual) {
+    # 복원 작업 안의 마무리(S3 명세 2.2·2.5절, R38-01). 벤더 구현이 끝나도 그 자식(백엔드·엔진)은 아직 쓰고 있을 수 있다.
+    # 그래서 이 Worker의 Job에 자신만 남은 것을 먼저 확인하고, 그다음에 벤더 상태를 새로 읽어 결정표로 간다.
+    # 자손을 끝내야 했거나 끝내지 못했으면 결정표에 들어가지 않고 attention으로 남긴다(프로젝트를 되돌리지 않음).
+    if (-not $VendorSkipped) {
+        $alone=Wait-WorkerJobAlone $script:WorkerWaitSec $script:WorkerKillSec
+        if ($alone -ne 'alone') { return (Set-MarkerAttention $Marker (T 'WkWorkerHelpersLeft')) }
+    }
+    # 벤더를 부르지 않았으면 대화에는 쓰지 않았다. 불렀으면 결과와 상관없이 벤더 기록을 새로 본다.
+    $state=if ($VendorSkipped) {'absent'} elseif ($OkEqual) {'complete'} else {Get-VendorState $Marker}
+    try { return (Resolve-Marker $Marker 'restore' @() $state $OkEqual) } catch { return (Set-MarkerAttention $Marker $_.Exception.Message) }
+}
 function Invoke-RestoreOperation([object]$Job,[hashtable]$Ids,[string]$Choice) {
     # 복원(S3 명세 4.1절): 차단 검사 → 짝·대상 확정 → 엔진 사전 검사 → 표지 → 프로젝트 파일 → 대화 → 결정표.
     if ($Choice -cne 'incoming') { throw (T 'WkChoiceRequired') }
@@ -747,10 +774,7 @@ function Invoke-RestoreOperation([object]$Job,[hashtable]$Ids,[string]$Choice) {
         $marker.phase='conversation'; Save-Marker $marker
         try { $restored=Invoke-Vendor $Job 'restore' ($Ids+@{receipt=[string]$Job.receipt;token=[string]$Job.token;choice=$Choice;operationId=$operationId}) } catch { $vendorError=$_ }
     }
-    # 벤더를 부르지 않았으면 대화에는 쓰지 않았다. 불렀으면 결과와 상관없이 벤더 기록을 다시 본다.
-    $okEqual=$restored -and $restored.effect -ceq 'equal'
-    $state=if ($failure) {'absent'} elseif ($okEqual) {'complete'} else {Get-VendorState $marker}
-    $outcome=try { Resolve-Marker $marker 'restore' @() $state $okEqual } catch { Set-MarkerAttention $marker $_.Exception.Message }
+    $outcome=Complete-RestoreMarker $marker ([bool]$failure) ($restored -and $restored.effect -ceq 'equal')
     if ($Job.projectReceipt) { $cleanup=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Job.projectReceipt))) } else { $cleanup='' }
     # 대화를 부르지 않았으면 벤더 미리보기의 평문 사본도 쓸 일이 없으므로 지운다. 불렀다가 실패하면 벤더가 증거로 남긴다.
     if ($failure -and [string]$Job.receipt) { $cleanup+=Remove-DesktopStage ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath([string]$Job.receipt))) }
@@ -914,8 +938,9 @@ function Assert-WorkerJob {
     if (-not ('CtxHopWorkerJob' -as [type]) -or -not [CtxHopWorkerJob]::Enabled) { throw (T 'WkJobObjectFailed') }
 }
 function Get-WorkerStarted([int]$ProcessId) {
-    # PID 재사용을 가리려고 시작 시각을 함께 본다. 끝났거나 볼 수 없으면 빈 값.
-    try { $process=[Diagnostics.Process]::GetProcessById($ProcessId); try { return [string]$process.StartTime.ToFileTimeUtc() } finally { $process.Dispose() } } catch { return '' }
+    # PID 재사용을 가리려고 시작 시각을 함께 본다. 그 PID가 없으면 빈 값이고, 있는데 읽지 못하면 예외다(끝났다고 보지 않는다).
+    try { $process=[Diagnostics.Process]::GetProcessById($ProcessId) } catch [ArgumentException] { return '' }
+    try { return [string]$process.StartTime.ToFileTimeUtc() } finally { $process.Dispose() }
 }
 function Get-WorkerFields {
     # 표지에 적는 지금 Worker의 값(S3 명세 2.4절).

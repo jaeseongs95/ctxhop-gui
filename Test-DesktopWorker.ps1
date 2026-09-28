@@ -766,6 +766,10 @@ Start-Sleep 120
                 [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
                 return @{status='rolled_back';id=$record.id;members=1}
             }
+            guard {
+                if ($script:GuardBusy) { $e=[InvalidOperationException]::new('Codex 앱/CLI/IDE를 모두 종료하세요.'); $e.Data['backendResult']=[pscustomobject]@{status='blocked';reason='writer';token=$null}; throw $e }
+                return @{status='closed';engine='fixture'}
+            }
             default { throw "unexpected backend operation $($Arguments[0])" }
         }
     }
@@ -849,6 +853,69 @@ Start-Sleep 120
     $r=Invoke-Rollback $c.op
     $after=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($c.op).json") -Raw | ConvertFrom-Json
     Assert ($r.outcome -ceq 'rolled_back' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and $after.outcome -ceq 'rolled_back') 'after the earlier worker is gone the next worker takes the record over and rolls back'
+    # R38-01: 벤더 구현이 끝난 뒤에도 그 자손이 쓰고 있을 수 있다. 자손이 끝난 뒤 새로 읽은 상태로 판단해야 한다.
+    $completeJson=Join-Path $caseRoot 'complete-journal.json'
+    [IO.File]::WriteAllText($completeJson,(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$desktopRoot;id=$script:Id}) -Compress))
+    $c=New-JournalCase 'late-writer' 'absent'
+    $late=Start-Helper "Start-Sleep -Seconds 2; Copy-Item -LiteralPath '$completeJson' -Destination '$(Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json")'"
+    $outcome=Complete-RestoreMarker $c.marker $false $false
+    Assert ($outcome -ceq 'completed' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and (Get-Done $c.op).outcome -ceq 'completed') "a conversation finished by a late helper is completed, not rolled back: $outcome"
+    $late.Dispose()
+    $c=New-JournalCase 'stuck-writer' 'absent'
+    $journalPath=Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json"
+    $stuck=Start-Helper "Start-Sleep -Seconds 60; Copy-Item -LiteralPath '$completeJson' -Destination '$journalPath'"
+    $script:WorkerWaitSec=1; $script:WorkerKillSec=10
+    try { $outcome=Complete-RestoreMarker $c.marker $false $false } finally { $script:WorkerWaitSec=60; $script:WorkerKillSec=30 }
+    Assert ($outcome -ceq 'attention' -and -not (Test-Alive $stuck.Id) -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Get-Done $c.op) -and -not (Test-Path -LiteralPath $journalPath) -and (Get-Row $c.op).Count -eq 1) 'a helper that had to be ended leaves the record for review and rolls nothing back'
+    $stuck.Dispose()
+    # R38-02: 프로젝트 파일을 되돌리기 전에 엔진 guard를 부른다. 열려 있으면 파일·벤더 모두 그대로다.
+    foreach ($state in 'absent','pending','resolved') {
+        $c=New-JournalCase "guard-$state" $state
+        $script:GuardBusy=$true
+        try { $r=Invoke-Rollback $c.op } finally { $script:GuardBusy=$false }
+        $recovery=$c.marker.projectRecovery
+        Assert ($r.outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $recovery 'rollback.json')) -and (Get-CodexState $c.op) -ceq $(if ($state -eq 'absent') {'absent'} else {$state})) "an open engine stops the $state rollback before any project write"
+        Assert ((Invoke-Rollback $c.op).outcome -cin @('rolled_back','resolved') -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old') "the $state rollback goes through once the engine is closed"
+    }
+    $c=New-JournalCase 'guard-restore' 'absent'
+    $script:GuardBusy=$true
+    try { $outcome=Complete-RestoreMarker $c.marker $true $false } finally { $script:GuardBusy=$false }
+    Assert ($outcome -ceq 'attention' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new') 'an engine opened during the restore stops the automatic rollback'
+    $null=Invoke-Rollback $c.op
+    # 시작 시각: 없는 PID는 빈 값, 있는데 읽을 수 없는 프로세스(PID 0은 누구도 열 수 없음)는 예외다.
+    $unused=1; while (Get-Process -Id $unused -ErrorAction SilentlyContinue) { $unused+=4 }
+    Assert ((Get-WorkerStarted $unused) -eq '') 'a PID that is not running has no start time'
+    Throws { Get-WorkerStarted 0 } '.'
+    # r37 근거 보강: 살아 있는 앞 Worker의 시작 시각을 읽지 못하면 끝났다고 보지 않는다(busy, 아무것도 끝내지 않음).
+    $probeRun=Start-JobProbe
+    try {
+        $marker=[ordered]@{workerJob=$probeRun.marker.workerJob;workerPid=$probeRun.marker.workerPid;workerStarted='1'}
+        $realStarted=${function:Get-WorkerStarted}
+        ${function:Get-WorkerStarted}={ param([int]$ProcessId) throw 'access denied' }
+        try { $seen=Test-WorkerWritersGone $marker 5 } finally { ${function:Get-WorkerStarted}=$realStarted }
+        Assert ($seen -eq 'busy' -and (Test-Alive $probeRun.marker.child) -and (Test-Alive $probeRun.marker.workerPid)) 'a worker whose start time cannot be read is busy and nothing is ended'
+        # abandoned mutex: mutex를 가진 스레드만 끝났고 앞 Worker는 살아 있다. 다음 작업은 mutex를 얻어도 busy이고 쓰기 0이다.
+        if (-not ('CtxHopAbandon' -as [type])) { Add-Type -TypeDefinition 'using System.Threading; public static class CtxHopAbandon { public static void Run(string name) { var t = new Thread(() => { var m = new Mutex(false, name); m.WaitOne(); }); t.Start(); t.Join(); } }' }
+        $mutexName="Local\CtxHopGUI-test-$([guid]::NewGuid().ToString('N'))"
+        [CtxHopAbandon]::Run($mutexName)
+        $realMutexName=${function:Get-OperationMutexName}
+        ${function:Get-OperationMutexName}=[scriptblock]::Create("'$mutexName'")
+        $c=New-JournalCase 'abandoned' 'absent'
+        foreach ($field in 'workerJob','workerPid','workerStarted') { $c.marker[$field]=$probeRun.marker.$field }; Save-Marker $c.marker
+        try { $blocked=$null; try { $null=Invoke-Job @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$c.op} } catch { $blocked=$_ } } finally { ${function:Get-OperationMutexName}=$realMutexName }
+        Assert ($blocked.Exception.Message -match (T 'WkJournalBusy').Substring(0,10) -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and -not (Test-Path -LiteralPath (Join-Path $c.marker.projectRecovery 'rollback.json'))) "an abandoned mutex with a live earlier worker is busy and writes nothing: $($blocked.Exception.Message)"
+    } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill(); $probeRun.process.WaitForExit() }; $probeRun.process.Dispose() }
+    for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
+    $null=Invoke-Rollback $c.op
+    # 끝내는 도중에도 새 자손이 계속 생기면, 목록을 다시 전부 받아 새로 생긴 것까지 끝낸다.
+    $spawnFile=Join-Path $caseRoot 'spawned.txt'
+    $spawner=Start-Helper "for (`$i=0; `$i -lt 200; `$i++) { `$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 60'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$p=[Diagnostics.Process]::Start(`$s); Add-Content -LiteralPath '$spawnFile' -Value `$p.Id; Start-Sleep -Milliseconds 150 }"
+    for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $spawnFile); $i++) { Start-Sleep -Milliseconds 250 }
+    Start-Sleep -Milliseconds 600
+    $result=Wait-WorkerJobAlone 1 20
+    $spawned=@(Get-Content -LiteralPath $spawnFile | ForEach-Object { [int]$_ })
+    Assert ($result -eq 'killed' -and -not (Test-Alive $spawner.Id) -and -not @($spawned | Where-Object { Test-Alive $_ }).Count -and $spawned.Count -ge 2) "helpers that keep starting children are ended together with every child: $result, $($spawned.Count) children"
+    $spawner.Dispose()
     # 종료 기록이 다른 작업의 것이면 표지를 지우지 않는다.
     $c=New-JournalCase 'done-mismatch' 'absent'
     $null=[IO.Directory]::CreateDirectory((Join-Path $testDirectory 'CtxHopGUI\journal\done'))

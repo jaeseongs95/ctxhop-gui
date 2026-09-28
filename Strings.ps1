@@ -300,6 +300,7 @@ $script:StringTable=@{
     WkProjectPlanInvalid=@('복원 계획 파일의 형식이 올바르지 않습니다: {0}','The restore plan file is not valid: {0}')
     WkProjectTargetsOverlap=@('복원할 폴더가 서로 겹치거나 보호하는 폴더와 겹쳐 아무것도 쓰지 않았습니다: {0} / {1}','Restore folders overlap each other or a protected folder, so nothing was written: {0} / {1}')
     WkWorkerHelpersLeft=@('작업이 끝난 뒤에도 도우미 프로세스가 남아 있었습니다. 기록을 확인이 필요한 상태로 남겼습니다.','Helper processes were still running after the job ended. The record was left for review.')
+    WkRollbackEngineOpen=@('{0}이(가) 열려 있거나 닫혔는지 확인하지 못해 프로젝트 파일을 되돌리지 않았습니다. 앱과 편집기를 닫은 뒤 다시 시도하세요: {1}','{0} is open, or it could not be confirmed that it is closed, so no project file was rolled back. Close the app and editors, then try again: {1}')
     WkRestoreFilesRolledBack=@(' 이번에 쓴 프로젝트 파일은 되돌렸습니다.',' The project files written by this restore were rolled back.')
     WkRestoreProjectRolledBack=@('프로젝트 파일을 쓰지 못해 대화를 복원하지 않았습니다. 쓴 파일은 되돌렸습니다: {0}','A project file could not be written, so the conversation was not restored. Files already written were rolled back: {0}')
     WkRestoreProjectFailed=@('프로젝트 파일을 쓰지 못해 대화를 복원하지 않았습니다. 쓴 파일을 모두 되돌리지 못했습니다. 설정 탭의 "중단된 복원"에서 확인하세요: {0}','A project file could not be written, so the conversation was not restored. Not every written file could be rolled back. Check "Interrupted restores" on the Settings tab: {0}')
