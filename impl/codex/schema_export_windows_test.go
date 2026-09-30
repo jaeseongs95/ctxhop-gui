@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -107,7 +106,7 @@ func exportPrivateSchema(dll *syscall.DLL, path string) (result object, retErr e
 	tables := object{}
 	migrationsFound := false
 	for _, row := range objects {
-		if row[0] != "table" {
+		if row[0] != "table" && row[0] != "view" {
 			continue
 		}
 		name, ok := row[1].(string)
