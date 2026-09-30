@@ -7,10 +7,12 @@ File snapshots detect final differences; they do not prove absence of transient
 writes or networking. Engine effects require independent complete observation.
 #>
 param(
-    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','Engine')][string]$Mode='SelfTest',
+    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
     [string]$SourceArchive,
     [string]$SourceCommit,
+    [string]$SchemaReceipt,
+    [string]$StateMigrations,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -210,7 +212,7 @@ function Get-SchemaMigrationComparison([object[]]$Migrations,[string]$Directory)
             $seen[$version]=$true
             $bytes=[IO.File]::ReadAllBytes($file.FullName)
             $text=[Text.UTF8Encoding]::new($false,$true).GetString($bytes)
-            if ($text.Contains("`r") -or $text.StartsWith([string][char]0xFEFF)) { throw 'schemaSourceNotLf' }
+            if ($text.Contains("`r") -or $text.StartsWith([string][char]0xFEFF,[StringComparison]::Ordinal)) { throw 'schemaSourceNotLf' }
             $lf=([BitConverter]::ToString($sha384.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
             $crlfBytes=$script:Utf8.GetBytes($text.Replace("`n","`r`n"))
             $crlf=([BitConverter]::ToString($sha384.ComputeHash($crlfBytes))).Replace('-','').ToLowerInvariant()
@@ -286,6 +288,20 @@ function Invoke-SyntheticSchemaExport([string]$Root,[string]$Archive,[string]$Co
         $receipt.runnerStatus='passed'; $receipt.step='complete'; $receipt.schemaSeal='observed synthetic objects/checksums; runtime compatibility not tested'
     } catch { $receipt.error=$_.Exception.Message; throw } finally { Write-FixtureJson (Join-Path $path 'schema-runner-result.json') $receipt }
     return $receipt
+}
+function Invoke-SyntheticSchemaComparison([string]$Root,[string]$ReceiptFile,[string]$MigrationsDirectory) {
+    # Resume only pure postprocessing of already exported, owned artifacts.
+    # This path has no Go/native SQLite, source acquisition or engine call.
+    $path=Assert-OwnedFixturePath $Root
+    $inputPath=Assert-OwnedFixturePath $ReceiptFile
+    $migrationPath=Assert-OwnedFixturePath $MigrationsDirectory
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    $export=Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
+    Assert-SyntheticSchemaReceipt $export
+    $comparison=Get-SchemaMigrationComparison @($export.migrations) $migrationPath
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    Write-FixtureJson (Join-Path $path 'migration-comparison.json') $comparison
+    return [ordered]@{schemaVersion=1;purpose='postprocess existing synthetic schema receipt';runnerStatus='passed';engineExecuted=$false;traceStarted=$false;engineAcceptance='notRun';sourceSQLiteOpens=0;privateSQLiteOpens=0;exportReused=$true;exportSha256=(Get-FileHash -LiteralPath $inputPath).Hash.ToLowerInvariant();runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant();objectCount=@($export.objects).Count;migrationCount=58;allMigrationsMatchLf=$comparison.allMatchLf;allMigrationsMatchCrlf=$comparison.allMatchCrlf;productionGuardObservation=$export.productionGuardObservation;absoluteWriterExclusion=$export.absoluteWriterExclusion;dll=$export.dll;runtimeCompatibility='notTested'}
 }
 function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
@@ -368,6 +384,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
