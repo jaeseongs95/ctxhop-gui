@@ -72,7 +72,7 @@ $migrations=@(foreach ($group in $groups) {
         if ($file.Name -cnotmatch '^[0-9]{4}_[a-z0-9_]+\.sql$') { throw 'unreviewed migration file' }
         $bytes=[IO.File]::ReadAllBytes($file.FullName)
         $sql=$utf8.GetString($bytes)
-        if ($sql.Contains("`r") -or $sql.StartsWith([string][char]0xfeff)) { throw 'migration source must be committed LF without BOM' }
+        if ($sql.Contains("`r") -or $sql.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) { throw 'migration source must be committed LF without BOM' }
         $lfHash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         [IO.File]::WriteAllBytes($file.FullName,$utf8.GetBytes($sql.Replace("`n","`r`n")))
         [ordered]@{path="codex-rs/state/$group/$($file.Name)";lfSha256=$lfHash;crlfSha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant();sqlxSha384=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA384).Hash.ToLowerInvariant()}
