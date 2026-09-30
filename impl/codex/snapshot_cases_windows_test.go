@@ -437,21 +437,25 @@ func TestSnapshotExistingWriterAndSQLiteHandoff(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer dll.Release()
-	openSourceWithoutSQL := func() uintptr {
+	openSourceWithoutSQL := func() (uintptr, int32) {
 		var db uintptr
+		readonly := int32(-1)
 		b := append([]byte(source), 0)
 		r, _, _ := dll.MustFindProc("sqlite3_open_v2").Call(uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&db)), 6, 0)
 		if db != 0 {
+			name := []byte("main\x00")
+			ro, _, _ := dll.MustFindProc("sqlite3_db_readonly").Call(db, uintptr(unsafe.Pointer(&name[0])))
+			readonly = int32(ro)
 			rc, _, _ := dll.MustFindProc("sqlite3_close").Call(db)
 			if rc != 0 {
 				t.Fatal("source fixture SQLite drain", rc)
 			}
 		}
-		return r
+		return r, readonly
 	}
 	before, _ := dbHashes(source)
-	heldRC := openSourceWithoutSQL()
-	if heldRC == 0 {
+	heldRC, heldReadonly := openSourceWithoutSQL()
+	if heldRC == 0 && heldReadonly != 1 {
 		t.Fatal("writable SQLite entered while raw READ/shareREAD held")
 	}
 	after, _ := dbHashes(source)
@@ -464,9 +468,9 @@ func TestSnapshotExistingWriterAndSQLiteHandoff(t *testing.T) {
 	if e := s.Close(true); e != nil {
 		t.Fatal(e)
 	}
-	releasedRC := openSourceWithoutSQL()
-	if releasedRC != 0 {
-		t.Fatal("writable SQLite fixture could not open after release", releasedRC)
+	releasedRC, releasedReadonly := openSourceWithoutSQL()
+	if releasedRC != 0 || releasedReadonly != 0 {
+		t.Fatal("writable SQLite fixture could not open after release", releasedRC, releasedReadonly)
 	}
-	t.Logf("owned source fixture only, SQL statements=0: writable SQLite open held rc=%d, released rc=%d; source/share lease cannot span writable activation", heldRC, releasedRC)
+	t.Logf("owned source fixture only, SQL statements=0: READWRITE request held rc=%d readonly=%d, released rc=%d readonly=%d; source/share lease cannot span writable activation", heldRC, heldReadonly, releasedRC, releasedReadonly)
 }
