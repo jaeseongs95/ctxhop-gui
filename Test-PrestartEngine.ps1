@@ -146,24 +146,24 @@ function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
     [IO.Directory]::CreateDirectory($path) | Out-Null
-    $home=Join-Path $path 'home'; $cwd=Join-Path $path 'project'; $childCwd=Join-Path $path 'child-project'
-    foreach ($directory in @($home,$cwd,$childCwd)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
-    Write-FixtureText (Join-Path $home 'config.toml') "# synthetic fixture; vendor policy flags remain unchanged`n"
+    $fixtureHome=Join-Path $path 'home'; $cwd=Join-Path $path 'project'; $childCwd=Join-Path $path 'child-project'
+    foreach ($directory in @($fixtureHome,$cwd,$childCwd)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+    Write-FixtureText (Join-Path $fixtureHome 'config.toml') "# synthetic fixture; vendor policy flags remain unchanged`n"
     Write-FixtureText (Join-Path $path 'malformed-config.toml') "[unterminated`n"
-    Write-FixtureText (Join-Path $path 'redirect-config.toml') ('sqlite_home = '+(ConvertTo-Json -InputObject $home -Compress)+"`n")
+    Write-FixtureText (Join-Path $path 'redirect-config.toml') ('sqlite_home = '+(ConvertTo-Json -InputObject $fixtureHome -Compress)+"`n")
     # An intentionally malformed database is valid only for rejection and
     # observer sensitivity tests. It is never labelled a canonical cold seed.
-    Write-FixtureText (Join-Path $home 'state_5.sqlite') "SYNTHETIC_INVALID_DB_FOR_REJECTION_ONLY`n"
-    Write-FixtureText (Join-Path $home 'state_5.sqlite-wal') "SYNTHETIC_INVALID_WAL_FOR_REJECTION_ONLY`n"
+    Write-FixtureText (Join-Path $fixtureHome 'state_5.sqlite') "SYNTHETIC_INVALID_DB_FOR_REJECTION_ONLY`n"
+    Write-FixtureText (Join-Path $fixtureHome 'state_5.sqlite-wal') "SYNTHETIC_INVALID_WAL_FOR_REJECTION_ONLY`n"
     $members=@(
-        @{id='11111111-1111-4111-8111-111111111111';parentId=$null;role='root';rolloutPath=(Join-Path $home 'root.jsonl');rolloutSha256=('1'*64)},
-        @{id='22222222-2222-4222-8222-222222222222';parentId='11111111-1111-4111-8111-111111111111';role='child';rolloutPath=(Join-Path $home 'child.jsonl');rolloutSha256=('2'*64)}
+        @{id='11111111-1111-4111-8111-111111111111';parentId=$null;role='root';rolloutPath=(Join-Path $fixtureHome 'root.jsonl');rolloutSha256=('1'*64)},
+        @{id='22222222-2222-4222-8222-222222222222';parentId='11111111-1111-4111-8111-111111111111';role='child';rolloutPath=(Join-Path $fixtureHome 'child.jsonl');rolloutSha256=('2'*64)}
     )
-    $startup=[ordered]@{contractVersion=1;requestNonce=('a'*32);operation='plan';home=$home;cwd=$cwd;offline=$true;members=@()}
-    $cold=[ordered]@{contractVersion=1;requestNonce=('b'*32);operation='cold';home=$home;cwd=$cwd;offline=$true;members=$members}
+    $startup=[ordered]@{contractVersion=1;requestNonce=('a'*32);operation='plan';home=$fixtureHome;cwd=$cwd;offline=$true;members=@()}
+    $cold=[ordered]@{contractVersion=1;requestNonce=('b'*32);operation='cold';home=$fixtureHome;cwd=$cwd;offline=$true;members=$members}
     Write-FixtureJson (Join-Path $path 'prepare-startup.json') @{id=1;method='ctxhop/prepare';params=$startup}
     Write-FixtureJson (Join-Path $path 'prepare-cold-template.json') @{id=1;method='ctxhop/prepare';params=$cold;fixtureStatus='templateOnly';missing='canonical rollout bytes/digests/settings and DB schema'}
-    $manifest=[ordered]@{schemaVersion=1;purpose='runner preparation only';home=$home;cwd=$cwd;childCwd=$childCwd;engineExecuted=$false;engineAcceptance='notRun';canonicalColdSeed=$false;protectedForbidden=@('thread/start','turn/start','config/account/auth/tool changes');cases=@(Get-PrestartCasePlan)}
+    $manifest=[ordered]@{schemaVersion=1;purpose='runner preparation only';home=$fixtureHome;cwd=$cwd;childCwd=$childCwd;engineExecuted=$false;engineAcceptance='notRun';canonicalColdSeed=$false;protectedForbidden=@('thread/start','turn/start','config/account/auth/tool changes');cases=@(Get-PrestartCasePlan)}
     Write-FixtureJson (Join-Path $path 'fixture-plan.json') $manifest
     return $manifest
 }
