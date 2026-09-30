@@ -285,6 +285,64 @@ func TestImportFixtures(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanRoutingDoesNotFallbackOnSafetyFailure(t *testing.T) {
+	for _, mode := range []string{"unsupported", "exists", "foreign_link", "unreadable_rollout", "reparse", "policy_error"} {
+		t.Run(mode, func(t *testing.T) {
+			o, m := importFixture(t, "legacy", false)
+			f, e := readArchive(o.Archive)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if e := support(f, o.Home); e != nil {
+				t.Fatal(e)
+			}
+			switch mode {
+			case "unsupported":
+				obj(f.Members[0].Data["thread"])["source"] = `{"subagent":{}}`
+				o.Archive = writeArchiveFixture(t, f, 2, nil)
+			case "exists":
+				if e := createFile(f.Members[0].Path, f.Members[0].Raw); e != nil {
+					t.Fatal(e)
+				}
+			case "foreign_link":
+				other := fixtureMember(otherID, nil, "legacy")
+				other.Header["parent_thread_id"] = rootID
+				if e := createFile(filepath.Join(o.Home, "sessions", "rollout-2023-11-14T22-13-20-"+otherID+".jsonl"), append(encoded(object{"type": "session_meta", "payload": other.Header}), '\n')); e != nil {
+					t.Fatal(e)
+				}
+			case "unreadable_rollout":
+				if e := createFile(f.Members[0].Path, []byte("invalid\n")); e != nil {
+					t.Fatal(e)
+				}
+			case "reparse":
+				system, e := systemDirectory()
+				if e != nil {
+					t.Fatal(e)
+				}
+				if e := makeJunction(system, filepath.Join(o.Home, "sessions"), t.TempDir()); e != nil {
+					t.Fatal(e)
+				}
+			case "policy_error":
+				old := prepareEngine
+				defer func() { prepareEngine = old }()
+				prepareEngine = func(options, string, []member) (*session, error) { return nil, fail("policy_error", "policy denied") }
+			}
+			m.Events = nil
+			r, e := plan(o)
+			if mode == "unsupported" || mode == "exists" {
+				if e != nil || r["status"] != mode || len(m.Events) != 0 {
+					t.Fatal(r, e, m.Events)
+				}
+				return
+			}
+			assertCode(t, e, mode)
+			if r["status"] != "blocked" {
+				t.Fatal("safety error permits fallback", r)
+			}
+		})
+	}
+}
 func TestPendingAndExplicitRollback(t *testing.T) {
 	o, m := importFixture(t, "paginated", false)
 	m.Fail = "thread/resume"

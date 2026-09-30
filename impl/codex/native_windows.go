@@ -564,14 +564,14 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 				if len(got) != 3 {
 					return fail("engine_db_unknown", "edge 구조 불명")
 				}
-				if got["child_thread_id"][5] != "1" || got["parent_thread_id"][5] != "0" || got["status"][5] != "0" {
-					return fail("engine_db_unknown", "edge 기본 키 구조 불명")
-				}
 				for _, key := range []string{"parent_thread_id", "child_thread_id", "status"} {
 					c := got[key]
 					if len(c) != 6 || strings.ToUpper(c[2]) != "TEXT" || c[3] != "1" {
 						return fail("engine_db_unknown", "edge 열 구조 불명")
 					}
+				}
+				if got["child_thread_id"][5] != "1" || got["parent_thread_id"][5] != "0" || got["status"][5] != "0" {
+					return fail("engine_db_unknown", "edge 기본 키 구조 불명")
 				}
 			}
 		}

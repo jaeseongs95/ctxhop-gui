@@ -240,6 +240,13 @@ func TestNativeReadOnlyDB(t *testing.T) {
 		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, false)
 		assertCode(t, e, "engine_db_unknown")
 	})
+	t.Run("missing_edge_key", func(t *testing.T) {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, `CREATE TABLE threads(id TEXT PRIMARY KEY); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT NOT NULL,status TEXT NOT NULL,unexpected TEXT);`)
+		close()
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, false)
+		assertCode(t, e, "engine_db_unknown")
+	})
 	t.Run("other_state", func(t *testing.T) {
 		home := t.TempDir()
 		os.WriteFile(filepath.Join(home, "state_6.sqlite"), nil, 0600)

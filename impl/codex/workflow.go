@@ -48,11 +48,12 @@ func plan(o options) (object, error) {
 		return r, nil
 	}
 	r["members"] = f.Members
+	r["status"] = "blocked"
 	s, e := scanHome(o.Home, f.Members, false)
 	if e != nil {
 		r["reasonCode"] = reason(e)
 		r["reason"] = e.Error()
-		return r, nil
+		return r, e
 	}
 	if hasFiles(s) {
 		r["status"] = "exists"
