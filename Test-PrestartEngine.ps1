@@ -494,7 +494,9 @@ function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Co
     try {
         foreach ($lane in @(@{name='runner';archive=$archivePath;commit=$Commit},@{name='go';archive=$goArchive;commit=$BackendCommit})) {
             $reference=Join-Path $path ($lane.name+'-reference.tar')
-            Invoke-SchemaCommand 'git' @('-C',$repo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$lane.commit) (Join-Path $path ($lane.name+'-archive.log'))
+            $archiveArguments=@('-C',$repo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$lane.commit)
+            if ($lane.name -ceq 'go') { $archiveArguments+='impl/codex' }
+            Invoke-SchemaCommand 'git' $archiveArguments (Join-Path $path ($lane.name+'-archive.log'))
             if ((Get-FileHash -LiteralPath $reference).Hash -cne (Get-FileHash -LiteralPath $lane.archive).Hash) { throw 'backendArchiveCommitMismatch' }
         }
         $summary.runnerArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant()
