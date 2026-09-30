@@ -2,8 +2,8 @@
 
 package main
 
-// This is an acquisition experiment, not a production DB route. No runtime
-// caller, flag, environment switch, engine RPC, or canonical query is redirected.
+// Raw source acquisition and owned private SQLite namespace. Config/home/stateDb
+// retain their canonical source meaning; only inspection receives a private path.
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"testing"
 	"unsafe"
 )
 
@@ -23,13 +22,15 @@ type snapshotEntry struct {
 	Info syscall.ByHandleFileInformation
 	Hash string
 }
-type testSnapshot struct {
+type dbAcquisition struct {
 	Source, Private string
 	Dirs            []snapshotEntry
 	Files           map[string]snapshotEntry
 	Copies          map[string]syscall.ByHandleFileInformation
 	SID             string
 	Closed          bool
+	PrivateRemoved  bool
+	CloseErr        error
 }
 
 func snapshotIdentity(a, b syscall.ByHandleFileInformation) bool {
@@ -71,7 +72,7 @@ func snapshotOpen(path string, directory bool) (snapshotEntry, error) {
 	}
 	return snapshotEntry{File: f, Info: info}, nil
 }
-func (s *testSnapshot) lockDirs(path string) error {
+func (s *dbAcquisition) lockDirs(path string) error {
 	paths := []string{}
 	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
 		paths = append(paths, p)
@@ -161,8 +162,8 @@ func snapshotACL(path, sid string) error {
 	}
 	return fmt.Errorf("snapshot DACL descriptor too long")
 }
-func acquireTestSnapshot(source, private string, max int64, hook func(string) error, copyBytes func(io.Writer, io.Reader) (int64, error)) (s *testSnapshot, retErr error) {
-	s = &testSnapshot{Source: filepath.Clean(source), Private: filepath.Clean(private), Files: map[string]snapshotEntry{}, Copies: map[string]syscall.ByHandleFileInformation{}}
+func acquireSnapshot(source, private string, max int64, hook func(string) error, copyBytes func(io.Writer, io.Reader) (int64, error)) (s *dbAcquisition, retErr error) {
+	s = &dbAcquisition{Source: filepath.Clean(source), Private: filepath.Clean(private), Files: map[string]snapshotEntry{}, Copies: map[string]syscall.ByHandleFileInformation{}}
 	if !filepath.IsAbs(source) || !filepath.IsAbs(private) || filepath.Base(source) != "state_5.sqlite" || samePath(filepath.Dir(source), private) || max < 100 || max > limit {
 		return s, fmt.Errorf("snapshot arguments rejected")
 	}
@@ -297,7 +298,7 @@ func acquireTestSnapshot(source, private string, max int64, hook func(string) er
 	}
 	return s, s.Verify(max)
 }
-func (s *testSnapshot) Verify(max int64) error {
+func (s *dbAcquisition) Verify(max int64) error {
 	if s.Closed {
 		return fmt.Errorf("snapshot handles already drained")
 	}
@@ -312,6 +313,9 @@ func (s *testSnapshot) Verify(max int64) error {
 		}
 	}
 	for _, entry := range s.Dirs {
+		if entry.File == nil {
+			continue
+		}
 		info, e := snapshotInfo(entry.File, true)
 		if e != nil || !snapshotIdentity(info, entry.Info) {
 			return fmt.Errorf("snapshot ancestor changed: %v", e)
@@ -329,20 +333,34 @@ func (s *testSnapshot) Verify(max int64) error {
 	}
 	return nil
 }
-func (s *testSnapshot) Close(clean bool) error {
+func (s *dbAcquisition) Close(clean bool) error {
 	if s.Closed {
-		return nil
+		return s.CloseErr
 	}
-	s.Closed = true
 	var result error
+	// Private readers must already be drained. Source leases remain held through
+	// identity-checked cleanup, including errors; every lease is then drained.
+	if clean {
+		result = s.CleanupPrivate()
+	}
 	for _, entry := range s.Files {
 		result = errors.Join(result, entry.File.Close())
 	}
 	for i := len(s.Dirs) - 1; i >= 0; i-- {
-		result = errors.Join(result, s.Dirs[i].File.Close())
+		if s.Dirs[i].File != nil {
+			result = errors.Join(result, s.Dirs[i].File.Close())
+			s.Dirs[i].File = nil
+		}
 	}
-	if result != nil || !clean {
-		return result
+	s.Closed, s.CloseErr = true, result
+	return result
+}
+func (s *dbAcquisition) CleanupPrivate() error {
+	if s.Closed {
+		return fmt.Errorf("snapshot cleanup after source release")
+	}
+	if s.PrivateRemoved {
+		return nil
 	}
 	if e := noReparse(s.Private); e != nil {
 		return e
@@ -352,9 +370,11 @@ func (s *testSnapshot) Close(clean bool) error {
 		return e
 	}
 	privateSame := false
-	for _, dir := range s.Dirs {
-		if samePath(dir.File.Name(), s.Private) && snapshotIdentity(dir.Info, privateEntry.Info) {
+	privateIndex := -1
+	for i, dir := range s.Dirs {
+		if dir.File != nil && samePath(dir.File.Name(), s.Private) && snapshotIdentity(dir.Info, privateEntry.Info) {
 			privateSame = true
+			privateIndex = i
 		}
 	}
 	if e := privateEntry.File.Close(); e != nil {
@@ -389,21 +409,15 @@ func (s *testSnapshot) Close(clean bool) error {
 			return e
 		}
 	}
-	return os.Remove(s.Private)
-}
-
-func snapshotAcquire(t *testing.T, source string) *testSnapshot {
-	t.Helper()
-	s, e := acquireTestSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil)
-	if e != nil {
-		t.Fatal(e)
+	// Only the private directory's no-DELETE handle must be released to remove
+	// it. Source directories and private ancestors remain anchored until Close.
+	if e := s.Dirs[privateIndex].File.Close(); e != nil {
+		return e
 	}
-	t.Cleanup(func() {
-		if !s.Closed {
-			if e := s.Close(true); e != nil {
-				t.Error(e)
-			}
-		}
-	})
-	return s
+	s.Dirs[privateIndex].File = nil
+	if e := os.Remove(s.Private); e != nil {
+		return e
+	}
+	s.PrivateRemoved = true
+	return nil
 }

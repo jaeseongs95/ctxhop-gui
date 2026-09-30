@@ -174,7 +174,7 @@ func TestExportCanonicalSyntheticSchema(t *testing.T) {
 	if !filepath.IsAbs(output) || len(output) <= len(prefix) || !strings.EqualFold(output[:len(prefix)], prefix) || (!helper2Output && !helper3Output) {
 		t.Fatal("explicit fresh owned export output flag is required")
 	}
-	outputLocks := &testSnapshot{Files: map[string]snapshotEntry{}}
+	outputLocks := &dbAcquisition{Files: map[string]snapshotEntry{}}
 	defer func() {
 		if e := outputLocks.Close(false); e != nil {
 			t.Error(e)
@@ -207,7 +207,7 @@ func TestExportCanonicalSyntheticSchema(t *testing.T) {
 	if guardErr != nil {
 		guardResult = object{"status": "busy-or-unknown", "reasonCode": reason(guardErr)}
 	}
-	s, e := acquireTestSnapshot(canonicalSyntheticSource, filepath.Join(output, "private"), limit, nil, nil)
+	s, e := acquireSnapshot(canonicalSyntheticSource, filepath.Join(output, "private"), limit, nil, nil)
 	if e != nil {
 		t.Fatal(e)
 	}

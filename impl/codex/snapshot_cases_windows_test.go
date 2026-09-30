@@ -43,7 +43,7 @@ func snapshotFixture(t *testing.T, walOnly bool) string {
 
 // Opens only the explicit private snapshot; no production/checkDB redirect.
 // SELECT is the only SQL. SQLite may create private WAL/SHM, never source sidecars.
-func snapshotCount(s *testSnapshot) (count int, retErr error) {
+func snapshotCount(s *dbAcquisition) (count int, retErr error) {
 	system, e := systemDirectory()
 	if e != nil {
 		return 0, e
@@ -87,7 +87,7 @@ func snapshotCount(s *testSnapshot) (count int, retErr error) {
 	n, _, _ := dll.MustFindProc("sqlite3_column_int").Call(stmt, 0)
 	return int(n), nil
 }
-func snapshotRegisterSidecars(s *testSnapshot) error {
+func snapshotRegisterSidecars(s *dbAcquisition) error {
 	// Called only after the owned private SQLite connection has been drained.
 	for _, name := range []string{"state_5.sqlite-wal", "state_5.sqlite-shm"} {
 		entry, e := snapshotOpen(filepath.Join(s.Private, name), false)
@@ -197,7 +197,7 @@ func TestSnapshotRejectsJournalAndAbsentWALChange(t *testing.T) {
 				t.Fatal(e)
 			}
 		}
-		_, e := acquireTestSnapshot(filepath.Join(home, "state_5.sqlite"), filepath.Join(t.TempDir(), "private"), limit, nil, nil)
+		_, e := acquireSnapshot(filepath.Join(home, "state_5.sqlite"), filepath.Join(t.TempDir(), "private"), limit, nil, nil)
 		if e == nil {
 			t.Fatal("hot journal accepted")
 		}
@@ -206,7 +206,7 @@ func TestSnapshotRejectsJournalAndAbsentWALChange(t *testing.T) {
 		t.Run("absent-becomes-present"+suffix, func(t *testing.T) {
 			source := snapshotFixture(t, false)
 			private := filepath.Join(t.TempDir(), "private")
-			s, e := acquireTestSnapshot(source, private, limit, func(phase string) error {
+			s, e := acquireSnapshot(source, private, limit, func(phase string) error {
 				if phase == "copied" {
 					return os.WriteFile(source+suffix, nil, 0600)
 				}
@@ -259,7 +259,7 @@ func TestSnapshotPartialSizeAndFreshCreation(t *testing.T) {
 					return nil
 				}
 			}
-			s, e := acquireTestSnapshot(source, private, max, hook, copyBytes)
+			s, e := acquireSnapshot(source, private, max, hook, copyBytes)
 			if e == nil || !s.Closed {
 				t.Fatal("invalid copy accepted/handles retained", e)
 			}
@@ -307,6 +307,18 @@ func TestSnapshotSharingIdentityAndDrain(t *testing.T) {
 		t.Fatal("ancestor rename entered while held")
 	}
 	handle := syscall.Handle(s.Files["state_5.sqlite"].File.Fd())
+	if e := s.CleanupPrivate(); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := os.Stat(s.Private); !os.IsNotExist(e) {
+		t.Fatal("private namespace not removed before source release", e)
+	}
+	if writer, e := syscall.CreateFile(u, syscall.GENERIC_WRITE, 7, nil, syscall.OPEN_EXISTING, 0, 0); e != syscall.Errno(32) {
+		if e == nil {
+			syscall.CloseHandle(writer)
+		}
+		t.Fatal("source writer entered during private cleanup", e)
+	}
 	if e := s.Close(true); e != nil {
 		t.Fatal(e)
 	}
@@ -331,7 +343,7 @@ func TestSnapshotHardlinkReparseAndCleanupFailure(t *testing.T) {
 				if e := os.Link(source, filepath.Join(t.TempDir(), "alias")); e != nil {
 					t.Fatal(e)
 				}
-				if _, e := acquireTestSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil); e == nil {
+				if _, e := acquireSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil); e == nil {
 					t.Fatal("source hardlink accepted")
 				}
 				return
@@ -345,7 +357,7 @@ func TestSnapshotHardlinkReparseAndCleanupFailure(t *testing.T) {
 				if e := makeJunction(system, link, filepath.Dir(source)); e != nil {
 					t.Fatal(e)
 				}
-				if _, e := acquireTestSnapshot(filepath.Join(link, "state_5.sqlite"), filepath.Join(t.TempDir(), "private"), limit, nil, nil); e == nil {
+				if _, e := acquireSnapshot(filepath.Join(link, "state_5.sqlite"), filepath.Join(t.TempDir(), "private"), limit, nil, nil); e == nil {
 					t.Fatal("ancestor junction accepted")
 				}
 				return
@@ -406,7 +418,7 @@ func TestSnapshotMappingSharing(t *testing.T) {
 			if e := syscall.CloseHandle(h); e != nil {
 				t.Fatal(e)
 			}
-			s, e := acquireTestSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil)
+			s, e := acquireSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil)
 			if writable {
 				if e != nil {
 					if !errors.Is(e, syscall.Errno(32)) {
@@ -439,7 +451,7 @@ func TestSnapshotExistingWriterAndSQLiteHandoff(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	_, acquireErr := acquireTestSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil)
+	_, acquireErr := acquireSnapshot(source, filepath.Join(t.TempDir(), "private"), limit, nil, nil)
 	if e := syscall.CloseHandle(writer); e != nil {
 		t.Fatal(e)
 	}
