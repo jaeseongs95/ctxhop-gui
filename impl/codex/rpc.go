@@ -297,6 +297,9 @@ func (s *session) bind() {
 	s.Binding["operation"] = s.Operation
 }
 func (s *session) complete(observed dbView) error {
+	if observed.Acquisition != nil && observed.Acquisition.Aggregate != nil {
+		return fail("engine_db_unknown", "v2 aggregate proof/catalog/schema 연결 전 complete 금지")
+	}
 	if s.Projection["inputComplete"] == true {
 		return nil
 	}

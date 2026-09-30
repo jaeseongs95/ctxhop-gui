@@ -37,6 +37,7 @@ type dbAcquisition struct {
 	ID              string
 	SourceDir       syscall.ByHandleFileInformation
 	PrivateDir      syscall.ByHandleFileInformation
+	Aggregate       *storeAcquisition
 }
 
 func snapshotIdentity(a, b syscall.ByHandleFileInformation) bool {
@@ -199,25 +200,42 @@ func pinSnapshotSource(source string, max int64) (s *dbAcquisition, retErr error
 		return s, e
 	}
 	s.SourceDir = s.Dirs[len(s.Dirs)-1].Info
-	if e := snapshotAbsent(source + "-journal"); e != nil {
-		return s, e // any rollback journal is conservative failure
+	return s, s.pinSourceFiles(max, false)
+}
+
+// The aggregate owns source ancestors; this phase owns only these file handles.
+func (s *dbAcquisition) pinSourceFiles(max int64, allowMissing bool) error {
+	if s.Pinned || s.Closed || !filepath.IsAbs(s.Source) || !snapshotCanonicalBase(filepath.Base(s.Source)) {
+		return fmt.Errorf("snapshot file pin phase/arguments rejected")
 	}
-	base := filepath.Base(source)
+	if e := snapshotAbsent(s.Source + "-journal"); e != nil {
+		return e // any rollback journal is conservative failure
+	}
+	base := filepath.Base(s.Source)
 	for _, name := range []string{base, base + "-wal", base + "-shm"} {
-		entry, e := snapshotOpen(filepath.Join(filepath.Dir(source), name), false)
+		entry, e := snapshotOpen(filepath.Join(filepath.Dir(s.Source), name), false)
+		if name == base && allowMissing && e == syscall.ERROR_FILE_NOT_FOUND {
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				if e := snapshotAbsent(s.Source + suffix); e != nil {
+					return e
+				}
+			}
+			s.Pinned = true
+			return nil
+		}
 		if name != base && e == syscall.ERROR_FILE_NOT_FOUND {
 			continue
 		}
 		if e != nil {
-			return s, e
+			return e
 		}
 		s.Files[name] = entry
 	}
 	if _, e := s.sourceBytes(max); e != nil {
-		return s, e
+		return e
 	}
 	s.Pinned = true
-	return s, nil
+	return nil
 }
 
 // Unsigned metadata and subtraction avoid overflow before any byte is read.
@@ -248,36 +266,56 @@ func (s *dbAcquisition) createPrivate(private string) error {
 	if !s.Pinned || s.Closed || s.PrivateCreated || s.Finalized || !filepath.IsAbs(private) || within(filepath.Dir(s.Source), private) || within(private, filepath.Dir(s.Source)) {
 		return fmt.Errorf("snapshot private phase/arguments rejected")
 	}
-	s.Private = filepath.Clean(private)
 	if e := s.lockDirs(filepath.Dir(private)); e != nil {
 		return e
 	}
+	return s.createPrivateDirectory(private)
+}
+
+// An aggregate already owns the private root and its ancestors.
+func (s *dbAcquisition) createPrivateDirectory(private string) error {
+	if !s.Pinned || s.Closed || s.PrivateCreated || s.Finalized || !filepath.IsAbs(private) || within(filepath.Dir(s.Source), private) || within(private, filepath.Dir(s.Source)) {
+		return fmt.Errorf("snapshot private phase/arguments rejected")
+	}
+	s.Private = filepath.Clean(private)
+	entry, sid, created, e := createSnapshotDirectory(s.Private)
+	s.SID, s.PrivateCreated = sid, created
+	if entry.File != nil {
+		s.Dirs = append(s.Dirs, entry)
+		s.PrivateDir = entry.Info
+	}
+	return e
+}
+
+// Return the ownership/handle even on post-creation failure, for safe draining.
+func createSnapshotDirectory(path string) (entry snapshotEntry, sid string, created bool, retErr error) {
 	sid, sd, e := snapshotSecurity()
 	if e != nil {
-		return e
+		return entry, sid, false, e
 	}
 	defer proc("LocalFree").Call(uintptr(unsafe.Pointer(sd)))
-	s.SID = sid
 	sa := syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: uintptr(unsafe.Pointer(sd))}
-	u, _ := syscall.UTF16PtrFromString(private)
+	u, e := syscall.UTF16PtrFromString(path)
+	if e != nil {
+		return entry, sid, false, e
+	}
 	r, _, e := proc("CreateDirectoryW").Call(uintptr(unsafe.Pointer(u)), uintptr(unsafe.Pointer(&sa)))
 	if r == 0 {
-		return e
+		return entry, sid, false, e
 	}
-	s.PrivateCreated = true
-	if e := s.lockDirs(private); e != nil {
-		return e
+	entry, e = snapshotOpen(path, true)
+	if e != nil {
+		return entry, sid, true, e
 	}
-	s.PrivateDir = s.Dirs[len(s.Dirs)-1].Info
-	if e := snapshotACL(private, sid); e != nil {
-		return e // before any private bytes are written
-	}
-	return nil
+	return entry, sid, true, snapshotACL(path, sid) // before any private bytes
 }
 
 func (s *dbAcquisition) finalizeCopy(max int64, copyBytes func(io.Writer, io.Reader) (int64, error)) error {
 	if !s.Pinned || !s.PrivateCreated || s.Finalized || s.Closed {
 		return fmt.Errorf("snapshot finalize phase rejected")
+	}
+	if s.Aggregate != nil && (!s.Aggregate.Pinned || !s.Aggregate.PrivatePrepared || s.Aggregate.Closed || s.Aggregate.Draining) {
+		return fmt.Errorf("snapshot finalize before aggregate pin/private barrier")
 	}
 	if e := s.verifySourceMetadata(max); e != nil {
 		return e
@@ -424,6 +462,11 @@ func (s *dbAcquisition) verifySourceMetadata(max int64) error {
 	if e := snapshotAbsent(s.Source + "-journal"); e != nil {
 		return e
 	}
+	if _, exists := s.Files[filepath.Base(s.Source)]; !exists {
+		if e := snapshotAbsent(s.Source); e != nil {
+			return e
+		}
+	}
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if _, exists := s.Files[filepath.Base(s.Source)+suffix]; !exists {
 			if e := snapshotAbsent(s.Source + suffix); e != nil {
@@ -431,14 +474,8 @@ func (s *dbAcquisition) verifySourceMetadata(max int64) error {
 			}
 		}
 	}
-	for _, entry := range s.Dirs {
-		if entry.File == nil {
-			continue
-		}
-		info, e := snapshotInfo(entry.File, true)
-		if e != nil || !snapshotIdentity(info, entry.Info) {
-			return fmt.Errorf("snapshot ancestor changed: %v", e)
-		}
+	if e := verifySnapshotDirectories(s.Dirs); e != nil {
+		return e
 	}
 	for _, entry := range s.Files {
 		info, e := snapshotInfo(entry.File, false)
@@ -448,6 +485,19 @@ func (s *dbAcquisition) verifySourceMetadata(max int64) error {
 	}
 	_, e := s.sourceBytes(max)
 	return e
+}
+
+func verifySnapshotDirectories(dirs []snapshotEntry) error {
+	for _, entry := range dirs {
+		if entry.File == nil {
+			continue
+		}
+		info, e := snapshotInfo(entry.File, true)
+		if e != nil || !snapshotIdentity(info, entry.Info) {
+			return fmt.Errorf("snapshot ancestor changed: %v", e)
+		}
+	}
+	return nil
 }
 
 func (s *dbAcquisition) verifySourceBytes(max int64) error {
@@ -477,9 +527,21 @@ func (s *dbAcquisition) Observation() (object, error) {
 	if filepath.Base(s.Source) != "state_5.sqlite" {
 		return nil, fmt.Errorf("v1 observation requires state acquisition")
 	}
+	if !s.privateCopyReady() {
+		return nil, fmt.Errorf("snapshot aggregate/private copy not finalized")
+	}
 	if e := s.Verify(limit); e != nil {
 		return nil, e
 	}
+	var wal any
+	if entry, exists := s.Files["state_5.sqlite-wal"]; exists {
+		wal = entry.Hash
+	}
+	return object{"stateDb": s.Source, "mainSha256": s.Files["state_5.sqlite"].Hash, "walSha256": wal, "acquisition": s.acquisitionObservation()}, nil
+}
+
+func (s *dbAcquisition) acquisitionObservation() object {
+	base := filepath.Base(s.Source)
 	describe := func(name string, private bool) any {
 		entry, exists := s.Files[name]
 		if !exists {
@@ -491,23 +553,22 @@ func (s *dbAcquisition) Observation() (object, error) {
 		}
 		return object{"identity": snapshotFileID(info), "size": snapshotSize(info), "sha256": entry.Hash}
 	}
-	main := s.Files["state_5.sqlite"]
-	var wal any
-	if entry, exists := s.Files["state_5.sqlite-wal"]; exists {
-		wal = entry.Hash
-	}
-	return object{"stateDb": s.Source, "mainSha256": main.Hash, "walSha256": wal, "acquisition": object{
+	return object{
 		"schemaVersion": 1, "acquisitionId": s.ID,
-		"source":                object{"directoryIdentity": snapshotFileID(s.SourceDir), "main": describe("state_5.sqlite", false), "wal": describe("state_5.sqlite-wal", false), "shm": describe("state_5.sqlite-shm", false)},
-		"private":               object{"directory": s.Private, "directoryIdentity": snapshotFileID(s.PrivateDir), "main": describe("state_5.sqlite", true), "wal": describe("state_5.sqlite-wal", true)},
+		"source":                object{"directoryIdentity": snapshotFileID(s.SourceDir), "main": describe(base, false), "wal": describe(base+"-wal", false), "shm": describe(base+"-shm", false)},
+		"private":               object{"directory": s.Private, "directoryIdentity": snapshotFileID(s.PrivateDir), "main": describe(base, true), "wal": describe(base+"-wal", true)},
 		"rollbackJournalAbsent": true,
-	}}, nil
+	}
+}
+
+func (s *dbAcquisition) privateCopyReady() bool {
+	return s.Finalized && s.PrivateCreated && !s.Closed && !s.PrivateRemoved && (s.Aggregate == nil || s.Aggregate.Finalized && !s.Aggregate.Closed && !s.Aggregate.Draining)
 }
 
 // Run only after every Go/provider private reader has closed. Register permitted
 // private sidecars without changing the original presence captured by Files.
 func (s *dbAcquisition) VerifyPrivate() error {
-	if !s.Finalized || !s.PrivateCreated || s.Closed || s.PrivateRemoved {
+	if !s.privateCopyReady() {
 		return fmt.Errorf("snapshot private copy not finalized or namespace drained")
 	}
 	base := filepath.Base(s.Source)
@@ -556,6 +617,9 @@ func (s *dbAcquisition) VerifyPrivate() error {
 // Fresh raw-only source acquisition after private cleanup/source release. This
 // observes a handoff gap; it does not turn the observation into a writer lease.
 func (s *dbAcquisition) VerifyReleasedSource() (retErr error) {
+	if s.Aggregate != nil {
+		return fmt.Errorf("aggregate freshness requires whole source repin")
+	}
 	if !s.Finalized || !s.Closed || s.CloseErr != nil || !s.PrivateRemoved {
 		return fmt.Errorf("snapshot source handoff before successful cleanup/drain")
 	}
@@ -600,6 +664,9 @@ func (s *dbAcquisition) Close(clean bool) error {
 // A set owner calls this only after all members' private cleanup has finished.
 // Pin failures also use it; it never starts cleanup or reads source bytes.
 func (s *dbAcquisition) releaseLeases() error {
+	if s.Aggregate != nil && !s.Aggregate.releasing {
+		return fmt.Errorf("source lease release belongs to aggregate owner")
+	}
 	if s.Closed {
 		return s.CloseErr
 	}
@@ -616,18 +683,47 @@ func (s *dbAcquisition) releaseLeases() error {
 	return s.CloseErr
 }
 func (s *dbAcquisition) CleanupPrivate() error {
+	if s.Aggregate != nil && !s.Aggregate.Draining {
+		return fmt.Errorf("private cleanup belongs to aggregate owner")
+	}
 	if !s.PrivateCreated || s.Closed {
 		return fmt.Errorf("snapshot cleanup before private creation or after source release")
 	}
 	if s.PrivateRemoved {
 		return nil
 	}
-	if e := noReparse(s.Private); e != nil {
+	entries, privateIndex, e := s.checkPrivateCleanup()
+	if e != nil {
 		return e
+	}
+	for _, item := range entries {
+		if e := os.Remove(filepath.Join(s.Private, item.Name())); e != nil {
+			return e
+		}
+	}
+	// Release this private kind's no-DELETE handle, keeping source/root anchors.
+	if e := s.Dirs[privateIndex].File.Close(); e != nil {
+		return e
+	}
+	s.Dirs[privateIndex].File = nil
+	if e := os.Remove(s.Private); e != nil {
+		return e
+	}
+	s.PrivateRemoved = true
+	return nil
+}
+
+// An aggregate calls this for every kind before deleting any private file.
+func (s *dbAcquisition) checkPrivateCleanup() ([]os.DirEntry, int, error) {
+	if !s.PrivateCreated || s.PrivateRemoved || s.Closed {
+		return nil, -1, fmt.Errorf("snapshot private cleanup preflight phase rejected")
+	}
+	if e := noReparse(s.Private); e != nil {
+		return nil, -1, e
 	}
 	privateEntry, e := snapshotOpen(s.Private, true)
 	if e != nil {
-		return e
+		return nil, -1, e
 	}
 	privateSame := false
 	privateIndex := -1
@@ -638,47 +734,32 @@ func (s *dbAcquisition) CleanupPrivate() error {
 		}
 	}
 	if e := privateEntry.File.Close(); e != nil {
-		return e
+		return nil, -1, e
 	}
 	if !privateSame {
-		return fmt.Errorf("snapshot cleanup directory identity changed")
+		return nil, -1, fmt.Errorf("snapshot cleanup directory identity changed")
 	}
 	entries, e := os.ReadDir(s.Private)
 	if e != nil {
-		return e
+		return nil, -1, e
 	}
 	base := filepath.Base(s.Source)
 	for _, item := range entries {
 		name := item.Name()
 		if name != base && name != base+"-wal" && name != base+"-shm" {
-			return fmt.Errorf("snapshot cleanup refused unknown entry: %s", name)
+			return nil, -1, fmt.Errorf("snapshot cleanup refused unknown entry: %s", name)
 		}
 		entry, e := snapshotOpen(filepath.Join(s.Private, name), false)
 		if e != nil {
-			return e
+			return nil, -1, e
 		}
 		original, exists := s.Copies[name]
 		if !exists || !snapshotIdentity(original, entry.Info) {
-			return errors.Join(fmt.Errorf("snapshot cleanup identity changed"), entry.File.Close())
+			return nil, -1, errors.Join(fmt.Errorf("snapshot cleanup identity changed"), entry.File.Close())
 		}
 		if e = entry.File.Close(); e != nil {
-			return e
+			return nil, -1, e
 		}
 	}
-	for _, item := range entries {
-		if e := os.Remove(filepath.Join(s.Private, item.Name())); e != nil {
-			return e
-		}
-	}
-	// Only the private directory's no-DELETE handle must be released to remove
-	// it. Source directories and private ancestors remain anchored until Close.
-	if e := s.Dirs[privateIndex].File.Close(); e != nil {
-		return e
-	}
-	s.Dirs[privateIndex].File = nil
-	if e := os.Remove(s.Private); e != nil {
-		return e
-	}
-	s.PrivateRemoved = true
-	return nil
+	return entries, privateIndex, nil
 }

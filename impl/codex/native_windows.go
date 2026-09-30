@@ -468,7 +468,7 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 
 func inspectPrivateState(s *dbAcquisition, members []member) (v dbView, retErr error) {
 	v = dbView{IDs: map[string]bool{}}
-	if s == nil || !s.Finalized || !s.PrivateCreated || s.Closed || s.PrivateRemoved || filepath.Base(s.Source) != "state_5.sqlite" {
+	if s == nil || !s.privateCopyReady() || filepath.Base(s.Source) != "state_5.sqlite" {
 		return v, fail("engine_db_unknown", "finalized state private acquisition 누락")
 	}
 	statePath := s.Source
