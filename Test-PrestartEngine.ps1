@@ -7,12 +7,14 @@ File snapshots detect final differences; they do not prove absence of transient
 writes or networking. Engine effects require independent complete observation.
 #>
 param(
-    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','Engine')][string]$Mode='SelfTest',
+    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','MigrationCheck','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
     [string]$SourceArchive,
     [string]$SourceCommit,
     [string]$SchemaReceipt,
     [string]$StateMigrations,
+    [string]$BuilderScript,
+    [string]$MigrationArchive,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -336,6 +338,109 @@ function Invoke-SyntheticSchemaComparison([string]$Root,[string]$ReceiptFile,[st
     Write-FixtureJson (Join-Path $path 'migration-comparison.json') $comparison
     return [ordered]@{schemaVersion=1;purpose='postprocess existing synthetic schema receipt';runnerStatus='passed';engineExecuted=$false;traceStarted=$false;engineAcceptance='notRun';sourceSQLiteOpens=0;privateSQLiteOpens=0;exportReused=$true;exportSha256=(Get-FileHash -LiteralPath $inputPath).Hash.ToLowerInvariant();runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant();objectCount=@($export.objects).Count;migrationCount=58;allMigrationsMatchLf=$comparison.allMatchLf;allMigrationsMatchCrlf=$comparison.allMatchCrlf;productionGuardObservation=$export.productionGuardObservation;absoluteWriterExclusion=$export.absoluteWriterExclusion;dll=$export.dll;runtimeCompatibility='notTested'}
 }
+function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Builder,[string]$MigrationsArchive,[string]$ReceiptFile) {
+    $path=Assert-OwnedFixturePath $Root
+    $archivePath=Assert-OwnedFixturePath $Archive
+    $builderPath=Assert-OwnedFixturePath $Builder
+    $migrationTar=Assert-OwnedFixturePath $MigrationsArchive
+    $inputPath=Assert-OwnedFixturePath $ReceiptFile
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or -not [string]::Equals($PSScriptRoot,(Join-Path (Split-Path $archivePath) 'source'),[StringComparison]::OrdinalIgnoreCase)) { throw 'migrationFixedRunnerRequired' }
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    $builderHash=(Get-FileHash -LiteralPath $builderPath).Hash.ToLowerInvariant()
+    $migrationHash=(Get-FileHash -LiteralPath $migrationTar).Hash.ToLowerInvariant()
+    $exportHash=(Get-FileHash -LiteralPath $inputPath).Hash.ToLowerInvariant()
+    if ($builderHash -cne '2e3ef406f69088ea70fff5ebd3a7c374eff46568ce052cc7e6f95e8a50586ab8' -or
+        $migrationHash -cne '72a21d180a090593d4cafdd4c982ed222a840f1245b2648592bbf232c8e181e9' -or
+        $exportHash -cne 'd48353071f9d9e9f178a8cb836e2a72732a43cf666cf1b892972b9cba0be6032') { throw 'migrationPinnedInputMismatch' }
+    $export=Get-Content -LiteralPath $inputPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-SyntheticSchemaReceipt $export
+    $builderText=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($builderPath))
+    if ($builderText.Contains("`r") -or $builderText.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) { throw 'migrationBuilderNotLf' }
+    $tokens=$null; $parseErrors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseInput($builderText,[ref]$tokens,[ref]$parseErrors)
+    $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Convert-EngineMigrationLineEndings'},$true))
+    if ($parseErrors.Count -ne 0 -or $functions.Count -ne 1) { throw 'migrationBuilderFunctionInvalid' }
+    # Execute only the reviewed function extent. Builder top-level build code is never invoked.
+    . ([scriptblock]::Create($functions[0].Extent.Text))
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $receipt=[ordered]@{schemaVersion=1;purpose='fixed builder migration byte checks';runnerStatus='failed';sourceCommit=$Commit;builderCommit='21e120fa17d5e291965b1e18c20df269a57b327f';vendorCommit='ff6aec96948b70d94983af2641a6b67c94faeff5';builderSha256=$builderHash;migrationArchiveSha256=$migrationHash;exportSha256=$exportHash;exportReused=$true;exportRepeats=0;sourceSQLiteOpens=0;privateSQLiteOpens=0;engineExecuted=$false;engineAcceptance='notRun';compileExecuted=$false;runtimeCompatibility='notTested';productionAtomicity='notEstablished'}
+    try {
+        $reference=Join-Path $path 'runner-reference.tar'
+        Invoke-SchemaCommand 'git' @('-C','D:\claude\세션인계\ctxhop-work-20260927\ctxhop-gui','-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$Commit) (Join-Path $path 'runner-archive.log')
+        $receipt.runnerArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant()
+        if ((Get-FileHash -LiteralPath $reference).Hash.ToLowerInvariant() -cne $receipt.runnerArchiveSha256) { throw 'migrationRunnerArchiveMismatch' }
+        $receipt.runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
+        $pristine=Join-Path $path 'pristine'
+        [IO.Directory]::CreateDirectory($pristine) | Out-Null
+        # Archive digest is pinned before extraction; every extracted path is then inventoried.
+        Invoke-SchemaCommand 'tar' @('-xf',$migrationTar,'-C',$pristine) (Join-Path $path 'state-extract.log')
+        $before=Get-FixtureTree $pristine
+        $comparison=Get-SchemaMigrationComparison @($export.migrations) (Join-Path $pristine 'codex-rs/state/migrations')
+        Assert-Fixture ($comparison.allMatchCrlf -and -not $comparison.allMatchLf) '58 expected CRLF checksums'
+        $groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
+        $groupChecks=@()
+        foreach ($group in $groups) {
+            $files=@(Get-ChildItem -LiteralPath (Join-Path $pristine "codex-rs/state/$group") -File)
+            Assert-Fixture ($files.Count -gt 0) "migration group present: $group"
+            foreach ($file in $files) {
+                $text=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($file.FullName))
+                Assert-Fixture (-not $text.Contains("`r") -and -not $text.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) "LF input: $($file.Name)"
+            }
+            $groupChecks+=[ordered]@{group=$group;fileCount=$files.Count;before='LF/noBOM';after='pending'}
+        }
+        $positive=Join-Path $path 'positive'
+        Copy-Item -LiteralPath $pristine -Destination $positive -Recurse
+        $actual=@(Convert-EngineMigrationLineEndings $positive)
+        Assert-Fixture ($actual.Count -eq ($groupChecks | Measure-Object fileCount -Sum).Sum) 'all six groups returned'
+        $stateCount=0
+        foreach ($row in $actual) {
+            $file=Join-Path $positive $row.path
+            $text=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($file))
+            Assert-Fixture ($text.Contains("`r`n") -and -not $text.Replace("`r`n",'').Contains("`r") -and -not $text.Replace("`r`n",'').Contains("`n") -and -not $text.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) "CRLF output: $($row.path)"
+            Assert-Fixture ($row.lfSha256 -ceq $before[$row.path].sha256 -and $row.crlfSha256 -ceq (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant() -and $row.sqlxSha384 -ceq (Get-FileHash -LiteralPath $file -Algorithm SHA384).Hash.ToLowerInvariant()) "builder receipt hashes: $($row.path)"
+            if ($row.path.StartsWith('codex-rs/state/migrations/',[StringComparison]::Ordinal)) {
+                $version=[int]([IO.Path]::GetFileName($file).Substring(0,4))
+                $expected=@($export.migrations | Where-Object version -eq $version)
+                Assert-Fixture ($expected.Count -eq 1 -and $row.sqlxSha384 -ceq $expected[0].checksum.ToLowerInvariant()) "actual state checksum: $version"
+                $stateCount++
+            }
+        }
+        Assert-Fixture ($stateCount -eq 58) '58 actual state checksums match'
+        foreach ($group in $groupChecks) { $group.after='CRLF/noBOM' }
+        Write-FixtureJson (Join-Path $path 'normalized-migrations.json') $actual
+        $negative=@()
+        foreach ($kind in @('directory','file','crlf','bom','second-pass')) {
+            $caseRoot=Join-Path $path ('negative-'+$kind)
+            $copyFrom=if ($kind -ceq 'second-pass') { $positive } else { $pristine }
+            Copy-Item -LiteralPath $copyFrom -Destination $caseRoot -Recurse
+            $first=(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'codex-rs/state/migrations') -File | Sort-Object Name | Select-Object -First 1).FullName
+            $reason='migration source must be committed LF without BOM'
+            if ($kind -ceq 'directory') {
+                $declaration=Join-Path $caseRoot 'codex-rs/state/src/migrations.rs'
+                $text=[IO.File]::ReadAllText($declaration)
+                Write-FixtureText $declaration ($text.Replace('migrate!("./logs_migrations")','migrate!("./unreviewed_migrations")'))
+                $reason='unreviewed migration directory'
+            } elseif ($kind -ceq 'file') {
+                Write-FixtureText (Join-Path $caseRoot 'codex-rs/state/migrations/0000_unreviewed-file.sql') "SELECT 1;`n"
+                $reason='unreviewed migration file'
+            } elseif ($kind -ceq 'crlf') {
+                [IO.File]::WriteAllText($first,[IO.File]::ReadAllText($first).Replace("`n","`r`n"),$script:Utf8)
+            } elseif ($kind -ceq 'bom') {
+                [IO.File]::WriteAllText($first,([string][char]0xfeff+[IO.File]::ReadAllText($first)),$script:Utf8)
+            }
+            $observed=$null
+            try { Convert-EngineMigrationLineEndings $caseRoot | Out-Null } catch { $observed=$_.Exception.Message }
+            Assert-Fixture ($observed -ceq $reason) "negative rejected: $kind"
+            $negative+=[ordered]@{case=$kind;status='passed';reason=$observed;casePreserved=$true;atomicityClaim=$false}
+        }
+        $pristineComparison=Compare-FixtureTree $before (Get-FixtureTree $pristine)
+        Assert-Fixture $pristineComparison.unchanged 'pristine archive bytes unchanged'
+        $receipt.groups=$groupChecks; $receipt.normalizedCount=$actual.Count; $receipt.stateMigrationCount=$stateCount
+        $receipt.negativeCases=$negative; $receipt.runnerChecks=$script:FixtureChecks; $receipt.runnerStatus='passed'
+    } catch { $receipt.error=$_.Exception.Message; throw } finally { Write-FixtureJson (Join-Path $path 'migration-check-result.json') $receipt }
+    return $receipt
+}
+
 function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
@@ -417,6 +522,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
