@@ -836,6 +836,11 @@ function Invoke-ConversationJob([object]$Job) {
         Preview {
             $preview=Invoke-Vendor $Job 'preview' $ids
             $result=@{message=[string]$preview.message;preview=$preview.view;receipt=$preview.receipt;token=$preview.token;project=@{state='off'}}
+            if ($Job.agent -ceq 'codex-desktop') {
+                foreach ($config in @($preview.view.projectConfig)) {
+                    if ($config.path -is [string] -and ($config.applied -eq $true -or $config.warning)) { $result.message+=T 'WkCodexProjectConfig' $config.path }
+                }
+            }
             # 복원을 고를 수 있는 대화만 프로젝트 파일을 받아 비교한다. 프로젝트 파일을 읽지 못해도 대화 미리보기는 그대로 보인다.
             if ($Job.projectRestore -and @($preview.choices) -ccontains 'incoming') {
                 $stage=New-DesktopStage

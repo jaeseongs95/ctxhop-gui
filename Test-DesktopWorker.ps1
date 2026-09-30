@@ -86,6 +86,53 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         default { throw 'unexpected backend operation' }
     }
 }
+# Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
+$script:GoState='exists'; $script:GoFail=$false
+function Invoke-DesktopGo([string[]]$Arguments) {
+    $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
+    switch ($Arguments[0]) {
+        plan {
+            if ($script:GoState -ceq 'failure') {
+                $e=[InvalidOperationException]::new('synthetic prestart failure')
+                $e.Data['backendResult']=[pscustomobject]@{error='synthetic prestart failure';reasonCode='engine_db_unknown';pending=@()}
+                $e.Data['reasonCode']='engine_db_unknown'; throw $e
+            }
+            return [pscustomobject]@{status=$script:GoState;reason='fixture_go_plan';reasonCode='fixture_go_plan';token=('a'*64);source=@{sessionId=$script:Id};target=@{};projectConfig=@(@{path='D:\synthetic-project\.codex\config.toml';applied=$true;warning=$null})}
+        }
+        import {
+            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
+            $run=Join-Path $home (".ctxhop-desktop-recovery\"+$op)
+            $null=[IO.Directory]::CreateDirectory($run)
+            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$home;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
+            if ($script:GoFail) {
+                $e=[InvalidOperationException]::new('synthetic Go placement failure')
+                $e.Data['backendResult']=[pscustomobject]@{error='synthetic Go placement failure';reasonCode='fixture_interrupted';pending=@($op)}
+                $e.Data['reasonCode']='fixture_interrupted'; throw $e
+            }
+            return @{status='imported';pending=@()}
+        }
+        rollback {
+            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
+            $journal=Join-Path $home ".ctxhop-desktop-recovery\$op\journal.json"
+            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
+            Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
+            $record.status='rolled_back'
+            [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
+            return @{status='rolled_back'}
+        }
+        guard {
+            if ($script:GuardOpen) {
+                $e=[InvalidOperationException]::new('synthetic active Codex writer')
+                $e.Data['backendResult']=[pscustomobject]@{status='busy';reasonCode='busy';error='synthetic active Codex writer'}
+                throw $e
+            }
+            return @{status='closed'}
+        }
+        default { throw 'unexpected Go operation' }
+    }
+}
 function Invoke-Bundle([string[]]$Arguments) {
     $script:Calls+=,[pscustomobject]@{kind='bundle';arguments=$Arguments}
     switch ($Arguments[0]) {
@@ -179,7 +226,7 @@ try {
     $script:GuardOpen=$false
     $g=Invoke-Vendor $guardJob 'guard' @{}
     Assert ($g.status -ceq 'ok') 'Codex guard is ok when no engine or IDE is open'
-    Assert ($script:Calls[-1].arguments[0] -ceq 'guard' -and $script:Calls[-1].arguments[[array]::IndexOf($script:Calls[-1].arguments,'--home')+1] -ceq $desktopRoot) 'Codex guard asks the backend for the target home'
+    Assert ($script:Calls[-1].arguments[0] -ceq 'guard' -and $script:Calls[-1].arguments[[array]::IndexOf($script:Calls[-1].arguments,'--home')+1] -ceq $desktopRoot) 'Codex guard asks Go for the target home'
     $script:GuardOpen=$true
     $failure=$null; try { $null=Invoke-Vendor $guardJob 'guard' @{} } catch { $failure=$_ }
     Assert ($failure.Exception.Data['vendorResult'].status -ceq 'busy' -and $failure.Exception.Data['vendorResult'].reasonCode -ceq 'engine_open') 'an open Codex engine makes guard busy'
@@ -336,6 +383,42 @@ try {
             Throws {Invoke-JobCore $job} '호환 불가'
         }
     }
+    # A frozen receipt keeps its route even if the next preview would choose another route.
+    foreach ($state in @('exists','unsupported')) {
+        $script:GoState=$state; $script:State='conflict'; $job.action='Preview'; $before=$script:Calls.Count
+        $goPreview=Invoke-JobCore $job
+        $route=Get-Content -LiteralPath $goPreview.receipt -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert ($route.route -ceq 'python' -and $route.reasonCode -ceq 'fixture_go_plan') "$state explicitly chooses Python and records the reason"
+        Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'backend' -and $_.arguments[0] -ceq 'inspect'}).Count -eq 1) "$state invokes inspect once"
+    }
+    foreach ($state in @('failure','invalid','blocked')) {
+        $script:GoState=$state; $job.action='Preview'; $before=$script:Calls.Count
+        $goPreview=Invoke-JobCore $job
+        Assert ($goPreview.preview.status -ceq 'blocked') "$state blocks the preview"
+        Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) "$state never falls back to Python"
+    }
+    $script:GoState='new'; $job.action='Preview'; $before=$script:Calls.Count; $goPreview=Invoke-JobCore $job
+    $route=Get-Content -LiteralPath $goPreview.receipt -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert ($route.route -ceq 'go' -and $route.token -ceq ('a'*64)) 'new Go receipt binds the exact route and token'
+    Assert ($goPreview.message -match '대상 프로젝트의 Codex 설정') 'applied project settings are visible in the preview'
+    Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go new preview does not invoke Python'
+    $job.action='Restore'; $job.receipt=$goPreview.receipt; $job.token=$goPreview.token; $job.choice='incoming'
+    $script:GoState='exists'; $before=$script:Calls.Count
+    $null=Invoke-JobCore $job
+    Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'import'}).Count -eq 1) 'restore uses the receipt Go route after the plan state changed'
+    Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go restore never invokes Python'
+    $script:GoState='new'; $job.action='Preview'; $goPreview=Invoke-JobCore $job
+    $job.action='Restore'; $job.receipt=$goPreview.receipt; $job.token=$goPreview.token; $script:GoFail=$true; $before=$script:Calls.Count
+    $failure=$null; try {$null=Invoke-JobCore $job} catch {$failure=$_}
+    Assert ($null -ne $failure -and $failure.Exception.Data['vendorResult'].recovery -ceq 'required') 'interrupted Go import requires recovery'
+    Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go import failure never applies with Python'
+    $goRecord=@((Get-DesktopRecordRows $desktopRoot) | Where-Object impl -eq 'ctxhop-codex')[0]
+    Assert ($goRecord.state -ceq 'pending' -and $goRecord.canRollback) 'Go pending record is available for explicit rollback'
+    $before=$script:Calls.Count
+    $null=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$goRecord.operationId}
+    Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'rollback'}).Count -eq 1) 'Go record rollback invokes Go'
+    Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go rollback never invokes Python'
+    $script:GoFail=$false; $script:GoState='exists'
     $script:State='conflict'; $job.action='Preview'; $r=Invoke-JobCore $job
     $job.action='Restore'; $job.receipt=$r.receipt; $job.token=$r.preview.token; $job.choice='incoming'; $script:ApplyFail=$true
     $failure=$null; try {Invoke-JobCore $job} catch {$failure=$_}
@@ -368,7 +451,54 @@ try {
         $stagingBefore=(@(Get-ChildItem -LiteralPath $staging -Force | ForEach-Object Name | Sort-Object)) -join '|'
         function Test-StagingClean { return ((@(Get-ChildItem -LiteralPath $staging -Force | ForEach-Object Name | Sort-Object)) -join '|') -eq $stagingBefore }
         $script:Store=[ordered]@{}; $script:PutCount=0; $script:ApplyStatus='imported'
-        function Invoke-Bundle([string[]]$Arguments) {
+        # Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
+$script:GoState='exists'; $script:GoFail=$false
+function Invoke-DesktopGo([string[]]$Arguments) {
+    $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
+    switch ($Arguments[0]) {
+        plan {
+            if ($script:GoState -ceq 'failure') {
+                $e=[InvalidOperationException]::new('synthetic prestart failure')
+                $e.Data['backendResult']=[pscustomobject]@{error='synthetic prestart failure';reasonCode='engine_db_unknown';pending=@()}
+                $e.Data['reasonCode']='engine_db_unknown'; throw $e
+            }
+            return [pscustomobject]@{status=$script:GoState;reason='fixture_go_plan';reasonCode='fixture_go_plan';token=('a'*64);source=@{sessionId=$script:Id};target=@{};projectConfig=@(@{path='D:\synthetic-project\.codex\config.toml';applied=$true;warning=$null})}
+        }
+        import {
+            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
+            $run=Join-Path $home (".ctxhop-desktop-recovery\"+$op)
+            $null=[IO.Directory]::CreateDirectory($run)
+            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$home;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
+            if ($script:GoFail) {
+                $e=[InvalidOperationException]::new('synthetic Go placement failure')
+                $e.Data['backendResult']=[pscustomobject]@{error='synthetic Go placement failure';reasonCode='fixture_interrupted';pending=@($op)}
+                $e.Data['reasonCode']='fixture_interrupted'; throw $e
+            }
+            return @{status='imported';pending=@()}
+        }
+        rollback {
+            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
+            $journal=Join-Path $home ".ctxhop-desktop-recovery\$op\journal.json"
+            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
+            Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
+            $record.status='rolled_back'
+            [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
+            return @{status='rolled_back'}
+        }
+        guard {
+            if ($script:GuardOpen) {
+                $e=[InvalidOperationException]::new('synthetic active Codex writer')
+                $e.Data['backendResult']=[pscustomobject]@{status='busy';reasonCode='busy';error='synthetic active Codex writer'}
+                throw $e
+            }
+            return @{status='closed'}
+        }
+        default { throw 'unexpected Go operation' }
+    }
+}
+function Invoke-Bundle([string[]]$Arguments) {
             $script:Calls+=,[pscustomobject]@{kind='bundle';arguments=$Arguments}
             switch ($Arguments[0]) {
                 list { return @{bundles=@($script:Store.Values | ForEach-Object { @{id=$_.id;metadata=$_.metadata} })} }

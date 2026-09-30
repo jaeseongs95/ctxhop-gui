@@ -1,11 +1,31 @@
 ﻿#requires -Version 5.1
 # Codex Desktop 대화 구현(벤더 계약 v1, docs\contract-v1.md). Worker가 impls.json으로 실행한다.
-# 내보내기·비교·가져오기는 고정한 Python 백엔드(backend\desktop_sessions.py)가 하고, 전송은 공통 도구 ctxhop.exe bundle이 한다.
+# 내보내기·기존 대화 비교는 고정 Python 백엔드가, 지원하는 새 대화 복원은 고정 Go helper가 맡는다.
 $ErrorActionPreference='Stop'
 $implArgs=$args   # Worker.ps1을 dot-source하면 $args가 바뀔 수 있어 먼저 보관한다.
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 # Release integration replaces this pin only after reviewing the final candidate.
 $script:DesktopBackendSHA256='DEF1FDB9B9B17721682F38EFEB2BA9322089453C265A334133F6346F0F75B349'
+# Final reproducible build integration supplies this pin before acceptance.
+$script:DesktopGoSHA256='PENDING_REVIEW'
+function Invoke-DesktopGo([string[]]$Arguments) {
+    $exe=Join-Path $PSScriptRoot 'bin\ctxhop-codex.exe'
+    Assert-FrozenFile $exe $script:DesktopGoSHA256
+    try { Invoke-JsonNative $exe $Arguments }
+    catch {
+        $code=$_.Exception.Data['backendResult'].reasonCode
+        if ($code -is [string] -and $code) { $_.Exception.Data['reasonCode']=$code }
+        throw
+    }
+}
+function Assert-DesktopGoPlan([object]$Report) {
+    if ($Report.status -cnotin @('new','exists','unsupported','blocked') -or $Report.reasonCode -isnot [string] -or $Report.reason -isnot [string]) { throw (T 'WkGoPlanInvalid') }
+    if ($Report.status -ceq 'new') {
+        if ($Report.token -isnot [string] -or $Report.token -cnotmatch '^[0-9a-f]{64}$' -or $Report.source.sessionId -isnot [string]) { throw (T 'WkGoPlanInvalid') }
+        Assert-NativeId $Report.source.sessionId
+        if ($Report.projectConfig -isnot [array]) { throw (T 'WkGoPlanInvalid') }
+    }
+}
 function Get-DesktopRuntime {
     $backend=Join-Path $PSScriptRoot 'backend\desktop_sessions.py'
     Assert-FrozenFile $backend $script:DesktopBackendSHA256
@@ -80,7 +100,9 @@ function Read-DesktopReceipt([object]$Job) {
     $archive=Join-Path (Split-Path -Parent $receipt) 'session.archive'
     if ($record.archive -ne $archive -or $record.bundleId -cne $Job.remoteId -or $record.nativeId -cne $Job.nativeId -or $record.home -ne (Get-DesktopHome $Job) -or $record.cwd -ne (Assert-DesktopTarget $Job) -or $record.token -cne $Job.token) { throw (T 'WkReceiptMismatch') }
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $record.sha256) { throw (T 'WkArchiveChanged') }
+    if ($record.route -cnotin @('go','python') -or $record.reasonCode -isnot [string]) { throw (T 'WkReceiptRouteInvalid') }
     Assert-DesktopInspect $record.preview
+    if ($record.route -ceq 'go' -and $record.preview.status -cne 'new') { throw (T 'WkReceiptRouteInvalid') }
     if ($record.token -cne $record.preview.token) { throw (T 'WkReceiptTokenMismatch') }
     return $record
 }
@@ -109,7 +131,7 @@ function Get-DesktopRecord([string]$DesktopRoot,[string]$RecordId) {
     # 기록 이름은 작업 ID다(apply --run). 예전 기록도 32자 hex 이름이라 같은 방법으로 찾는다.
     $null=Assert-OperationId $RecordId
     $run=Join-Path $DesktopRoot ".ctxhop-desktop-recovery\$RecordId"
-    $row=[ordered]@{recordId=$RecordId;operationId=$RecordId;nativeId=$null;path=$run;state='absent';sha256=$null;canRollback=$false;files=$null}
+    $row=[ordered]@{recordId=$RecordId;operationId=$RecordId;nativeId=$null;path=$run;state='absent';sha256=$null;canRollback=$false;files=$null;impl=$null}
     if (-not [IO.Directory]::Exists($run)) { return $row }
     $journal=Join-Path $run 'journal.json'; $resolved=Join-Path $run 'journal.resolved.json'
     $present=@($journal,$resolved | Where-Object { [IO.File]::Exists($_) })
@@ -123,9 +145,10 @@ function Get-DesktopRecord([string]$DesktopRoot,[string]$RecordId) {
         $record=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($record.home -isnot [string] -or $record.home.TrimEnd('\') -ne $DesktopRoot.TrimEnd('\')) { return $row }
         if ($record.id -is [string]) { $row.nativeId=$record.id }
+        if ($record.impl -is [string]) { $row.impl=$record.impl }
         if ([string]$record.status -cin @('pending','complete','rolled_back')) { $row.state=[string]$record.status }
     } catch { $row.state='unreadable' }
-    $row.canRollback=$row.state -eq 'pending'
+    $row.canRollback=$row.state -eq 'pending' -and $row.impl -cin @($null,'ctxhop-codex')
     return $row
 }
 function Get-DesktopRecordRows([string]$DesktopRoot) {
@@ -167,11 +190,27 @@ $script:CodexDesktopOps=@{
         Assert-NativeId $R.nativeId; Assert-BundleId $R.remoteId
         $desktopRoot=Get-DesktopHome $R; $cwd=Assert-DesktopTarget $R; $stage=New-DesktopStage; $archive=Join-Path $stage 'session.archive'
         $null=Get-BundleFile $R.remoteId $archive
-        $preview=Invoke-DesktopBackend @('inspect','--home',$desktopRoot,'--archive',$archive,'--cwd',$cwd)
+        $route='go'; $reasonCode=''
+        try {
+            $plan=Invoke-DesktopGo @('plan','--home',$desktopRoot,'--archive',$archive,'--cwd',$cwd)
+            Assert-DesktopGoPlan $plan
+            $reasonCode=[string]$plan.reasonCode
+            if ($plan.status -cin @('new','blocked')) { $preview=$plan }
+            else {
+                # Only an explicit exists/unsupported plan selects the compatibility backend.
+                $route='python'
+                $preview=Invoke-DesktopBackend @('inspect','--home',$desktopRoot,'--archive',$archive,'--cwd',$cwd)
+            }
+        } catch {
+            # Native failure or an invalid plan blocks this preview; never invoke Python after it.
+            $code=$_.Exception.Data['reasonCode']
+            $reasonCode=if ($code -is [string] -and $code) {$code} else {'plan_failed'}
+            $preview=[pscustomobject]@{status='blocked';reason=$_.Exception.Message;reasonCode=$reasonCode;token='';source=$null;target=$null}
+        }
         Assert-DesktopInspect $preview
         if ($preview.status -ne 'blocked' -and $preview.source.sessionId -cne $R.nativeId) { throw (T 'WkArchiveIdMismatch') }
         $receipt=Join-Path $stage 'inspect.json'
-        @{home=$desktopRoot;cwd=$cwd;archive=$archive;bundleId=$R.remoteId;nativeId=$R.nativeId;token=$preview.token;sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash;preview=$preview} | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receipt -Encoding UTF8
+        @{home=$desktopRoot;cwd=$cwd;archive=$archive;bundleId=$R.remoteId;nativeId=$R.nativeId;token=$preview.token;sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash;preview=$preview;route=$route;reasonCode=$reasonCode} | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receipt -Encoding UTF8
         # 손상·호환 불가(blocked) 백업은 복원을 고를 수 없다.
         return @{state=[string]$preview.status;choices=@(if ($preview.status -ne 'blocked') {'incoming'});receipt=$receipt;token=[string]$preview.token;view=$preview;message=(T 'WkPreviewDone')}
     }
@@ -180,9 +219,12 @@ $script:CodexDesktopOps=@{
         if ($R.choice -cne 'incoming') { throw (T 'WkChoiceRequired') }
         $run=Assert-OperationId $R.operationId
         if ($record.preview.status -eq 'blocked') { throw (T 'WkBlockedRestore') }
-        try { $applied=Invoke-DesktopBackend @('apply','--home',$record.home,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--choice','incoming','--run',$run) }
+        try {
+            if ($record.route -ceq 'go') { $applied=Invoke-DesktopGo @('import','--home',$record.home,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--run',$run) }
+            else { $applied=Invoke-DesktopBackend @('apply','--home',$record.home,'--archive',$record.archive,'--cwd',$record.cwd,'--token',$record.token,'--choice','incoming','--run',$run) }
+        }
         catch {
-            # 백엔드는 가져오기에 실패하면 이 홈에 남은 복구 기록(pending) 목록을 준다. 비었으면 쓰기 전 실패이고, 목록이 없으면 알 수 없다.
+            # 구현은 가져오기에 실패하면 이 홈에 남은 복구 기록(pending) 목록을 준다. 비었으면 쓰기 전 실패이고, 목록이 없으면 알 수 없다.
             $pending=$_.Exception.Data['backendResult'].pending
             $_.Exception.Data['recovery']=if ($pending -isnot [array]) {'unknown'} elseif ($pending.Count) {'required'} else {'none'}
             throw
@@ -214,7 +256,11 @@ $script:CodexDesktopOps=@{
                 $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)
                 if ($row.state -eq 'rolled_back') { return @{effect='rolled_back';message=(T 'WkRecoverRolledBack' $row.path)} }
                 if ($row.state -ne 'pending') { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordNotPending' $row.state);records=@([pscustomobject]$row)} }
-                try { $done=Invoke-DesktopBackend @('recover','--home',$desktopRoot,'--run',$row.path) }
+                if ($row.impl -cnotin @($null,'ctxhop-codex')) { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordImplUnknown');records=@([pscustomobject]$row)} }
+                try {
+                    if ($row.impl -ceq 'ctxhop-codex') { $done=Invoke-DesktopGo @('rollback','--home',$desktopRoot,'--run',$row.recordId) }
+                    else { $done=Invoke-DesktopBackend @('recover','--home',$desktopRoot,'--run',$row.path) }
+                }
                 catch {
                     # 백엔드는 중단 뒤 대화가 바뀌었으면 되돌리지 않고 멈춘다. 기록은 pending으로 남는다.
                     $code=if ($_.Exception.Data['backendResult'].status -eq 'busy') {'busy'} else {'needs_attention'}
@@ -238,10 +284,12 @@ $script:CodexDesktopOps=@{
     guard={ param($R)
         # 프로젝트 파일을 먼저 쓰기 전에, apply와 같은 검사로 Codex 앱·CLI·IDE가 모두 닫혔는지 본다. 열려 있으면 busy다.
         $desktopRoot=Get-DesktopHome $R
-        try { $null=Invoke-DesktopBackend @('guard','--home',$desktopRoot) }
+        try { $closed=Invoke-DesktopGo @('guard','--home',$desktopRoot); if ($closed.status -cne 'closed') { throw (T 'WkGoGuardInvalid') } }
         catch {
             if (-not $_.Exception.Data['backendResult']) { throw }
-            return @{status='busy';reasonCode='engine_open';reason=$_.Exception.Message}
+            $detail=$_.Exception.Data['backendResult']
+            if ($detail.reasonCode -ceq 'busy' -or $detail.status -ceq 'busy') { return @{status='busy';reasonCode='engine_open';reason=$_.Exception.Message} }
+            throw
         }
         return @{}
     }
