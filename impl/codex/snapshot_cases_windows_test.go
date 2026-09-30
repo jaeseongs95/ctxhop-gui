@@ -132,9 +132,25 @@ func TestSnapshotCheckpointEmptyWALAndWALOnly(t *testing.T) {
 			if _, e := os.Stat(filepath.Join(s.Private, "state_5.sqlite-shm")); !os.IsNotExist(e) {
 				t.Fatal("source SHM was copied")
 			}
+			copyPath := filepath.Join(s.Private, "state_5.sqlite")
+			copyBefore, e := dbHashes(copyPath)
+			if e != nil {
+				t.Fatal(e)
+			}
 			count, e := snapshotCount(s)
 			if e != nil || count != 1 {
 				t.Fatal(e, count)
+			}
+			copyAfter, e := dbHashes(copyPath)
+			if e != nil || copyAfter[copyPath] != copyBefore[copyPath] {
+				t.Fatal("private readonly query changed main bytes", e)
+			}
+			if copyBefore[copyPath+"-wal"] == "absent" {
+				if copyAfter[copyPath+"-wal"] != "absent" && copyAfter[copyPath+"-wal"] != digest(nil) {
+					t.Fatal("private missing WAL query created nonempty WAL")
+				}
+			} else if copyAfter[copyPath+"-wal"] != copyBefore[copyPath+"-wal"] {
+				t.Fatal("private readonly query changed existing WAL bytes")
 			}
 			if e := snapshotRegisterSidecars(s); e != nil {
 				t.Fatal(e)
@@ -152,7 +168,7 @@ func TestSnapshotCheckpointEmptyWALAndWALOnly(t *testing.T) {
 					t.Fatal("source SHM changed", e)
 				}
 			}
-			t.Logf("source main/WAL unchanged; private SELECT count=%d; source WAL present=%t; distinct file IDs; protected single-user DACL; source SHM not copied", count, before[source+"-wal"] != "absent")
+			t.Logf("source main/WAL unchanged; private SELECT count=%d; source WAL present=%t; private new empty WAL=%t; private main/existing WAL unchanged; distinct file IDs; protected single-user owner/DACL; source SHM not copied", count, before[source+"-wal"] != "absent", copyBefore[copyPath+"-wal"] == "absent" && copyAfter[copyPath+"-wal"] == digest(nil))
 			if e := s.Close(true); e != nil {
 				t.Fatal(e)
 			}
