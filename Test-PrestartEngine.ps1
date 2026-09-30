@@ -7,7 +7,7 @@ File snapshots detect final differences; they do not prove absence of transient
 writes or networking. Engine effects require independent complete observation.
 #>
 param(
-    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','MigrationCheck','Engine')][string]$Mode='SelfTest',
+    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','MigrationCheck','BackendCheck','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
     [string]$SourceArchive,
     [string]$SourceCommit,
@@ -16,6 +16,8 @@ param(
     [string]$BuilderScript,
     [string]$MigrationArchive,
     [string]$SourceRepository,
+    [string]$GoArchive,
+    [string]$GoCommit,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -443,6 +445,116 @@ function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Co
     return $receipt
 }
 
+function Invoke-BoundedBackendCommand([string]$Executable,[string[]]$Arguments,[string]$Directory,[string]$Log) {
+    if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'backendRunnerRequiresPs7' }
+    $start=[Diagnostics.ProcessStartInfo]::new()
+    $start.FileName=$Executable; $start.WorkingDirectory=$Directory; $start.UseShellExecute=$false
+    $start.CreateNoWindow=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+    $process=[Diagnostics.Process]::Start($start)
+    try {
+        $stdout=$process.StandardOutput.ReadToEndAsync(); $stderr=$process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(210000)) { $process.Kill($true); $process.WaitForExit(); throw 'backendOwnedProcessTimeout' }
+        $code=$process.ExitCode
+        Write-FixtureText $Log ($stdout.Result+"`n"+$stderr.Result)
+        if ($code -ne 0) { throw "backendCommandFailed:$code" }
+    } finally {
+        if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+        $process.Dispose()
+    }
+}
+function Assert-BackendReadPath([string]$Path,[string]$CaseId) {
+    if ($CaseId -cnotmatch '^[0-9a-f]{32}$' -or -not [IO.Path]::IsPathRooted($Path)) { throw 'backendCaseBindingInvalid' }
+    $full=[IO.Path]::GetFullPath($Path)
+    $root='D:\Go\codex-s4\backend-fixtures\'+$CaseId
+    if (-not $full.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'backendReadOutsideCase' }
+    $scan=$full
+    while ($scan) {
+        if ((Test-Path -LiteralPath $scan) -and ((Get-Item -LiteralPath $scan -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'backendReadReparse' }
+        $scan=[IO.Path]::GetDirectoryName($scan)
+    }
+    return $full
+}
+function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Repository,[string]$BackendArchive,[string]$BackendCommit) {
+    if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'backendRunnerRequiresPs7' }
+    $path=Assert-OwnedFixturePath $Root; $archivePath=Assert-OwnedFixturePath $Archive
+    $repo=Assert-OwnedFixturePath $Repository; $goArchive=Assert-OwnedFixturePath $BackendArchive
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or $BackendCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        -not [string]::Equals($PSScriptRoot,(Join-Path (Split-Path $archivePath) 'source'),[StringComparison]::OrdinalIgnoreCase)) { throw 'backendFixedArchiveRequired' }
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    $rustExe='D:\Go\codex-s4\r45-backend-d0fa3d8\codex-app-server-libtest.exe'
+    $rustArtifact=Join-Path (Split-Path $rustExe) 'artifact.json'
+    $rustExeHash=(Get-FileHash -LiteralPath $rustExe).Hash.ToLowerInvariant()
+    $rustArtifactHash=(Get-FileHash -LiteralPath $rustArtifact).Hash.ToLowerInvariant()
+    if ($rustExeHash -cne '3494e9fe61a5756232f97066dfcfaa698dc1c0c78e2e72548bb59c310c5f19c0' -or $rustArtifactHash -cne '88a56530236aa95ea879ce908a7ae72c23922b1ce3374855ea0dcf3c86c4c2ec') { throw 'backendRustPinMismatch' }
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $cases=@('checkpoint','empty-wal','wal-only','stale-shm','decoder-error','missing-private-copy','nonempty-new-wal','unknown-entry')
+    $caseResults=@($cases | ForEach-Object { [ordered]@{case=$_;status='notRun';caseId=$null} })
+    $summary=[ordered]@{schemaVersion=1;purpose='fresh state-only Go/Rust private acquisition helper compatibility';runnerStatus='failed';sourceCommit=$Commit;goSourceCommit=$BackendCommit;rustSourceCommit='d0fa3d8b26bf4d0f4d2538e45b03e0356d6948f2';rustTestExeSha256=$rustExeHash;rustArtifactSha256=$rustArtifactHash;engineExecuted=$false;engineAcceptance='notRun';runtimeAdmission='notTested';completeEffects='notMeasured';sourceSQLiteOpens=0;historicalExportRepeats=0;backendCasesExecuted=0;creationWriter='checked-in Go test only';ownedTimeoutSeconds=210;goTestTimeout='3m';rustChildTimeout='2m';cases=$caseResults;connectionPlanAdditionalCases='notRun'}
+    try {
+        foreach ($lane in @(@{name='runner';archive=$archivePath;commit=$Commit},@{name='go';archive=$goArchive;commit=$BackendCommit})) {
+            $reference=Join-Path $path ($lane.name+'-reference.tar')
+            Invoke-SchemaCommand 'git' @('-C',$repo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$lane.commit) (Join-Path $path ($lane.name+'-archive.log'))
+            if ((Get-FileHash -LiteralPath $reference).Hash -cne (Get-FileHash -LiteralPath $lane.archive).Hash) { throw 'backendArchiveCommitMismatch' }
+        }
+        $summary.runnerArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant()
+        $summary.runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
+        $summary.goArchiveSha256=(Get-FileHash -LiteralPath $goArchive).Hash.ToLowerInvariant()
+        $goSource=Join-Path $path 'go-source'; [IO.Directory]::CreateDirectory($goSource) | Out-Null
+        Invoke-SchemaCommand 'tar' @('-xf',$goArchive,'-C',$goSource) (Join-Path $path 'go-extract.log')
+        Get-FixtureTree $goSource | Out-Null
+        . 'D:\Go\ctxhop-s4-toolchain-r45\Enter-R45Toolchain.ps1'
+        $env:CGO_ENABLED='0'; $env:GOWORK='off'; $env:GOPROXY='off'; $env:GOSUMDB='off'; $env:GOFLAGS=''; $env:GOEXPERIMENT=''
+        $go=Join-Path $env:GOROOT 'bin/go.exe'; $testExe=Join-Path $path 'backend-sequence.test.exe'
+        $summary.goToolSha256=(Get-FileHash -LiteralPath $go).Hash.ToLowerInvariant()
+        $summary.goVersion=(& $go version) -join ''
+        if ($LASTEXITCODE -ne 0 -or $summary.goVersion -cne 'go version go1.27.1 windows/amd64') { throw 'backendGoVersionMismatch' }
+        $summary.winSqliteSha256=(Get-FileHash -LiteralPath 'C:\Windows\System32\winsqlite3.dll').Hash.ToLowerInvariant()
+        $goDirectory=Join-Path $goSource 'impl/codex'
+        Invoke-BoundedBackendCommand $go @('test','-c','-tags','ctxhop_schema_export,ctxhop_backend_sequence','-trimpath','-buildvcs=false','-o',$testExe,'.') $goDirectory (Join-Path $path 'go-build.log')
+        $summary.goTestExeSha256=(Get-FileHash -LiteralPath $testExe).Hash.ToLowerInvariant()
+        Invoke-BoundedBackendCommand $testExe @('-test.list','^TestBackendSequence$') $goDirectory (Join-Path $path 'test-list.log')
+        if ((Get-Content -LiteralPath (Join-Path $path 'test-list.log') -Raw).Trim() -cne 'TestBackendSequence') { throw 'backendSelectorMissing' }
+        foreach ($entry in $caseResults) {
+            $id=[guid]::NewGuid().ToString('N'); $entry.caseId=$id
+            $caseRoot='D:\Go\codex-s4\backend-fixtures\'+$id
+            if (Test-Path -LiteralPath $caseRoot) { throw 'backendCaseAlreadyExists' }
+            $summary.backendCasesExecuted++; $entry.status='failed'
+            Invoke-BoundedBackendCommand $testExe @('-test.run','^TestBackendSequence$','-test.count=1','-test.timeout=3m','-test.v',('-ctxhop-backend-case='+$entry.case),('-ctxhop-backend-case-id='+$id)) $goDirectory (Join-Path $path ($entry.case+'.log'))
+            $manifestFile=Assert-BackendReadPath (Join-Path $caseRoot 'manifest.json') $id
+            $goFile=Assert-BackendReadPath (Join-Path $caseRoot 'go-backend-receipt.json') $id
+            $rustFile=Assert-BackendReadPath (Join-Path $caseRoot 'rust-backend-receipt.json') $id
+            $manifest=Get-Content -LiteralPath $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $goReceipt=Get-Content -LiteralPath $goFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $rust=Get-Content -LiteralPath $rustFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $observation=$manifest.dbObservation; $acquisition=$observation.acquisition
+            $sourceFile=Assert-BackendReadPath $observation.stateDb $id
+            $privateFile=Assert-BackendReadPath (Join-Path $acquisition.private.directory 'state_5.sqlite') $id
+            Assert-Fixture ($manifest.caseId -ceq $id -and $goReceipt.caseId -ceq $id -and $rust.caseId -ceq $id -and $goReceipt.case -ceq $entry.case) 'same backend case'
+            Assert-Fixture ($goReceipt.acquisitionId -ceq $acquisition.acquisitionId -and $rust.acquisitionId -ceq $acquisition.acquisitionId -and $acquisition.schemaVersion -eq 1) 'same private acquisition'
+            Assert-Fixture ([string]::Equals($sourceFile,(Join-Path $caseRoot 'source/state_5.sqlite'),[StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($privateFile,(Join-Path $caseRoot 'private/state_5.sqlite'),[StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($rust.sourceStateDb,$sourceFile,[StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($rust.privateStateDb,$privateFile,[StringComparison]::OrdinalIgnoreCase)) 'same source and private paths'
+            Assert-Fixture ($goReceipt.manifestSha256 -ceq (Get-FileHash -LiteralPath $manifestFile).Hash.ToLowerInvariant() -and $goReceipt.rustReceiptSha256 -ceq (Get-FileHash -LiteralPath $rustFile).Hash.ToLowerInvariant() -and $goReceipt.rustTestExeSha256 -ceq $rustExeHash -and $goReceipt.rustArtifactSha256 -ceq $rustArtifactHash) 'backend receipt hash binding'
+            $expected=if ($entry.case -ceq 'decoder-error') { 'stateMetadataUnknown' } elseif ($entry.case -cin @('missing-private-copy','nonempty-new-wal','unknown-entry')) { 'acquisitionUnknown' } else { $null }
+            Assert-Fixture ($rust.reason -ceq $expected -and $manifest.expectedReason -ceq $expected) 'backend reason matches case'
+            Assert-Fixture ($goReceipt.engineExecutions -eq 0 -and $goReceipt.sourceSQLiteOpens -eq 0 -and $goReceipt.sourceMainWALSHMPreserved -ceq $true -and $goReceipt.sourceHandlesDrained -ceq $true) 'source lease and engine boundary'
+            foreach ($kind in @('main','wal','shm')) {
+                $suffix=if ($kind -ceq 'main') { '' } else { '-'+$kind }
+                $file=Assert-BackendReadPath ($sourceFile+$suffix) $id; $descriptor=$acquisition.source.$kind
+                if ($null -eq $descriptor) { Assert-Fixture (-not (Test-Path -LiteralPath $file)) 'source sidecar absence' }
+                else { Assert-Fixture ((Get-Item -LiteralPath $file).Length -eq $descriptor.size -and (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant() -ceq $descriptor.sha256 -and $descriptor.identity -cmatch '^[0-9a-f]{24}$') 'raw final source bytes and descriptor' }
+            }
+            if ($entry.case -ceq 'unknown-entry') {
+                Assert-Fixture ($goReceipt.privateRemoved -ceq $false -and (Test-Path -LiteralPath (Assert-BackendReadPath (Join-Path $acquisition.private.directory 'unknown-entry') $id))) 'unknown entry retained'
+            } else { Assert-Fixture ($goReceipt.privateRemoved -ceq $true -and -not (Test-Path -LiteralPath $acquisition.private.directory)) 'private cleanup completed' }
+            if ($null -eq $expected) { Assert-Fixture (@($rust.rows).Count -eq 2 -and $rust.rows[0].id -ceq $manifest.threadIds[0] -and $null -eq $rust.rows[1] -and $rust.rows[0].canonicalMetadataSha256 -cmatch '^[0-9a-f]{64}$') 'canonical present and missing member' }
+            $entry.status='passed'; $entry.acquisitionId=$acquisition.acquisitionId; $entry.reason=$rust.reason
+            $entry.manifestSha256=$goReceipt.manifestSha256; $entry.goReceiptSha256=(Get-FileHash -LiteralPath $goFile).Hash.ToLowerInvariant(); $entry.rustReceiptSha256=$goReceipt.rustReceiptSha256; $entry.goPrivateBackend=$goReceipt.goPrivateBackend; $entry.privateRemoved=$goReceipt.privateRemoved
+        }
+        $summary.runnerStatus='passed'; $summary.runnerChecks=$script:FixtureChecks
+    } catch { $summary.error=$_.Exception.Message; throw } finally { Write-FixtureJson (Join-Path $path 'backend-sequence-result.json') $summary }
+    return $summary
+}
+
 function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
@@ -524,6 +636,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
