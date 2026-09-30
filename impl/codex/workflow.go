@@ -345,13 +345,18 @@ func admit(s *session, home string, ms []member, missing bool) (view dbView, ret
 	if e := checkGuard(s.P); e != nil {
 		return dbView{}, e
 	}
+	if e := checkOtherStoreAbsence(s.Projection); e != nil {
+		return dbView{}, e
+	}
 	view, e := readPreparedState(home, text(s.Projection["stateDb"]), ms, missing)
 	if e != nil {
 		return view, e
 	}
 	defer func() {
 		if view.Acquisition != nil {
-			retErr = errors.Join(retErr, view.Acquisition.Close(true))
+			// Failed provider completion cannot prove private readers drained.
+			// Preserve that private namespace for attention; still drain raw leases.
+			retErr = errors.Join(retErr, view.Acquisition.Close(retErr == nil))
 		}
 	}()
 	if s.Operation == "rollback" || s.Operation == "rollback-check" {

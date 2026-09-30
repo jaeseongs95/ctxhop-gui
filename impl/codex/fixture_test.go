@@ -399,3 +399,35 @@ func TestAcquisitionWireRejectsUnknownAndUnboundProvenance(t *testing.T) {
 		}
 	}
 }
+
+func TestOtherStoreUnknownNeverMeansEmpty(t *testing.T) {
+	for _, kind := range []string{"logs", "goals", "memories", "memoriesV2", "queue", "threadHistory"} {
+		t.Run(kind, func(t *testing.T) {
+			o := options{Home: t.TempDir(), Cwd: t.TempDir()}
+			p := projection(o, "rollback", nil, true)
+			if e := checkOtherStoreAbsence(p); e != nil {
+				t.Fatal(e)
+			}
+			var path string
+			for _, raw := range array(p["writeTargets"]) {
+				target := obj(raw)
+				if target["kind"] == kind {
+					path = text(target["path"])
+				}
+			}
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				if e := os.WriteFile(path+suffix, []byte("unknown store bytes"), 0600); e != nil {
+					t.Fatal(e)
+				}
+				assertCode(t, checkOtherStoreAbsence(p), "foreign_store_unknown")
+				b, e := os.ReadFile(path + suffix)
+				if e != nil || string(b) != "unknown store bytes" {
+					t.Fatal("store bytes changed", e)
+				}
+				if e := os.Remove(path + suffix); e != nil {
+					t.Fatal(e)
+				}
+			}
+		})
+	}
+}

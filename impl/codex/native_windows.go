@@ -609,6 +609,20 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 		for _, m := range members {
 			ids[m.ID] = true
 		}
+		for _, table := range []string{"thread_attachments", "thread_dynamic_tools"} {
+			rows, e := query("SELECT thread_id FROM " + table)
+			if e != nil {
+				return e
+			}
+			for _, row := range rows {
+				if len(row) != 1 || !uuidRE.MatchString(row[0]) {
+					return fail("engine_db_unknown", "state 참조 ID 구조 불명")
+				}
+				if ids[row[0]] {
+					return fail("foreign_reference", "구성원의 attachment/dynamic tool 참조가 있습니다")
+				}
+			}
+		}
 		for _, r := range rows {
 			if len(r) != 3 || !uuidRE.MatchString(r[0]) || !uuidRE.MatchString(r[1]) || (r[2] != "open" && r[2] != "closed") {
 				return fail("engine_db_unknown", "DB edge 구조 불명")

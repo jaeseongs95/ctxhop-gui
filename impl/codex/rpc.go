@@ -546,6 +546,11 @@ func (s *session) revalidateHandoff() error {
 	if e := checkGuard(s.P); e != nil {
 		return e
 	}
+	if s.Operation != "plan" && s.Operation != "bootstrap" {
+		if e := checkOtherStoreAbsence(s.Projection); e != nil {
+			return e
+		}
+	}
 	if s.Acquisition != nil {
 		if e := s.Acquisition.VerifyReleasedSource(); e != nil {
 			return fail("engine_db_changed", "acquisition 해제 후 원본 변경/접근 오류")
@@ -579,6 +584,26 @@ func (s *session) revalidateHandoff() error {
 	}
 	// Canonical Config/auth/loader freshness is revalidated by the provider's
 	// accept/activate against its retained typed inputs, not reconstructed here.
+	return nil
+}
+func checkOtherStoreAbsence(projection object) error {
+	// No original SQLite opens for other stores. Until their own schema and
+	// references have acquisition evidence, presence is unknown and blocks.
+	for _, raw := range array(projection["writeTargets"]) {
+		target := obj(raw)
+		if target["kind"] == "state" {
+			continue
+		}
+		path := text(target["path"])
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+			if e := noReparse(path + suffix); e != nil {
+				return e
+			}
+			if e := snapshotAbsent(path + suffix); e != nil {
+				return fail("foreign_store_unknown", "다른 DB store/queue의 참조·목표 부재가 미증명입니다")
+			}
+		}
+	}
 	return nil
 }
 func (s *session) activate() error {

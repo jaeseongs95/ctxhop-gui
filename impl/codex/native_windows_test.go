@@ -330,6 +330,19 @@ func TestLiveSchemaSealMutations(t *testing.T) {
 		}
 	}
 }
+
+func TestStateAttachmentAndDynamicToolReferencesBlock(t *testing.T) {
+	for _, sql := range []string{
+		`INSERT INTO thread_attachments VALUES('attachment','` + rootID + `','file','identity','{}',1);`,
+		`INSERT INTO thread_dynamic_tools(thread_id,position,name,description,input_schema) VALUES('` + rootID + `',0,'tool','owned fixture','{}');`,
+	} {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, liveFixtureSQL(t)+liveFixtureThread(rootID)+sql)
+		close()
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+		assertCode(t, e, "foreign_reference")
+	}
+}
 func makeJunction(system, link, target string) error {
 	cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
