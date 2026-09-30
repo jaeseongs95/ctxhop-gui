@@ -8,5 +8,6 @@
   "loaderContractId": null,
   "patches": [],
   "engineSha256": null,
-  "normalEngineSha256": "cbafb6422bca005b94c12d105b1a16a0474219e24ea4893f85846409c464f5a1"
+  "normalEngineSha256": "cbafb6422bca005b94c12d105b1a16a0474219e24ea4893f85846409c464f5a1",
+  "migrationLineEndings": "CRLF"
 }

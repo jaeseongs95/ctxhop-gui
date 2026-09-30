@@ -20,7 +20,7 @@ $repo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 if (@(git -C $repo status --porcelain).Count) { throw 'the working tree has uncommitted changes' }
 $providerPath=Join-Path $repo 'engine\provider.json'
 $provider=Get-Content -LiteralPath $providerPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($provider.schemaVersion -ne 1 -or $provider.baseCommit -cnotmatch '^[0-9a-f]{40}$' -or $provider.target -cne 'x86_64-pc-windows-msvc' -or $provider.rustVersion -cne '1.95.0') { throw 'invalid provider manifest' }
+if ($provider.schemaVersion -ne 1 -or $provider.baseCommit -cnotmatch '^[0-9a-f]{40}$' -or $provider.target -cne 'x86_64-pc-windows-msvc' -or $provider.rustVersion -cne '1.95.0' -or $provider.migrationLineEndings -cne 'CRLF') { throw 'invalid provider manifest' }
 if ($provider.loaderContractId -isnot [string] -or $provider.loaderContractId -cnotmatch '^ctxhop-prestart-v1:[0-9a-f]{64}$' -or -not @($provider.patches).Count) { throw 'protected engine provider is not finalized' }
 if ($VerifyPin -and $provider.engineSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'protected engine pin is not finalized' }
 $Out=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
@@ -56,6 +56,29 @@ foreach ($patch in $provider.patches) {
     Invoke-EngineBuildNative git @('-C',$sourceTree,'apply','--binary',$path)
 }
 
+# sqlx hashes the embedded SQL bytes. The supported Windows vendor build uses
+# CRLF migrations; compiling LF archive bytes would reject an existing DB.
+# Normalize only the canonical migration directories, and retain both hashes.
+$stateRoot=Join-Path $sourceTree 'codex-rs\state'
+$groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
+$migrationSource=[IO.File]::ReadAllText((Join-Path $stateRoot 'src\migrations.rs'))
+$declared=@([regex]::Matches($migrationSource,'migrate!\("\./([a-z_]+)"\)') | ForEach-Object { $_.Groups[1].Value })
+if (@(Compare-Object ($groups|Sort-Object) ($declared|Sort-Object)).Count) { throw 'unreviewed migration directory' }
+$utf8=[Text.UTF8Encoding]::new($false,$true)
+$migrations=@(foreach ($group in $groups) {
+    $files=@(Get-ChildItem -LiteralPath (Join-Path $stateRoot $group) -File | Sort-Object Name)
+    if (-not $files.Count) { throw "missing migrations: $group" }
+    foreach ($file in $files) {
+        if ($file.Name -cnotmatch '^[0-9]{4}_[a-z0-9_]+\.sql$') { throw 'unreviewed migration file' }
+        $bytes=[IO.File]::ReadAllBytes($file.FullName)
+        $sql=$utf8.GetString($bytes)
+        if ($sql.Contains("`r") -or $sql.StartsWith([string][char]0xfeff)) { throw 'migration source must be committed LF without BOM' }
+        $lfHash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllBytes($file.FullName,$utf8.GetBytes($sql.Replace("`n","`r`n")))
+        [ordered]@{path="codex-rs/state/$group/$($file.Name)";lfSha256=$lfHash;crlfSha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant();sqlxSha384=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA384).Hash.ToLowerInvariant()}
+    }
+})
+
 $env:TEMP='D:\Go\temp'; $env:TMP=$env:TEMP
 $null=[IO.Directory]::CreateDirectory($env:TEMP)
 $env:CARGO_TARGET_DIR=Join-Path $Out 'rust-target'
@@ -73,6 +96,6 @@ $engine=Join-Path $Out 'ctxhop-codex-engine.exe'
 Copy-Item -LiteralPath $built -Destination $engine
 $hash=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($VerifyPin -and $hash -cne $provider.engineSha256) { throw "protected engine hash mismatch: $hash" }
-$info=[ordered]@{schemaVersion=1;baseRepository=$provider.baseRepository;baseCommit=$provider.baseCommit;sourceVersion=$provider.sourceVersion;providerSha256=(Get-FileHash -LiteralPath $frozenProvider -Algorithm SHA256).Hash.ToLowerInvariant();loaderContractId=$provider.loaderContractId;rust=$provider.rustVersion;target=$provider.target;patches=$provider.patches;sha256=$hash;profile='release';cargoLocked=$true;runtimeExecuted=$false}
+$info=[ordered]@{schemaVersion=1;baseRepository=$provider.baseRepository;baseCommit=$provider.baseCommit;sourceVersion=$provider.sourceVersion;providerSha256=(Get-FileHash -LiteralPath $frozenProvider -Algorithm SHA256).Hash.ToLowerInvariant();loaderContractId=$provider.loaderContractId;rust=$provider.rustVersion;target=$provider.target;patches=$provider.patches;migrationLineEndings=$provider.migrationLineEndings;migrations=$migrations;sha256=$hash;profile='release';cargoLocked=$true;runtimeExecuted=$false}
 [IO.File]::WriteAllText((Join-Path $Out 'engine-build-info.json'),($info|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
 "$hash  ctxhop-codex-engine.exe"
