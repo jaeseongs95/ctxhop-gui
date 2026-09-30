@@ -468,12 +468,45 @@ function Enter-Marker([Collections.IDictionary]$Marker) {
     foreach ($field in (Get-WorkerFields).GetEnumerator()) { $Marker[$field.Key]=$field.Value }
     Save-Marker $Marker
 }
+function Get-CodexRetainedKinds([object]$Record) {
+    # 이 필드는 증명 결과의 표시일 뿐 원본 삭제·쓰기 권한이 아니다. 순서는 v2 store catalog와 같다.
+    $allowed=@('state.migrationCursor','queue.revision','agentMessageBoard.deletedBoard')
+    $kind=$Record.absenceKind; $kinds=$Record.retainedKinds
+    if ($null -ne $kinds -and $kinds -isnot [array]) { throw (T 'WkRetainedProofUnknown') }
+    if ($null -eq $kind -or $kind -ceq 'absent') {
+        if ($null -ne $kinds -and $kinds.Count) { throw (T 'WkRetainedProofUnknown') }
+        return
+    }
+    if ($kind -isnot [string] -or $kind -cne 'retained' -or $kinds -isnot [array] -or -not $kinds.Count) { throw (T 'WkRetainedProofUnknown') }
+    $last=-1
+    foreach ($entry in $kinds) {
+        if ($entry -isnot [string]) { throw (T 'WkRetainedProofUnknown') }
+        $index=-1
+        for ($i=0; $i -lt $allowed.Count; $i++) { if ($entry -ceq $allowed[$i]) { $index=$i; break } }
+        if ($index -le $last) { throw (T 'WkRetainedProofUnknown') }
+        $last=$index
+        $entry
+    }
+}
+function Set-MarkerVendorAbsence([Collections.IDictionary]$Marker,[object]$Report,[string]$State) {
+    $kinds=@(Get-CodexRetainedKinds $Report)
+    if ($kinds.Count) {
+        if ($Marker.agent -cne 'codex-desktop' -or $State -cne 'rolled_back') { throw (T 'WkRetainedProofUnknown') }
+        $Marker.absenceKind='retained'; $Marker.retainedKinds=[string[]]$kinds
+    } else {
+        $null=$Marker.Remove('absenceKind'); $null=$Marker.Remove('retainedKinds')
+    }
+}
 function Get-VendorState([Collections.IDictionary]$Marker) {
     # 벤더 기록 상태(S3 명세 2.3절). 최소 표지는 새 operationId가 아니라 원래 기록(recordRef)을 조회한다(R37-N1).
     # 조회 자체가 실패하면 failed(unreadable처럼 다루지만 닫지는 않는다). 프로젝트 기록 표지는 벤더가 없다(none).
     if ($Marker.recordKind -eq 'project') { return 'none' }
-    try { $state=[string](Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $Marker)}).state } catch { return 'failed' }
-    if ($state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable')) { return 'failed' }
+    try {
+        $report=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $Marker)}
+        $state=[string]$report.state
+        if ($state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable')) { return 'failed' }
+        Set-MarkerVendorAbsence $Marker $report $state
+    } catch { return 'failed' }
     return $state
 }
 function Read-ProjectPlan([string]$Recovery) {
@@ -513,6 +546,12 @@ function Test-DoneRecord([Collections.IDictionary]$Marker) {
     if (-not [IO.File]::Exists($file)) { return $false }
     try { $done=Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }
     if ($done.version -ne 1 -or [string]$done.operationId -cne [string]$Marker.operationId -or [string]$done.agent -cne [string]$Marker.agent -or [string]$done.home -cne [string]$Marker.home) { return $false }
+    try {
+        $retained=@(Get-CodexRetainedKinds $done)
+        if ($retained.Count) {
+            if ($Marker.agent -cne 'codex-desktop' -or $done.outcome -cne 'rolled_back' -or $done.vendorState -cne 'rolled_back' -or $Marker.absenceKind -cne 'retained' -or (@($Marker.retainedKinds) -join '|') -cne ($retained -join '|')) { return $false }
+        } elseif ($Marker.absenceKind -ceq 'retained') { return $false }
+    } catch { return $false }
     switch -CaseSensitive ([string]$done.outcome) {
         completed { return ([string]$done.vendorState -cin @('complete','equal') -and $done.project.success -eq $true) }
         rolled_back { return ([string]$done.vendorState -cin @('absent','rolled_back','none') -and $done.project.complete -eq $true) }
@@ -526,7 +565,12 @@ function Close-Marker([Collections.IDictionary]$Marker,[string]$Outcome,[string]
     # 표지 없던 프로젝트 기록은 그 폴더에 resolved.json(기록 해시)을 남겨 목록에서 뺀다.
     if ($Marker.recordKind -eq 'project' -and -not (Test-ProjectRecordResolved ([string]$Marker.recordRef))) { Save-ProjectJson (Join-Path $Marker.recordRef 'resolved.json') ([ordered]@{version=1;operationId=$Marker.operationId;outcome=$Outcome;sha256=(Get-ProjectRecordSha ([string]$Marker.recordRef));at=(Get-ProjectStamp)}) }
     $dir=Join-Path (Get-JournalDir) 'done'; $null=[IO.Directory]::CreateDirectory($dir)
-    Save-ProjectJson (Join-Path $dir "$($Marker.operationId).json") ([ordered]@{version=1;operationId=$Marker.operationId;agent=$Marker.agent;home=$Marker.home;recordRef=$Marker.recordRef;outcome=$Outcome;vendorState=$VendorState;project=$Project;at=(Get-ProjectStamp)})
+    $done=[ordered]@{version=1;operationId=$Marker.operationId;agent=$Marker.agent;home=$Marker.home;recordRef=$Marker.recordRef;outcome=$Outcome;vendorState=$VendorState;project=$Project;at=(Get-ProjectStamp)}
+    if ($Marker.absenceKind -ceq 'retained') {
+        $done.absenceKind='retained'; $done.retainedKinds=@(Get-CodexRetainedKinds $Marker)
+        Save-Marker $Marker
+    }
+    Save-ProjectJson (Join-Path $dir "$($Marker.operationId).json") $done
     if (-not (Test-DoneRecord $Marker)) { return (Set-MarkerAttention $Marker (T 'WkJournalDoneMismatch')) }
     [IO.File]::Delete((Join-Path (Get-JournalDir) "$($Marker.operationId).json"))
     return $Outcome
@@ -563,7 +607,10 @@ function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]
     if (-not $project.complete) { return (Set-MarkerAttention $Marker (T 'WkRollbackIncomplete')) }
     if ($VendorState -eq 'pending') {
         # 프로젝트를 먼저 되돌린 뒤 대화를 되돌린다. 벤더가 멈추면 기록은 pending으로 남고 확인이 필요하다.
-        try { $null=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='rollback';recordId=(Get-MarkerRef $Marker);confirmedUnknown=@($Confirmed)} }
+        try {
+            $report=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='rollback';recordId=(Get-MarkerRef $Marker);confirmedUnknown=@($Confirmed)}
+            Set-MarkerVendorAbsence $Marker $report 'rolled_back'
+        }
         catch { return (Set-MarkerAttention $Marker $_.Exception.Message) }
         $VendorState='rolled_back'
     }
@@ -672,8 +719,10 @@ function Invoke-JournalRollback([object]$Job) {
     Enter-Marker $marker
     $outcome=Resolve-Marker $marker 'rollback' @($Job.confirmedUnknown | Where-Object { $_ }) (Get-VendorState $marker) $false
     if ($outcome -ceq 'waiting') { $outcome=Set-MarkerAttention $marker (T 'WkJournalVendorUnreadable' 'complete') }
-    $message=switch ($outcome) { rolled_back {T 'WkJournalRolledBack'} resolved {T 'WkJournalRolledBackProject'} completed {T 'WkJournalCompleted'} default {T 'WkJournalAttention' $marker.error} }
-    return @{outcome=$outcome;operationId=$marker.operationId;message=$message}
+    $message=switch ($outcome) { rolled_back {if ($marker.absenceKind -ceq 'retained') {T 'WkJournalRolledBackRetained'} else {T 'WkJournalRolledBack'}} resolved {T 'WkJournalRolledBackProject'} completed {T 'WkJournalCompleted'} default {T 'WkJournalAttention' $marker.error} }
+    $result=@{outcome=$outcome;operationId=$marker.operationId;message=$message}
+    if ($outcome -ceq 'rolled_back' -and $marker.absenceKind -ceq 'retained') { $result.absenceKind='retained'; $result.retainedKinds=@($marker.retainedKinds) }
+    return $result
 }
 function Invoke-JournalClose([object]$Job) {
     # 사용자가 "해결했음"으로 닫음(S3 명세 3.5·4.3절). 벤더 기록이 남았으면 벤더 resolve를 먼저 부른다. 조회가 실패하면 닫지 않는다.

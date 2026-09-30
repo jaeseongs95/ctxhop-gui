@@ -189,9 +189,10 @@ S4의 새 ID 복원 경로와 실행 파일 결합은 [`s4-prestart.md`](s4-pres
 |---|---|---|
 | `status` | `operationId` | `state`: `absent` \| `pending` \| `complete` \| `rolled_back` \| `resolved` \| `unreadable` |
 | `list` | 공통 문맥 | `records`: 되돌리거나 닫아야 할 기록(`pending`·`unreadable`). 예전 형식 포함 |
-| `rollback` | `recordId`, `confirmedUnknown`(선택, `{target, current}` 배열) | `effect: rolled_back`. 모두 원래대로일 때만 |
+| `rollback` | `recordId`, `confirmedUnknown`(선택, `{target, current}` 배열) | `effect: rolled_back`. 프로젝트 파일 복구와 벤더별 완료 조건을 충족할 때만 |
 | `resolve` | `recordId`, `sha256` | `effect: resolved`. 기록 파일의 SHA-256이 사용자가 본 값과 같을 때만 이름을 바꿉니다. 이미 닫혔으면 성공입니다. |
 
+- Codex Go의 `rollbackRetained`는 대화 파일·state와 활성·외부 참조의 부재를 확인한 뒤 엔진의 삭제 표시·순회 기록을 보존합니다. 원본 DB를 추가로 쓰거나 삭제하지 않고 소유 복구 기록만 마무리합니다. `absenceKind: retained`, 비어 있지 않은 `retainedKinds`를 vendor 응답·공통 종료 기록·최종 응답에 남깁니다. 종류의 허용 순서는 `state.migrationCursor`, `queue.revision`, `agentMessageBoard.deletedBoard`이며 누락·중복·알 수 없는 종류는 완료로 수용하지 않습니다. 이는 원본의 모든 byte가 복원 전과 같다는 뜻이 아닙니다. `rollbackAbsent`의 모든 durable 참조 0 조건과 자동 대화 삭제 금지는 그대로입니다.
 - `records` 행: `recordId`, `operationId`(모르면 null), `nativeId`, `path`, `state`, `sha256`(기록 파일), `canRollback`, `files`(파일별 분류, 알 수 있을 때)
 - 실패 응답은 `failed`와 `reasonCode`(`needs_attention` \| `unsupported_record` \| `changed` \| `busy`)를 함께 돌려주고, 남은 항목은 `records`에 담습니다. 모르는 `mode`는 기록을 읽기 전에 `failed`입니다.
 - Claude 파일은 "이 작업이 씀"으로 인증하지 않습니다. 그래서 Claude `rollback`은 사용자가 확인한 알 수 없는 파일(`confirmedUnknown`)만 되돌리고, 치운 파일은 모두 `<operationId>.rollback\`에 남깁니다.

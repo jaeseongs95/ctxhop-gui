@@ -87,7 +87,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
     }
 }
 # Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
-$script:GoState='exists'; $script:GoFail=$false
+$script:GoState='exists'; $script:GoFail=$false; $script:GoRetainedKinds=$null
 function Invoke-DesktopGo([string[]]$Arguments) {
     $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
     switch ($Arguments[0]) {
@@ -119,8 +119,14 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
             Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
             $record.status='rolled_back'
+            $result=@{status='rolled_back'}
+            if ($null -ne $script:GoRetainedKinds) {
+                $record | Add-Member NoteProperty absenceKind 'retained' -Force
+                $record | Add-Member NoteProperty retainedKinds $script:GoRetainedKinds -Force
+                $result.absenceKind='retained'; $result.retainedKinds=$script:GoRetainedKinds
+            }
             [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
-            return @{status='rolled_back'}
+            return $result
         }
         guard {
             if ($script:GuardOpen -or $script:GuardBusy) {
@@ -415,9 +421,27 @@ try {
     $goRecord=@((Get-DesktopRecordRows $desktopRoot) | Where-Object impl -eq 'ctxhop-codex')[0]
     Assert ($goRecord.state -ceq 'pending' -and $goRecord.canRollback) 'Go pending record is available for explicit rollback'
     $before=$script:Calls.Count
-    $null=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$goRecord.operationId}
+    $script:GoRetainedKinds=@('state.migrationCursor','queue.revision','agentMessageBoard.deletedBoard')
+    $retainedResult=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$goRecord.operationId}
+    Assert ($retainedResult.outcome -ceq 'rolled_back' -and $retainedResult.absenceKind -ceq 'retained' -and ($retainedResult.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and $retainedResult.message -match '보존했습니다') 'retained rollback reports conversation absence and preserved markers'
+    $retainedDone=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($goRecord.operationId).json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert ($retainedDone.absenceKind -ceq 'retained' -and ($retainedDone.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and -not [IO.File]::Exists((Join-Path $testDirectory "CtxHopGUI\journal\$($goRecord.operationId).json"))) 'retained proof is preserved in the terminal record before clearing the marker'
+    $again=Invoke-Vendor ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot}) 'recover' @{mode='rollback';recordId=$goRecord.recordId}
+    Assert ($again.absenceKind -ceq 'retained' -and $again.message -match '보존했습니다') 'an already rolled back Go record keeps its truthful retained result'
+    $script:GoRetainedKinds=$null
     Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'rollback'}).Count -eq 1) 'Go record rollback invokes Go'
     Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go rollback never invokes Python'
+    # malformed retained metadata never becomes a terminal success, including after a restart.
+    $badMetadata=@(@(),@('queue.revision','queue.revision'),@('agentMessageBoard.deletedBoard','state.migrationCursor'),@('logs.thread'),@($null),@('QUEUE.REVISION'))
+    $caseNumber=20
+    foreach ($badKinds in $badMetadata) {
+        $badOp=$caseNumber.ToString('x32'); $caseNumber++
+        $badJournal=@{status='rolled_back';home=$desktopRoot;id=$script:Id;impl='ctxhop-codex';absenceKind='retained';retainedKinds=$badKinds}
+        Write-RunJournal $badOp ($badJournal | ConvertTo-Json -Compress -Depth 4)
+        Assert ((Get-DesktopRecord $desktopRoot $badOp).state -ceq 'unreadable') 'malformed retained journal is unreadable and preserved'
+        Throws {New-DesktopRollbackResult ([pscustomobject]$badJournal) 'fixture'} '보존한 엔진 기록'
+        [IO.File]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp\journal.json"))
+    }
     $script:GoFail=$false; $script:GoState='exists'
     $script:State='conflict'; $job.action='Preview'; $r=Invoke-JobCore $job
     $job.action='Restore'; $job.receipt=$r.receipt; $job.token=$r.preview.token; $job.choice='incoming'; $script:ApplyFail=$true
