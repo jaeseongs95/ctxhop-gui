@@ -186,7 +186,7 @@ func TestSnapshotRejectsJournalAndAbsentWALChange(t *testing.T) {
 			t.Fatal("hot journal accepted")
 		}
 	})
-	for _, suffix := range []string{"-wal", "-journal"} {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		t.Run("absent-becomes-present"+suffix, func(t *testing.T) {
 			source := snapshotFixture(t, false)
 			private := filepath.Join(t.TempDir(), "private")
@@ -206,7 +206,7 @@ func TestSnapshotRejectsJournalAndAbsentWALChange(t *testing.T) {
 	}
 }
 func TestSnapshotPartialSizeAndFreshCreation(t *testing.T) {
-	for _, mode := range []string{"partial-error", "partial-success", "size", "existing-private", "existing-copy"} {
+	for _, mode := range []string{"partial-error", "partial-success", "disk-full-error", "size", "existing-private", "existing-copy"} {
 		t.Run(mode, func(t *testing.T) {
 			source := snapshotFixture(t, false)
 			before, _ := dbHashes(source)
@@ -222,6 +222,9 @@ func TestSnapshotPartialSizeAndFreshCreation(t *testing.T) {
 					}
 					return n, e
 				}
+			}
+			if mode == "disk-full-error" {
+				copyBytes = func(w io.Writer, r io.Reader) (int64, error) { return 0, syscall.Errno(112) }
 			}
 			if mode == "size" {
 				max = 100

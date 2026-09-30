@@ -136,13 +136,13 @@ func snapshotACL(path, sid string) error {
 	u, _ := syscall.UTF16PtrFromString(path)
 	adv := syscall.NewLazyDLL("advapi32.dll")
 	var sd *byte
-	r, _, _ := adv.NewProc("GetNamedSecurityInfoW").Call(uintptr(unsafe.Pointer(u)), 1, 4, 0, 0, 0, 0, uintptr(unsafe.Pointer(&sd)))
+	r, _, _ := adv.NewProc("GetNamedSecurityInfoW").Call(uintptr(unsafe.Pointer(u)), 1, 5, 0, 0, 0, 0, uintptr(unsafe.Pointer(&sd)))
 	if r != 0 {
 		return syscall.Errno(r)
 	}
 	defer proc("LocalFree").Call(uintptr(unsafe.Pointer(sd)))
 	var text *uint16
-	r, _, e := adv.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW").Call(uintptr(unsafe.Pointer(sd)), 1, 4, uintptr(unsafe.Pointer(&text)), 0)
+	r, _, e := adv.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW").Call(uintptr(unsafe.Pointer(sd)), 1, 5, uintptr(unsafe.Pointer(&text)), 0)
 	if r == 0 {
 		return e
 	}
@@ -153,7 +153,7 @@ func snapshotACL(path, sid string) error {
 		proc("RtlMoveMemory").Call(uintptr(unsafe.Pointer(&buf[i])), uintptr(unsafe.Pointer(text))+uintptr(i*2), 2)
 		if buf[i] == 0 {
 			got := syscall.UTF16ToString(buf[:i])
-			if got != "D:P(A;OICI;FA;;;"+sid+")" {
+			if got != "O:"+sid+"D:P(A;OICI;FA;;;"+sid+")" {
 				return fmt.Errorf("snapshot DACL is not protected single-user: %s", got)
 			}
 			return nil
@@ -178,9 +178,9 @@ func acquireTestSnapshot(source, private string, max int64, hook func(string) er
 	if e := snapshotAbsent(source + "-journal"); e != nil {
 		return s, e // any rollback journal is conservative failure
 	}
-	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal"} {
+	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"} {
 		entry, e := snapshotOpen(filepath.Join(filepath.Dir(source), name), false)
-		if name == "state_5.sqlite-wal" && e == syscall.ERROR_FILE_NOT_FOUND {
+		if name != "state_5.sqlite" && e == syscall.ERROR_FILE_NOT_FOUND {
 			continue
 		}
 		if e != nil {
@@ -196,6 +196,14 @@ func acquireTestSnapshot(source, private string, max int64, hook func(string) er
 	}
 	if e := s.lockDirs(filepath.Dir(private)); e != nil {
 		return s, e
+	}
+	if entry, exists := s.Files["state_5.sqlite-shm"]; exists {
+		hash, _, e := snapshotHash(entry.File, lineLimit)
+		if e != nil {
+			return s, e
+		}
+		entry.Hash = hash
+		s.Files["state_5.sqlite-shm"] = entry
 	}
 	sid, sd, e := snapshotSecurity()
 	if e != nil {
@@ -296,9 +304,11 @@ func (s *testSnapshot) Verify(max int64) error {
 	if e := snapshotAbsent(s.Source + "-journal"); e != nil {
 		return e
 	}
-	if _, exists := s.Files["state_5.sqlite-wal"]; !exists {
-		if e := snapshotAbsent(s.Source + "-wal"); e != nil {
-			return e
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, exists := s.Files["state_5.sqlite"+suffix]; !exists {
+			if e := snapshotAbsent(s.Source + suffix); e != nil {
+				return e
+			}
 		}
 	}
 	for _, entry := range s.Dirs {
