@@ -22,15 +22,16 @@ type rpcError struct {
 
 func (e *rpcError) Error() string { return fmt.Sprintf("엔진 RPC 오류 (%d)", e.Code) } // engine의 비밀 포함 오류 문자열은 전달하지 않는다.
 type session struct {
-	P          *process
-	Projection object
-	Binding    object
-	Members    []member
-	Options    options
-	Operation  string
-	Call       func(string, object) (object, error)
-	Notify     func(string, object) error
-	Close      func() error
+	P           *process
+	Projection  object
+	Binding     object
+	Members     []member
+	Options     options
+	Operation   string
+	Acquisition *dbAcquisition
+	Call        func(string, object) (object, error)
+	Notify      func(string, object) error
+	Close       func() error
 }
 
 func enginePath(o options) (string, error) {
@@ -299,45 +300,41 @@ func (s *session) complete(observed dbView) error {
 	if s.Projection["inputComplete"] == true {
 		return nil
 	}
-	before := observed.Hashes
-	current, e := dbHashes(text(s.Projection["stateDb"]))
-	if e != nil {
-		return e
-	}
-	if !bytes.Equal(encoded(before), encoded(current)) {
-		return fail("engine_db_changed", "U-a 이후 DB/WAL 변경")
-	}
-	main := before[text(s.Projection["stateDb"])]
-	if !hashRE.MatchString(main) {
-		return fail("engine_db_unknown", "complete 전 DB 본문 부재")
-	}
-	var wal any
-	w := before[text(s.Projection["stateDb"])+"-wal"]
-	if w != "absent" {
-		if !hashRE.MatchString(w) {
-			return fail("engine_db_unknown", "complete 전 WAL hash 오류")
+	observation := observed.Observation
+	if observed.Acquisition != nil {
+		if e := observed.Acquisition.VerifyPrivate(); e != nil {
+			return e
 		}
-		wal = w
+		current, e := observed.Acquisition.Observation()
+		if e != nil {
+			return e
+		}
+		if !bytes.Equal(encoded(observation), encoded(current)) {
+			return fail("engine_db_changed", "U-a 이후 acquisition 변경")
+		}
+	} else if s.P != nil {
+		return fail("engine_db_unknown", "complete에 유지된 raw acquisition 누락")
+	}
+	if !exact(observation, "stateDb", "mainSha256", "walSha256", "acquisition") || !samePath(text(observation["stateDb"]), text(s.Projection["stateDb"])) || !hashRE.MatchString(text(observation["mainSha256"])) || observation["walSha256"] != nil && !hashRE.MatchString(text(observation["walSha256"])) || !opRE.MatchString(text(obj(observation["acquisition"])["acquisitionId"])) {
+		return fail("engine_db_unknown", "complete acquisition descriptor 오류")
 	}
 	params := object{}
 	for k, v := range s.Binding {
 		params[k] = v
 	}
-	params["dbObservation"] = object{"stateDb": s.Projection["stateDb"], "mainSha256": main, "walSha256": wal}
+	params["dbObservation"] = observation
 	r, e := s.Call("ctxhop/complete", params)
 	if e != nil {
 		return e
 	}
-	after, e := dbHashes(text(s.Projection["stateDb"]))
-	if e != nil {
-		return e
-	}
-	if !bytes.Equal(encoded(before), encoded(after)) {
-		return fail("engine_db_changed", "complete 중 DB/WAL 변경")
+	if observed.Acquisition != nil {
+		if e := observed.Acquisition.VerifyPrivate(); e != nil {
+			return e
+		}
 	}
 	oldGen, _ := integer(s.Projection["generation"])
 	newGen, _ := integer(r["generation"])
-	if newGen <= oldGen || text(r["processNonce"]) != text(s.Projection["processNonce"]) || text(r["snapshotId"]) != text(s.Projection["snapshotId"]) || r["inputComplete"] != true {
+	if newGen <= oldGen || text(r["processNonce"]) != text(s.Projection["processNonce"]) || text(r["snapshotId"]) != text(s.Projection["snapshotId"]) || r["inputComplete"] != true || r["acquisitionId"] != obj(observation["acquisition"])["acquisitionId"] {
 		return fail("prestart_binding", "최종 complete binding 오류")
 	}
 	pid, _ := integer(s.Projection["processId"])
@@ -356,7 +353,7 @@ func asRPC(e error, out **rpcError) bool {
 	return ok
 }
 func validateProjection(r object, n, operation string, o options, members []member, pid int64) error {
-	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "effects") {
+	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "effects") {
 		return fail("prestart_schema", "알 수 없는 prepare projection 구조")
 	}
 	version, ok := integer(r["contractVersion"])
@@ -377,7 +374,8 @@ func validateProjection(r object, n, operation string, o options, members []memb
 	effects := obj(r["effects"])
 	writes, wok := integer(effects["applicationWrites"])
 	network, nok := integer(effects["networkRequests"])
-	if !exact(effects, "applicationWrites", "networkRequests", "sqliteShmMayChange") || !wok || !nok || writes != 0 || network != 0 || (effects["sqliteShmMayChange"] != true && effects["sqliteShmMayChange"] != false) || partial && effects["sqliteShmMayChange"] != false || r["inputComplete"] == true && operation != "plan" && operation != "bootstrap" && effects["sqliteShmMayChange"] != true {
+	acquired := r["inputComplete"] == true && operation != "plan" && operation != "bootstrap"
+	if !exact(effects, "applicationWrites", "networkRequests", "sqliteShmMayChange", "privateSqliteSidecarsMayChange") || !wok || !nok || writes != 0 || network != 0 || effects["sqliteShmMayChange"] != false || effects["privateSqliteSidecarsMayChange"] != acquired || acquired && !opRE.MatchString(text(r["acquisitionId"])) || !acquired && r["acquisitionId"] != nil {
 		return fail("prestart_effects", "준비 단계 효과0 조건 실패")
 	}
 	if text(r["authResolution"]) != "resolved" || text(r["policyResolution"]) != "resolved" {
@@ -482,11 +480,53 @@ func validateProjection(r object, n, operation string, o options, members []memb
 	}
 	return nil
 }
+func (s *session) revalidateHandoff() error {
+	if e := checkGuard(s.P); e != nil {
+		return e
+	}
+	if s.Acquisition != nil {
+		if e := s.Acquisition.VerifyReleasedSource(); e != nil {
+			return fail("engine_db_changed", "acquisition 해제 후 원본 변경/접근 오류")
+		}
+	} else if s.P != nil && s.Operation != "plan" && s.Operation != "bootstrap" {
+		return fail("prestart_incomplete", "정리된 acquisition 없는 member activation 금지")
+	}
+	if s.P != nil && s.Operation == "bootstrap" {
+		if e := snapshotAbsent(text(s.Projection["stateDb"])); e != nil {
+			return fail("engine_db_changed", "bootstrap 전 state 부재 변경")
+		}
+	}
+	for _, m := range s.Members {
+		b, e := readBounded(m.Path, limit)
+		absent := (s.Operation == "rollback" || s.Operation == "rollback-check") && os.IsNotExist(e)
+		if absent {
+			found := false
+			for _, raw := range array(s.Projection["contexts"]) {
+				context := obj(raw)
+				if context["memberId"] == m.ID && context["phase"] == "rollbackAbsent" {
+					found = true
+				}
+			}
+			if found {
+				continue
+			}
+		}
+		if e != nil || digest(b) != m.SHA256 {
+			return fail("stale_input", "accept/activate 전 rollout 입력 변경")
+		}
+	}
+	// Canonical Config/auth/loader freshness is revalidated by the provider's
+	// accept/activate against its retained typed inputs, not reconstructed here.
+	return nil
+}
 func (s *session) activate() error {
 	if s.Projection["inputComplete"] != true {
 		return fail("prestart_incomplete", "complete 전 activate 금지")
 	}
 	for _, step := range []struct{ method, key string }{{"ctxhop/accept", "accepted"}, {"ctxhop/activate", "activated"}} {
+		if e := s.revalidateHandoff(); e != nil {
+			return e
+		}
 		r, e := s.Call(step.method, s.Binding)
 		if e != nil {
 			return e

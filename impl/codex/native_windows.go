@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -410,14 +411,22 @@ type ioDiscard struct{}
 func (ioDiscard) Write(b []byte) (int, error) { return len(b), nil }
 
 type dbView struct {
-	IDs    map[string]bool
-	Edges  []object
-	Count  int
-	Hashes map[string]string
+	IDs         map[string]bool
+	Edges       []object
+	Count       int
+	Hashes      map[string]string
+	Acquisition *dbAcquisition
+	Observation object
 }
 
 func checkDB(home, statePath string, members []member, allowMissing bool) (dbView, error) {
-	v := dbView{IDs: map[string]bool{}}
+	return checkDBAcquisition(home, statePath, members, allowMissing, false)
+}
+func checkDBPrepared(home, statePath string, members []member, allowMissing bool) (dbView, error) {
+	return checkDBAcquisition(home, statePath, members, allowMissing, true)
+}
+func checkDBAcquisition(home, statePath string, members []member, allowMissing, keep bool) (v dbView, retErr error) {
+	v = dbView{IDs: map[string]bool{}}
 	if !samePath(statePath, filepath.Join(home, "state_5.sqlite")) {
 		return v, fail("engine_db_unknown", "실제 state descriptor 경로 오류")
 	}
@@ -440,27 +449,25 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 	if e != nil {
 		return v, fail("engine_db_unknown", "state DB가 없거나 접근할 수 없습니다")
 	}
-	before, e := dbHashes(statePath)
+	s, e := acquireSnapshot(statePath, filepath.Join(os.TempDir(), "ctxhop-acquisition-"+nonce()), limit, nil, nil)
 	if e != nil {
-		return v, e
+		return v, fail("engine_db_unknown", "원본 raw acquisition 실패")
 	}
-	for _, p := range []string{statePath + "-wal", statePath + "-shm", statePath + "-journal"} {
-		if e = noReparse(p); e != nil {
-			return v, e
+	defer func() {
+		if retErr != nil || !keep {
+			retErr = errors.Join(retErr, s.Close(true))
 		}
-	}
-	headerFile, e := os.Open(statePath)
+	}()
+	privatePath := filepath.Join(s.Private, "state_5.sqlite")
+	headerFile, e := os.Open(privatePath)
 	if e != nil {
 		return v, e
 	}
 	header := make([]byte, 100)
 	_, e = io.ReadFull(headerFile, header)
-	headerFile.Close()
+	e = errors.Join(e, headerFile.Close())
 	if e != nil || !bytes.Equal(header[:16], []byte("SQLite format 3\x00")) || (header[18] != 1 && header[18] != 2) || header[18] != header[19] {
 		return v, fail("engine_db_unknown", "DB 파일 header 구조 불명")
-	}
-	if header[18] == 2 && before[statePath+"-wal"] == "absent" {
-		return v, fail("engine_db_unknown", "WAL 모드의 WAL 부재는 무쓰기 열기를 증명할 수 없습니다")
 	}
 	dir, e := systemDirectory()
 	if e != nil {
@@ -480,7 +487,7 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 		funcs[name] = p
 	}
 	var db uintptr
-	uri := url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(statePath), RawQuery: "mode=ro"}
+	uri := url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(privatePath), RawQuery: "mode=ro"}
 	name := append([]byte(uri.String()), 0)
 	r, _, _ := funcs["sqlite3_open_v2"].Call(uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&db)), 0x41, 0)
 	if r != 0 {
@@ -490,15 +497,20 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 		return v, fail("engine_db_unknown", "state DB readonly 열기 실패")
 	}
 	var inspectErr error
-	query := func(sql string) ([][]string, error) {
+	query := func(sql string) (rows [][]string, retErr error) {
 		buf := append([]byte(sql), 0)
 		var stmt uintptr
 		r, _, _ := funcs["sqlite3_prepare_v2"].Call(db, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)-1), uintptr(unsafe.Pointer(&stmt)), 0)
 		if r != 0 {
 			return nil, fail("engine_db_unknown", "readonly SQL 구조 검사 실패")
 		}
-		defer funcs["sqlite3_finalize"].Call(stmt)
-		rows := [][]string{}
+		defer func() {
+			rc, _, _ := funcs["sqlite3_finalize"].Call(stmt)
+			if rc != 0 {
+				retErr = errors.Join(retErr, fail("engine_db_unknown", "SQL statement 종료 실패"))
+			}
+		}()
+		rows = [][]string{}
 		for {
 			r, _, _ := funcs["sqlite3_step"].Call(stmt)
 			if r == 101 {
@@ -611,15 +623,24 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 	if rc != 0 {
 		return v, fail("engine_db_unknown", "DB handle 종료 실패")
 	}
-	after, e := dbHashes(statePath)
+	if e := s.VerifyPrivate(); e != nil {
+		inspectErr = errors.Join(inspectErr, fail("engine_db_changed", "private query 효과 또는 원본 acquisition 변경"))
+	}
+	if inspectErr != nil {
+		return v, inspectErr
+	}
+	v.Observation, e = s.Observation()
 	if e != nil {
 		return v, e
 	}
-	if fmt.Sprint(before) != fmt.Sprint(after) {
-		return v, fail("engine_db_changed", "readonly 검사 중 DB/WAL이 바뀌었습니다")
+	v.Hashes = map[string]string{statePath: s.Files["state_5.sqlite"].Hash, statePath + "-wal": "absent"}
+	if wal, exists := s.Files["state_5.sqlite-wal"]; exists {
+		v.Hashes[statePath+"-wal"] = wal.Hash
 	}
-	v.Hashes = before
-	return v, inspectErr
+	if keep {
+		v.Acquisition = s
+	}
+	return v, nil
 }
 func dbHashes(path string) (map[string]string, error) {
 	m := map[string]string{}

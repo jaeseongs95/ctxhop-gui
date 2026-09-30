@@ -25,7 +25,7 @@ type mockEngine struct {
 
 func installMock(t *testing.T, f *family) *mockEngine {
 	t.Helper()
-	oldPrepare, oldGuard, oldState := prepareEngine, checkGuard, readState
+	oldPrepare, oldGuard, oldState, oldPreparedState := prepareEngine, checkGuard, readState, readPreparedState
 	oldPin, oldLoader := engineSHA256, loaderContractID
 	engineSHA256 = strings.Repeat("a", 64)
 	loaderContractID = "fixture"
@@ -54,10 +54,20 @@ func installMock(t *testing.T, f *family) *mockEngine {
 		}
 		return v, e
 	}
+	readPreparedState = func(home, state string, ms []member, missing bool) (dbView, error) {
+		v, e := readState(home, state, ms, missing)
+		var wal any
+		if hash := v.Hashes[state+"-wal"]; hash != "absent" {
+			wal = hash
+		}
+		v.Observation = object{"stateDb": state, "mainSha256": v.Hashes[state], "walSha256": wal, "acquisition": object{"acquisitionId": strings.Repeat("a", 32)}}
+		return v, e
+	}
 	t.Cleanup(func() {
 		prepareEngine = oldPrepare
 		checkGuard = oldGuard
 		readState = oldState
+		readPreparedState = oldPreparedState
 		engineSHA256 = oldPin
 		loaderContractID = oldLoader
 	})
@@ -95,6 +105,7 @@ func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error
 		case "ctxhop/complete":
 			r := projection(o, op, ms, true)
 			r["generation"] = num(2)
+			r["acquisitionId"] = obj(obj(p["dbObservation"])["acquisition"])["acquisitionId"]
 			return r, nil
 		case "ctxhop/accept", "ctxhop/activate":
 			r := object{}

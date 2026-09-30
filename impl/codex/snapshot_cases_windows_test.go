@@ -221,6 +221,71 @@ func TestSnapshotRejectsJournalAndAbsentWALChange(t *testing.T) {
 		})
 	}
 }
+
+func TestAcquisitionProvenanceAndReleasedSourceChange(t *testing.T) {
+	source := snapshotFixture(t, false)
+	s := snapshotAcquire(t, source)
+	before, e := s.Observation()
+	if e != nil {
+		t.Fatal(e)
+	}
+	a := obj(before["acquisition"])
+	src, private := obj(a["source"]), obj(a["private"])
+	if !opRE.MatchString(text(a["acquisitionId"])) || src["directoryIdentity"] == private["directoryIdentity"] || obj(src["main"])["identity"] == obj(private["main"])["identity"] || obj(src["main"])["sha256"] != obj(private["main"])["sha256"] || src["wal"] != nil || src["shm"] != nil || private["wal"] != nil {
+		t.Fatal("acquisition provenance/presence", before)
+	}
+	if n, e := snapshotCount(s); e != nil || n != 1 {
+		t.Fatal(e, n)
+	}
+	if e := s.VerifyPrivate(); e != nil {
+		t.Fatal(e)
+	}
+	after, e := s.Observation()
+	if e != nil || string(encoded(before)) != string(encoded(after)) {
+		t.Fatal("private query changed original descriptor", e)
+	}
+	if e := s.Close(true); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.VerifyReleasedSource(); e != nil {
+		t.Fatal(e)
+	}
+	f, e := os.OpenFile(source, os.O_APPEND|os.O_WRONLY, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, writeErr := f.Write([]byte("changed-after-source-release"))
+	if e := errors.Join(writeErr, f.Close()); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.VerifyReleasedSource(); e == nil {
+		t.Fatal("handoff source change accepted")
+	}
+}
+
+func TestAcquisitionPrivateSidecarBoundaries(t *testing.T) {
+	for _, mode := range []string{"nonempty-new-wal", "copied-main-change"} {
+		t.Run(mode, func(t *testing.T) {
+			s := snapshotAcquire(t, snapshotFixture(t, false))
+			path := filepath.Join(s.Private, "state_5.sqlite-wal")
+			if mode == "copied-main-change" {
+				path = filepath.Join(s.Private, "state_5.sqlite")
+			}
+			if e := os.WriteFile(path, []byte("forbidden change"), 0600); e != nil {
+				t.Fatal(e)
+			}
+			if e := s.VerifyPrivate(); e == nil {
+				t.Fatal("private sidecar/copied file effect accepted")
+			}
+			// Register the injected new file solely so test cleanup can own it.
+			if mode == "nonempty-new-wal" {
+				if e := snapshotRegisterSidecars(s); e != nil {
+					t.Fatal(e)
+				}
+			}
+		})
+	}
+}
 func TestSnapshotPartialSizeAndFreshCreation(t *testing.T) {
 	for _, mode := range []string{"partial-error", "partial-success", "disk-full-error", "size", "existing-private", "existing-copy"} {
 		t.Run(mode, func(t *testing.T) {

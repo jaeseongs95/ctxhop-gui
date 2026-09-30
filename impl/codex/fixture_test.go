@@ -326,7 +326,12 @@ func projection(o options, op string, ms []member, complete bool) object {
 			contexts = append(contexts, object{"memberId": m.ID, "ownerId": m.ID, "phase": phase, "cwd": o.Cwd, "rolloutSha256": sha, "settingsDigest": sd, "contextId": m.ID, "sqliteHome": o.Home})
 		}
 	}
-	return object{"contractVersion": num(1), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": complete && op != "plan" && op != "bootstrap"}}
+	acquired := complete && op != "plan" && op != "bootstrap"
+	var acquisitionID any
+	if acquired {
+		acquisitionID = strings.Repeat("a", 32)
+	}
+	return object{"contractVersion": num(1), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "acquisitionId": acquisitionID, "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false, "privateSqliteSidecarsMayChange": acquired}}
 }
 func TestProjectionAndToken(t *testing.T) {
 	old := loaderContractID

@@ -213,8 +213,8 @@ func TestNativeReadOnlyDB(t *testing.T) {
 		if string(encoded(before)) != string(encoded(after)) {
 			t.Fatal("body/WAL changed")
 		}
-		if _, e = os.Stat(filepath.Join(home, "state_5.sqlite-shm")); e != nil {
-			t.Fatal("SHM exception not observed", e)
+		if _, e = os.Stat(filepath.Join(home, "state_5.sqlite-shm")); !os.IsNotExist(e) {
+			t.Fatal("original SHM namespace changed", e)
 		}
 		os.Remove(filepath.Join(home, "state_5.sqlite-wal"))
 		missingBefore, _ := dbHashes(filepath.Join(home, "state_5.sqlite"))

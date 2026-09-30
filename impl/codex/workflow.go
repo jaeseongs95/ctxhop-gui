@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 var prepareEngine = openEngine
 var checkGuard = guard
 var readState = checkDB
+var readPreparedState = checkDBPrepared
 var advanceJournal = advance
 var stageFile = createFile
 
@@ -339,14 +341,19 @@ func importArchive(o options) (result object, retErr error) {
 	}
 	return object{"status": "imported", "members": j.Members, "engineVersion": j.EngineVersion, "run": o.Run, "pending": []string{}, "recovery": "none", "coldSandbox": cold}, nil
 }
-func admit(s *session, home string, ms []member, missing bool) (dbView, error) {
+func admit(s *session, home string, ms []member, missing bool) (view dbView, retErr error) {
 	if e := checkGuard(s.P); e != nil {
 		return dbView{}, e
 	}
-	view, e := readState(home, text(s.Projection["stateDb"]), ms, missing)
+	view, e := readPreparedState(home, text(s.Projection["stateDb"]), ms, missing)
 	if e != nil {
 		return view, e
 	}
+	defer func() {
+		if view.Acquisition != nil {
+			retErr = errors.Join(retErr, view.Acquisition.Close(true))
+		}
+	}()
 	if s.Operation == "rollback" || s.Operation == "rollback-check" {
 		for _, m := range s.Members {
 			if _, e := os.Stat(m.Path); os.IsNotExist(e) {
@@ -364,6 +371,18 @@ func admit(s *session, home string, ms []member, missing bool) (dbView, error) {
 		}
 	}
 	if e = s.complete(view); e != nil {
+		return view, e
+	}
+	if view.Acquisition != nil {
+		if e := view.Acquisition.VerifyPrivate(); e != nil {
+			return view, e
+		}
+		if e := view.Acquisition.Close(true); e != nil {
+			return view, e
+		}
+		s.Acquisition = view.Acquisition
+	}
+	if e := s.revalidateHandoff(); e != nil {
 		return view, e
 	}
 	return view, nil
