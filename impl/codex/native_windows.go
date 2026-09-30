@@ -417,6 +417,7 @@ type dbView struct {
 	Hashes      map[string]string
 	Acquisition *dbAcquisition
 	Observation object
+	Backend     object
 }
 
 func checkDB(home, statePath string, members []member, allowMissing bool) (dbView, error) {
@@ -458,6 +459,16 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 			retErr = errors.Join(retErr, s.Close(true))
 		}
 	}()
+	v, e = inspectPrivateState(s, members)
+	if keep && e == nil {
+		v.Acquisition = s
+	}
+	return v, e
+}
+
+func inspectPrivateState(s *dbAcquisition, members []member) (v dbView, retErr error) {
+	v = dbView{IDs: map[string]bool{}}
+	statePath := s.Source
 	privatePath := filepath.Join(s.Private, "state_5.sqlite")
 	headerFile, e := os.Open(privatePath)
 	if e != nil {
@@ -477,7 +488,7 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 	if e != nil {
 		return v, fail("engine_db_unknown", "readonly SQLite를 사용할 수 없습니다")
 	}
-	defer dll.Release()
+	defer func() { retErr = errors.Join(retErr, dll.Release()) }()
 	funcs := map[string]*syscall.Proc{}
 	for _, name := range []string{"sqlite3_open_v2", "sqlite3_close", "sqlite3_prepare_v2", "sqlite3_step", "sqlite3_finalize", "sqlite3_column_text", "sqlite3_column_count", "sqlite3_column_bytes"} {
 		p, e := dll.FindProc(name)
@@ -551,6 +562,11 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 		if _, e := query("BEGIN"); e != nil {
 			return e
 		}
+		backend, e := sqliteTypedQuery(dll, db, "SELECT sqlite_version(),sqlite_source_id()")
+		if e != nil || len(backend) != 1 || len(backend[0]) != 2 {
+			return fail("engine_db_unknown", "private SQLite backend 불명")
+		}
+		v.Backend = object{"version": backend[0][0], "sourceId": backend[0][1]}
 		check, e := query("PRAGMA quick_check")
 		if e != nil || len(check) != 1 || check[0][0] != "ok" {
 			return fail("engine_db_unknown", "state DB integrity 오류")
@@ -653,9 +669,6 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 	v.Hashes = map[string]string{statePath: s.Files["state_5.sqlite"].Hash, statePath + "-wal": "absent"}
 	if wal, exists := s.Files["state_5.sqlite-wal"]; exists {
 		v.Hashes[statePath+"-wal"] = wal.Hash
-	}
-	if keep {
-		v.Acquisition = s
 	}
 	return v, nil
 }
