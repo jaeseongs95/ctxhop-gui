@@ -110,7 +110,9 @@ func TestBackendSequence(t *testing.T) {
 	}
 	sql := liveFixtureSQL(t) + liveFixtureThread(rootID)
 	if *backendMode == "decoder-error" {
-		sql += `UPDATE threads SET created_at='not-an-integer';`
+		// The legacy timestamp trigger coerces invalid text to a valid ms value.
+		// Canonical SQL reads created_at_ms; i64::MAX exceeds chrono's range.
+		sql += `UPDATE threads SET created_at_ms=9223372036854775807;`
 	}
 	seedClose := sqliteFixture(t, seed, true, sql)
 	seedClosed := false
