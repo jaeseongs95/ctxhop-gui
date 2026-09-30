@@ -138,7 +138,7 @@ function Get-PrestartCasePlan {
         @{id='changed-source';sequence=@('prepare','mutate captured config/absence/rollout','accept/activate');expected='reject stale captured input';seed='startup'},
         @{id='multi-cwd-v2';sequence=@('prepare(members)','U-a','complete','accept','activate','first/cold resume');expected='approved parent settings/cwd only';seed='canonical legacy/full-turns/v2 required'},
         @{id='metadata-change';sequence=@('prepare','U-a','mutate main/WAL','complete');expected='reject DB observation mismatch';seed='canonical cold'},
-        @{id='readonly-shm';sequence=@('prepare','U-a','complete');expected='main/WAL0; exact observed stateDb-shm only';seed='canonical WAL fixture'},
+        @{id='readonly-shm';sequence=@('prepare','U-a','complete');expected='original main/WAL/SHM unchanged; same private generation; bounded private sidecars only';seed='fresh synthetic WAL fixture'},
         @{id='prepare-shm-write';sequence=@('prepare');expected='no DB open and no SHM exception';seed='startup'},
         @{id='activation-job-close';sequence=@('activate','initialize','EOF/timeout','Job close','final guard');expected='whole own Job active0 incl nested children';seed='canonical bootstrap'},
         @{id='ambiguous-activation';sequence=@('activate','drop ACK','close Job','inspect actual journal');expected='no activate replay; placing+ remains pending';seed='journal fault injection'},
@@ -154,7 +154,7 @@ function Get-PrestartConnectionPlan([object]$Provider=$null) {
     }
     $phases=@(
         @{id='standalone-prepare';source=@('config/auth/cloud denial before effects','no SQLite open','no background worker spawn');os=@('all application file writes including transient','process/thread/descendant creation','DNS/connect/send including denied attempts');allowed='applicationWrites0/network0; no SHM exception'},
-        @{id='complete-after-U-a';source=@('Go handles closed before complete','main/WAL observation and generation binding','read-only metadata/context');os=@('main/WAL write and mapping activity','exact observed SHM path only','network attempts');allowed='main/WAL0/network0; approved SHM only'},
+        @{id='complete-after-U-a';source=@('source raw lease retained through both readers','Go U-a reader closed before Rust canonical pool','same private acquisition and generation binding','Rust pool.close awaited on success and error; revalidate then close','private cleanup before source lease release');os=@('original main/WAL/SHM write and mapping activity','bounded private SHM and new empty WAL only','network attempts');allowed='original namespace unchanged/network0; private sidecars only'},
         @{id='accept-abort-eof';source=@('all six binding fields','incomplete/old generation rejected','accept never activates','EOF/abort cleanup');os=@('application writes/network attempts','whole owned Job descendants through active0');allowed='applicationWrites0/network0; Job closes'},
         @{id='activate-initialize';source=@('single activation after final accept','MCP/plugin/OTEL/init workers','stable RPC whitelist');os=@('file/network activity by phase','children and grandchildren','timeouts and Job termination');allowed='coordinator must seal activation effect policy'},
         @{id='legacy-paginated-full-child';source=@('canonical legacy/paginated/full-turns reader','approved parent settings/cwd','child membership and rollout digest','first resume whitelist');os=@('DB/rollout and auxiliary writes','per-member network attempts','worker descendants');allowed='scenario-specific sealed resume policy'},
@@ -174,6 +174,39 @@ function Get-PrestartConnectionPlan([object]$Provider=$null) {
             identity='PID + creation time + locked image identity + Job descendants + phase timestamps'
             loss='controller EventsLost/LogBuffersLost/RealTimeBuffersLost and decoded trace loss must be zero; EVENT_TRACE_LOGFILEW.EventsLost is not used'
             limits=@('file tree hash detects final state only','source counters and stderr are not independent OS coverage','registered providers do not prove capture permission','PID filters alone may miss service-mediated effects','zero events without positive calibration is not absence evidence')
+        }
+        backendFixture=@{
+            purpose='fresh synthetic same-generation backend preparation';status='notRun';engineLaunches=0
+            sourceSqliteOpens=0;historicalExportRepeats=0;runtimeCompatibility='notTested'
+            schemaEvidence=@{
+                kind='historical schema-only observation; never a fresh acquisition'
+                exportSha256='d48353071f9d9e9f178a8cb836e2a72732a43cf666cf1b892972b9cba0be6032'
+                comparisonSha256='2329654e2a14a7bf45bba726e249a3e3745e6fef708e6f78ff6c888b112f7f95'
+                objectCount=60;migrationCount=58;checksumEncoding='CRLF SHA384';canonicalEngineSchemaSeal=$false
+            }
+            sequence=@('create fresh owned synthetic DB with source-bound schema and invented rows; close seed writer',
+                'Go acquireSnapshot pins raw source and creates exactly one protected private main/existing WAL copy',
+                'Go WinSQLite U-a reads private only; close statements/database/DLL before Rust reader',
+                'retain Go source lease; Rust validate_acquisition opens the identical private path and identity',
+                'one Rust bundledSQLite canonical pool decodes every member; no migrations/init/repair',
+                'await pool.close on success/error; revalidate private/source and explicitly close validator',
+                'Go verifies source/private; cleans registered private files; releases source handles',
+                'source-only fresh raw identity/size/hash/absence revalidation; no provider activation')
+            cases=@('missing WAL/SHM','existing empty WAL','WAL-only committed row absent from main',
+                'existing stale source SHM never copied','multiple members share one canonical pool',
+                'decoder/query error still closes every reader','different private copy/generation rejected',
+                'changed original/copied main or existing WAL rejected','new nonempty private WAL rejected',
+                'unknown private file/reparse/hardlink/unprotected ACL rejected','cleanup/close failure blocks success')
+            requiredEvidence=@('fixed Go/Rust commit+archive+test executable hashes and exact selectors',
+                'fresh synthetic seed recipe/rows/schema provenance; no historical DB bytes copied',
+                'acquisitionId + source/private native identity/size/hash at every reader boundary',
+                'system WinSQLite DLL identity/hash and actual bundled SQLite source/version',
+                'same canonical member metadata before/after; WAL-only row decoded by both backends',
+                'private sidecar inventory and close/cleanup/source-release outcome on success/error')
+            unresolved=@('helper2 Go test-only cross-backend lifecycle hook',
+                'helper1 canonical pool/decoder test-only hook and fixed artifact',
+                'source/build schema byte normalization and lifecycle seal',
+                'unknown schema/other stores remain needs_attention; no support PASS')
         }
         phases=@($phases)
     }
