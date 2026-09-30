@@ -15,6 +15,7 @@ param(
     [string]$StateMigrations,
     [string]$BuilderScript,
     [string]$MigrationArchive,
+    [string]$SourceRepository,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -338,11 +339,12 @@ function Invoke-SyntheticSchemaComparison([string]$Root,[string]$ReceiptFile,[st
     Write-FixtureJson (Join-Path $path 'migration-comparison.json') $comparison
     return [ordered]@{schemaVersion=1;purpose='postprocess existing synthetic schema receipt';runnerStatus='passed';engineExecuted=$false;traceStarted=$false;engineAcceptance='notRun';sourceSQLiteOpens=0;privateSQLiteOpens=0;exportReused=$true;exportSha256=(Get-FileHash -LiteralPath $inputPath).Hash.ToLowerInvariant();runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant();objectCount=@($export.objects).Count;migrationCount=58;allMigrationsMatchLf=$comparison.allMatchLf;allMigrationsMatchCrlf=$comparison.allMatchCrlf;productionGuardObservation=$export.productionGuardObservation;absoluteWriterExclusion=$export.absoluteWriterExclusion;dll=$export.dll;runtimeCompatibility='notTested'}
 }
-function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Builder,[string]$MigrationsArchive,[string]$ReceiptFile) {
+function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Builder,[string]$MigrationsArchive,[string]$ReceiptFile,[string]$Repository) {
     $path=Assert-OwnedFixturePath $Root
     $archivePath=Assert-OwnedFixturePath $Archive
     $builderPath=Assert-OwnedFixturePath $Builder
     $migrationTar=Assert-OwnedFixturePath $MigrationsArchive
+    $repositoryPath=Assert-OwnedFixturePath $Repository
     $inputPath=Assert-OwnedFixturePath $ReceiptFile
     if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or -not [string]::Equals($PSScriptRoot,(Join-Path (Split-Path $archivePath) 'source'),[StringComparison]::OrdinalIgnoreCase)) { throw 'migrationFixedRunnerRequired' }
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
@@ -363,10 +365,10 @@ function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Co
     # Execute only the reviewed function extent. Builder top-level build code is never invoked.
     . ([scriptblock]::Create($functions[0].Extent.Text))
     [IO.Directory]::CreateDirectory($path) | Out-Null
-    $receipt=[ordered]@{schemaVersion=1;purpose='fixed builder migration byte checks';runnerStatus='failed';sourceCommit=$Commit;builderCommit='21e120fa17d5e291965b1e18c20df269a57b327f';vendorCommit='ff6aec96948b70d94983af2641a6b67c94faeff5';builderSha256=$builderHash;migrationArchiveSha256=$migrationHash;exportSha256=$exportHash;exportReused=$true;exportRepeats=0;sourceSQLiteOpens=0;privateSQLiteOpens=0;engineExecuted=$false;engineAcceptance='notRun';compileExecuted=$false;runtimeCompatibility='notTested';productionAtomicity='notEstablished'}
+    $receipt=[ordered]@{schemaVersion=1;purpose='fixed builder migration byte checks';runnerStatus='failed';sourceCommit=$Commit;sourceRepository=$repositoryPath;builderCommit='21e120fa17d5e291965b1e18c20df269a57b327f';vendorCommit='ff6aec96948b70d94983af2641a6b67c94faeff5';builderSha256=$builderHash;migrationArchiveSha256=$migrationHash;exportSha256=$exportHash;exportReused=$true;exportRepeats=0;sourceSQLiteOpens=0;privateSQLiteOpens=0;engineExecuted=$false;engineAcceptance='notRun';compileExecuted=$false;runtimeCompatibility='notTested';productionAtomicity='notEstablished'}
     try {
         $reference=Join-Path $path 'runner-reference.tar'
-        Invoke-SchemaCommand 'git' @('-C','D:\claude\세션인계\ctxhop-work-20260927\ctxhop-gui','-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$Commit) (Join-Path $path 'runner-archive.log')
+        Invoke-SchemaCommand 'git' @('-C',$repositoryPath,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$Commit) (Join-Path $path 'runner-archive.log')
         $receipt.runnerArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant()
         if ((Get-FileHash -LiteralPath $reference).Hash.ToLowerInvariant() -cne $receipt.runnerArchiveSha256) { throw 'migrationRunnerArchiveMismatch' }
         $receipt.runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
@@ -522,6 +524,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
