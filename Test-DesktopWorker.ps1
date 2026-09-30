@@ -100,11 +100,11 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             return [pscustomobject]@{status=$script:GoState;reason='fixture_go_plan';reasonCode='fixture_go_plan';token=('a'*64);source=@{sessionId=$script:Id};target=@{};projectConfig=@(@{path='D:\synthetic-project\.codex\config.toml';applied=$true;warning=$null})}
         }
         import {
-            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $goFixtureHome=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
             $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
-            $run=Join-Path $home (".ctxhop-desktop-recovery\"+$op)
+            $run=Join-Path $goFixtureHome (".ctxhop-desktop-recovery\"+$op)
             $null=[IO.Directory]::CreateDirectory($run)
-            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$home;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$goFixtureHome;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
             if ($script:GoFail) {
                 $e=[InvalidOperationException]::new('synthetic Go placement failure')
                 $e.Data['backendResult']=[pscustomobject]@{error='synthetic Go placement failure';reasonCode='fixture_interrupted';pending=@($op)}
@@ -113,9 +113,9 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             return @{status='imported';pending=@()}
         }
         rollback {
-            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+            $goFixtureHome=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
             $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
-            $journal=Join-Path $home ".ctxhop-desktop-recovery\$op\journal.json"
+            $journal=Join-Path $goFixtureHome ".ctxhop-desktop-recovery\$op\journal.json"
             $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
             Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
             $record.status='rolled_back'
@@ -451,54 +451,7 @@ try {
         $stagingBefore=(@(Get-ChildItem -LiteralPath $staging -Force | ForEach-Object Name | Sort-Object)) -join '|'
         function Test-StagingClean { return ((@(Get-ChildItem -LiteralPath $staging -Force | ForEach-Object Name | Sort-Object)) -join '|') -eq $stagingBefore }
         $script:Store=[ordered]@{}; $script:PutCount=0; $script:ApplyStatus='imported'
-        # Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
-$script:GoState='exists'; $script:GoFail=$false
-function Invoke-DesktopGo([string[]]$Arguments) {
-    $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
-    switch ($Arguments[0]) {
-        plan {
-            if ($script:GoState -ceq 'failure') {
-                $e=[InvalidOperationException]::new('synthetic prestart failure')
-                $e.Data['backendResult']=[pscustomobject]@{error='synthetic prestart failure';reasonCode='engine_db_unknown';pending=@()}
-                $e.Data['reasonCode']='engine_db_unknown'; throw $e
-            }
-            return [pscustomobject]@{status=$script:GoState;reason='fixture_go_plan';reasonCode='fixture_go_plan';token=('a'*64);source=@{sessionId=$script:Id};target=@{};projectConfig=@(@{path='D:\synthetic-project\.codex\config.toml';applied=$true;warning=$null})}
-        }
-        import {
-            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
-            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
-            $run=Join-Path $home (".ctxhop-desktop-recovery\"+$op)
-            $null=[IO.Directory]::CreateDirectory($run)
-            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$home;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
-            if ($script:GoFail) {
-                $e=[InvalidOperationException]::new('synthetic Go placement failure')
-                $e.Data['backendResult']=[pscustomobject]@{error='synthetic Go placement failure';reasonCode='fixture_interrupted';pending=@($op)}
-                $e.Data['reasonCode']='fixture_interrupted'; throw $e
-            }
-            return @{status='imported';pending=@()}
-        }
-        rollback {
-            $home=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
-            $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
-            $journal=Join-Path $home ".ctxhop-desktop-recovery\$op\journal.json"
-            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
-            Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
-            $record.status='rolled_back'
-            [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
-            return @{status='rolled_back'}
-        }
-        guard {
-            if ($script:GuardOpen) {
-                $e=[InvalidOperationException]::new('synthetic active Codex writer')
-                $e.Data['backendResult']=[pscustomobject]@{status='busy';reasonCode='busy';error='synthetic active Codex writer'}
-                throw $e
-            }
-            return @{status='closed'}
-        }
-        default { throw 'unexpected Go operation' }
-    }
-}
-function Invoke-Bundle([string[]]$Arguments) {
+        function Invoke-Bundle([string[]]$Arguments) {
             $script:Calls+=,[pscustomobject]@{kind='bundle';arguments=$Arguments}
             switch ($Arguments[0]) {
                 list { return @{bundles=@($script:Store.Values | ForEach-Object { @{id=$_.id;metadata=$_.metadata} })} }
@@ -535,9 +488,9 @@ function Invoke-Bundle([string[]]$Arguments) {
                 apply {
                     # 가져왔으면 백엔드처럼 작업 ID 이름의 run 폴더에 완료 journal을 남긴다. equal·local_newer는 기록이 없다.
                     if ($script:ApplyStatus -eq 'imported') {
-                        $home2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $home2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+                        $goFixtureHome2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $goFixtureHome2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
                         $null=New-Item -ItemType Directory -Path $run -Force
-                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$home2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$goFixtureHome2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
                     }
                     return @{status=$script:ApplyStatus}
                 }
