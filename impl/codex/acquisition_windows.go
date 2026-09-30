@@ -137,6 +137,9 @@ func snapshotSecurity() (string, *byte, error) {
 	return sid, sd, nil
 }
 func snapshotACL(path, sid string) error {
+	return snapshotOwnedACL(path, sid, false)
+}
+func snapshotOwnedACL(path, sid string, inheritedSidecar bool) error {
 	u, _ := syscall.UTF16PtrFromString(path)
 	adv := syscall.NewLazyDLL("advapi32.dll")
 	var sd *byte
@@ -157,7 +160,9 @@ func snapshotACL(path, sid string) error {
 		proc("RtlMoveMemory").Call(uintptr(unsafe.Pointer(&buf[i])), uintptr(unsafe.Pointer(text))+uintptr(i*2), 2)
 		if buf[i] == 0 {
 			got := syscall.UTF16ToString(buf[:i])
-			if got != "O:"+sid+"D:P(A;OICI;FA;;;"+sid+")" {
+			protected := "O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")"
+			inherited := "O:" + sid + "D:(A;ID;FA;;;" + sid + ")"
+			if got != protected && !(inheritedSidecar && got == inherited) {
 				return fmt.Errorf("snapshot DACL is not protected single-user: %s", got)
 			}
 			return nil
@@ -406,7 +411,7 @@ func (s *dbAcquisition) VerifyPrivate() error {
 			return e
 		}
 		e = func() error {
-			if e := snapshotACL(entry.File.Name(), s.SID); e != nil {
+			if e := snapshotOwnedACL(entry.File.Name(), s.SID, !copied); e != nil {
 				return e
 			}
 			if old, exists := s.Copies[name]; exists && !snapshotIdentity(old, entry.Info) {
