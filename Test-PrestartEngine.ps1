@@ -18,6 +18,7 @@ param(
     [string]$SourceRepository,
     [string]$GoArchive,
     [string]$GoCommit,
+    [string]$BackendCases,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -475,7 +476,7 @@ function Assert-BackendReadPath([string]$Path,[string]$CaseId) {
     }
     return $full
 }
-function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Repository,[string]$BackendArchive,[string]$BackendCommit) {
+function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Repository,[string]$BackendArchive,[string]$BackendCommit,[string]$Requested) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'backendRunnerRequiresPs7' }
     $path=Assert-OwnedFixturePath $Root; $archivePath=Assert-OwnedFixturePath $Archive
     $repo=Assert-OwnedFixturePath $Repository; $goArchive=Assert-OwnedFixturePath $BackendArchive
@@ -488,9 +489,11 @@ function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Co
     $rustArtifactHash=(Get-FileHash -LiteralPath $rustArtifact).Hash.ToLowerInvariant()
     if ($rustExeHash -cne '3494e9fe61a5756232f97066dfcfaa698dc1c0c78e2e72548bb59c310c5f19c0' -or $rustArtifactHash -cne '88a56530236aa95ea879ce908a7ae72c23922b1ce3374855ea0dcf3c86c4c2ec') { throw 'backendRustPinMismatch' }
     [IO.Directory]::CreateDirectory($path) | Out-Null
-    $cases=@('checkpoint','empty-wal','wal-only','stale-shm','decoder-error','missing-private-copy','nonempty-new-wal','unknown-entry')
-    $caseResults=@($cases | ForEach-Object { [ordered]@{case=$_;status='notRun';caseId=$null} })
-    $summary=[ordered]@{schemaVersion=1;purpose='fresh state-only Go/Rust private acquisition helper compatibility';runnerStatus='failed';sourceCommit=$Commit;goSourceCommit=$BackendCommit;rustSourceCommit='d0fa3d8b26bf4d0f4d2538e45b03e0356d6948f2';rustTestExeSha256=$rustExeHash;rustArtifactSha256=$rustArtifactHash;engineExecuted=$false;engineAcceptance='notRun';runtimeAdmission='notTested';completeEffects='notMeasured';sourceSQLiteOpens=0;historicalExportRepeats=0;backendCasesExecuted=0;creationWriter='checked-in Go test only';ownedTimeoutSeconds=210;goTestTimeout='3m';rustChildTimeout='2m';cases=$caseResults;connectionPlanAdditionalCases='notRun'}
+    $allCases=@('checkpoint','empty-wal','wal-only','stale-shm','decoder-error','missing-private-copy','nonempty-new-wal','unknown-entry')
+    $cases=if ($Requested) { @($Requested.Split(',')) } else { $allCases }
+    if (@($cases | Where-Object { $_ -cnotin $allCases }).Count -or @($cases | Sort-Object -Unique).Count -ne $cases.Count) { throw 'backendCaseSelectionInvalid' }
+    $caseResults=@($allCases | ForEach-Object { [ordered]@{case=$_;status='notRun';caseId=$null} })
+    $summary=[ordered]@{schemaVersion=1;purpose='fresh state-only Go/Rust private acquisition helper compatibility';runnerStatus='failed';sourceCommit=$Commit;goSourceCommit=$BackendCommit;rustSourceCommit='d0fa3d8b26bf4d0f4d2538e45b03e0356d6948f2';rustTestExeSha256=$rustExeHash;rustArtifactSha256=$rustArtifactHash;engineExecuted=$false;engineAcceptance='notRun';runtimeAdmission='notTested';completeEffects='notMeasured';sourceSQLiteOpens=0;historicalExportRepeats=0;backendCasesExecuted=0;requestedCases=@($cases);creationWriter='checked-in Go test only';ownedTimeoutSeconds=210;goTestTimeout='3m';rustChildTimeout='2m';cases=$caseResults;connectionPlanAdditionalCases='notRun'}
     try {
         foreach ($lane in @(@{name='runner';archive=$archivePath;commit=$Commit},@{name='go';archive=$goArchive;commit=$BackendCommit})) {
             $reference=Join-Path $path ($lane.name+'-reference.tar')
@@ -517,7 +520,7 @@ function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Co
         $summary.goTestExeSha256=(Get-FileHash -LiteralPath $testExe).Hash.ToLowerInvariant()
         Invoke-BoundedBackendCommand $testExe @('-test.list','^TestBackendSequence$') $goDirectory (Join-Path $path 'test-list.log')
         if ((Get-Content -LiteralPath (Join-Path $path 'test-list.log') -Raw).Trim() -cne 'TestBackendSequence') { throw 'backendSelectorMissing' }
-        foreach ($entry in $caseResults) {
+        foreach ($entry in @($caseResults | Where-Object { $_.case -cin $cases })) {
             $id=[guid]::NewGuid().ToString('N'); $entry.caseId=$id
             $caseRoot='D:\Go\codex-s4\backend-fixtures\'+$id
             if (Test-Path -LiteralPath $caseRoot) { throw 'backendCaseAlreadyExists' }
@@ -638,6 +641,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit $BackendCases } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
