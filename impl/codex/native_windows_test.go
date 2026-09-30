@@ -205,7 +205,7 @@ func liveFixtureSQL(t *testing.T) string {
 	return sql.String()
 }
 func liveFixtureThread(id string) string {
-	return `INSERT INTO threads(id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES('` + id + `','D:/Go/owned-rollout.jsonl',1,1,'cli','openai','D:/Go','fixture','read-only','untrusted');`
+	return `INSERT INTO threads(id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES('` + id + `','D:/Go/owned-rollout-` + id + `.jsonl',1,1,'cli','openai','D:/Go','fixture','read-only','untrusted');`
 }
 
 func TestNativeReadOnlyDB(t *testing.T) {
@@ -357,6 +357,22 @@ func TestStateEdgesSurviveUnrelatedReferenceRows(t *testing.T) {
 	}
 	_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
 	assertCode(t, e, "foreign_link")
+}
+
+func TestStateSourceAndMigrationReferencesBlock(t *testing.T) {
+	for _, tc := range []struct{ sql, code string }{
+		{`UPDATE threads SET source='{"subagent":{"thread_spawn":{"parent_thread_id":"` + rootID + `","depth":1}}}' WHERE id='` + otherID + `';`, "foreign_link"},
+		{`UPDATE threads SET source='unrecognized' WHERE id='` + otherID + `';`, "engine_db_unknown"},
+		{`INSERT INTO rollout_migration_state VALUES('migration',1,'` + rootID + `',1);`, "foreign_reference"},
+		{`INSERT INTO rollout_migration_skipped_rollouts VALUES('migration','D:/Go/owned-rollout-` + rootID + `.jsonl',1,1,'fixture',1);`, "foreign_reference"},
+		{`INSERT INTO thread_sections(id,name) VALUES('section','fixture'); UPDATE threads SET thread_section_id='section' WHERE id='` + rootID + `';`, "foreign_reference"},
+	} {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, liveFixtureSQL(t)+liveFixtureThread(rootID)+liveFixtureThread(otherID)+tc.sql)
+		close()
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID, Path: "D:/Go/owned-rollout-" + rootID + ".jsonl"}}, false)
+		assertCode(t, e, tc.code)
+	}
 }
 func makeJunction(system, link, target string) error {
 	cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)

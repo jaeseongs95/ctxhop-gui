@@ -625,6 +625,65 @@ func inspectPrivateState(s *dbAcquisition, members []member) (v dbView, retErr e
 		for _, m := range members {
 			ids[m.ID] = true
 		}
+		metadata, e := query("SELECT id,source,rollout_path,project_id,thread_section_id FROM threads")
+		if e != nil {
+			return e
+		}
+		for _, row := range metadata {
+			if len(row) != 5 || !uuidRE.MatchString(row[0]) {
+				return fail("engine_db_unknown", "state metadata 참조 descriptor 오류")
+			}
+			parent, e := stateSourceParent(row[1])
+			if e != nil {
+				return e
+			}
+			if parent != "" && ids[parent] != ids[row[0]] {
+				return fail("foreign_link", "edge 테이블 밖 SessionSource parent 연결")
+			}
+			if !ids[row[0]] {
+				for _, m := range members {
+					if m.Path != "" && samePath(m.Path, row[2]) {
+						return fail("foreign_reference", "구성원 밖 DB row가 대상 rollout을 소유합니다")
+					}
+				}
+			}
+			if ids[row[0]] {
+				if row[3] != "" || row[4] != "" {
+					return fail("foreign_reference", "구성원의 project/section 분류 보존 미지원")
+				}
+				for _, m := range members {
+					if m.ID == row[0] && m.Path != "" && !samePath(m.Path, row[2]) {
+						return fail("foreign_reference", "state rollout owner/path 불일치")
+					}
+				}
+			}
+		}
+		cursor, e := query("SELECT last_checked_thread_id FROM rollout_migration_state")
+		if e != nil {
+			return e
+		}
+		for _, row := range cursor {
+			if len(row) != 1 {
+				return fail("engine_db_unknown", "migration cursor 구조 오류")
+			}
+			if ids[row[0]] {
+				return fail("foreign_reference", "구성원 migration cursor 참조")
+			}
+		}
+		skipped, e := query("SELECT rollout_path FROM rollout_migration_skipped_rollouts")
+		if e != nil {
+			return e
+		}
+		for _, row := range skipped {
+			if len(row) != 1 {
+				return fail("engine_db_unknown", "migration rollout descriptor 오류")
+			}
+			for _, m := range members {
+				if m.Path != "" && samePath(m.Path, row[0]) {
+					return fail("foreign_reference", "구성원 skipped rollout 참조")
+				}
+			}
+		}
 		for _, table := range []string{"thread_attachments", "thread_dynamic_tools"} {
 			rows, e := query("SELECT thread_id FROM " + table)
 			if e != nil {
