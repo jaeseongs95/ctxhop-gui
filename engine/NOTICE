@@ -1,0 +1,10 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
+
+CtxHop protected engine modifications: prestart admission, frozen canonical inputs, offline execution and scoped restore APIs. This is a modified OpenAI Codex build, not the installed OpenAI executable.
+Source base: https://github.com/openai/codex/tree/ff6aec96948b70d94983af2641a6b67c94faeff5
+The provider manifest and patch hashes identify the local modifications.
