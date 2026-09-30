@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,48 @@ func enginePath(o options) (string, error) {
 	if !hashRE.MatchString(engineSHA256) || loaderContractID == "" {
 		return "", fail("engine_untrusted", "검증된 protected engine 배포 pin이 없습니다")
 	}
+	if !strings.EqualFold(filepath.Base(path), "ctxhop-codex-engine.exe") {
+		return "", fail("engine_identity", "guard가 인식하는 protected engine 이름이 필요합니다")
+	}
 	return path, nil
+}
+func normalEnginePath(o options) (string, error) {
+	if !hashRE.MatchString(normalEngineSHA256) {
+		return "", fail("normal_engine_untrusted", "정상 엔진의 검증된 배포 pin이 없습니다")
+	}
+	if o.NormalEngine != "" {
+		return absolute(o.NormalEngine)
+	}
+	root := os.Getenv("LOCALAPPDATA")
+	if !filepath.IsAbs(root) {
+		return "", fail("normal_engine_untrusted", "정상 엔진 설치 경로 미확정")
+	}
+	matches, e := filepath.Glob(filepath.Join(root, "OpenAI", "Codex", "bin", "*", "codex.exe"))
+	if e != nil || len(matches) == 0 {
+		return "", fail("normal_engine_untrusted", "정상 Codex Desktop 엔진을 찾을 수 없습니다")
+	}
+	type candidate struct {
+		path string
+		time time.Time
+	}
+	candidates := []candidate{}
+	for _, p := range matches {
+		if e = noReparse(p); e != nil {
+			return "", e
+		}
+		st, e := os.Stat(p)
+		if e != nil || !st.Mode().IsRegular() {
+			return "", fail("normal_engine_untrusted", "정상 엔진 파일 오류")
+		}
+		candidates = append(candidates, candidate{p, st.ModTime()})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].time.Equal(candidates[j].time) {
+			return candidates[i].path < candidates[j].path
+		}
+		return candidates[i].time.After(candidates[j].time)
+	})
+	return candidates[0].path, nil
 }
 func processEnv(home string) ([]string, error) {
 	env := []string{}
@@ -86,6 +128,19 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	b, e := io.ReadAll(io.LimitReader(locks[0], limit+1))
 	if e != nil || int64(len(b)) > limit || digest(b) != engineSHA256 {
 		return nil, fail("engine_untrusted", "protected engine 열린 handle 해시가 pin과 다릅니다")
+	}
+	normal, e := normalEnginePath(o)
+	if e != nil {
+		return nil, e
+	}
+	normalLocks, e := lockImage(normal)
+	if e != nil {
+		return nil, e
+	}
+	locks = append(locks, normalLocks...)
+	b, e = io.ReadAll(io.LimitReader(normalLocks[0], limit+1))
+	if e != nil || int64(len(b)) > limit || digest(b) != normalEngineSHA256 {
+		return nil, fail("normal_engine_untrusted", "정상 엔진 열린 handle 해시가 pin과 다릅니다")
 	}
 	env, e := processEnv(o.Home)
 	if e != nil {
@@ -322,7 +377,7 @@ func validateProjection(r object, n, operation string, o options, members []memb
 	effects := obj(r["effects"])
 	writes, wok := integer(effects["applicationWrites"])
 	network, nok := integer(effects["networkRequests"])
-	if !exact(effects, "applicationWrites", "networkRequests", "sqliteShmMayChange") || !wok || !nok || writes != 0 || network != 0 || (effects["sqliteShmMayChange"] != true && effects["sqliteShmMayChange"] != false) || partial && effects["sqliteShmMayChange"] != false {
+	if !exact(effects, "applicationWrites", "networkRequests", "sqliteShmMayChange") || !wok || !nok || writes != 0 || network != 0 || (effects["sqliteShmMayChange"] != true && effects["sqliteShmMayChange"] != false) || partial && effects["sqliteShmMayChange"] != false || r["inputComplete"] == true && operation != "plan" && operation != "bootstrap" && effects["sqliteShmMayChange"] != true {
 		return fail("prestart_effects", "준비 단계 효과0 조건 실패")
 	}
 	if text(r["authResolution"]) != "resolved" || text(r["policyResolution"]) != "resolved" {
@@ -398,6 +453,21 @@ func validateProjection(r object, n, operation string, o options, members []memb
 		}
 		id := text(c["memberId"])
 		m, ok := ids[id]
+		if (operation == "rollback" || operation == "rollback-check") && ok && phase != "rollbackAbsent" {
+			if _, e := os.Stat(m.Path); os.IsNotExist(e) {
+				return fail("prestart_context", "없는 구성원은 rollbackAbsent marker가 필요합니다")
+			}
+		}
+		if phase == "rollbackAbsent" {
+			if (operation != "rollback" && operation != "rollback-check") || !ok || seen[id] || text(c["ownerId"]) != id || c["rolloutSha256"] != nil || c["settingsDigest"] != nil {
+				return fail("prestart_context", "rollback 부재 marker 오류")
+			}
+			if _, e := os.Stat(m.Path); !os.IsNotExist(e) {
+				return fail("prestart_context", "marker 파일 부재 불일치")
+			}
+			seen[id] = true
+			continue
+		}
 		if !ok || seen[id] || text(c["ownerId"]) != id && (m.Parent == nil || text(c["ownerId"]) != *m.Parent) || text(c["rolloutSha256"]) != m.SHA256 || !hashRE.MatchString(text(c["settingsDigest"])) {
 			return fail("prestart_context", "구성원 context binding 오류")
 		}

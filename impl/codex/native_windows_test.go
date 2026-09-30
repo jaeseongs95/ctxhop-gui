@@ -193,8 +193,13 @@ func TestNativeReadOnlyDB(t *testing.T) {
 			t.Fatal("SHM exception not observed", e)
 		}
 		os.Remove(filepath.Join(home, "state_5.sqlite-wal"))
+		missingBefore, _ := dbHashes(filepath.Join(home, "state_5.sqlite"))
 		_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
 		assertCode(t, e, "engine_db_unknown")
+		missingAfter, _ := dbHashes(filepath.Join(home, "state_5.sqlite"))
+		if string(encoded(missingBefore)) != string(encoded(missingAfter)) {
+			t.Fatal("missing WAL gate wrote body/WAL")
+		}
 	})
 	t.Run("missing", func(t *testing.T) {
 		home := t.TempDir()
@@ -228,7 +233,16 @@ func TestNativeReparse(t *testing.T) {
 	os.Mkdir(target, 0700)
 	link := filepath.Join(dir, "link")
 	if e := os.Symlink(target, link); e != nil {
-		t.Skip("symlink privilege unavailable; native reparse positive fixture not run")
+		system, e := systemDirectory()
+		if e != nil {
+			t.Fatal(e)
+		}
+		cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if b, e := cmd.CombinedOutput(); e != nil {
+			t.Fatalf("junction fixture failed %v %s", e, b)
+		}
+		t.Log("directory junction used; symlink privilege unavailable")
 	}
 	assertCode(t, noReparse(filepath.Join(link, "absent")), "reparse")
 }

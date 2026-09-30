@@ -196,20 +196,21 @@ func createFile(path string, b []byte) error {
 }
 
 type journal struct {
-	Version          int      `json:"version"`
-	Impl             string   `json:"impl"`
-	Status           string   `json:"status"`
-	Phase            string   `json:"phase"`
-	Home             string   `json:"home"`
-	ID               string   `json:"id"`
-	Cwd              string   `json:"cwd"`
-	ArchiveSHA256    string   `json:"archiveSha256"`
-	Archived         bool     `json:"archived"`
-	Members          []member `json:"members"`
-	EngineVersion    string   `json:"engineVersion"`
-	EngineSHA256     string   `json:"engineSha256"`
-	LoaderContractID string   `json:"loaderContractId"`
-	LastError        string   `json:"lastError,omitempty"`
+	Version            int      `json:"version"`
+	Impl               string   `json:"impl"`
+	Status             string   `json:"status"`
+	Phase              string   `json:"phase"`
+	Home               string   `json:"home"`
+	ID                 string   `json:"id"`
+	Cwd                string   `json:"cwd"`
+	ArchiveSHA256      string   `json:"archiveSha256"`
+	Archived           bool     `json:"archived"`
+	Members            []member `json:"members"`
+	EngineVersion      string   `json:"engineVersion"`
+	EngineSHA256       string   `json:"engineSha256"`
+	NormalEngineSHA256 string   `json:"normalEngineSha256"`
+	LoaderContractID   string   `json:"loaderContractId"`
+	LastError          string   `json:"lastError,omitempty"`
 }
 
 func runPath(home, run string) string { return filepath.Join(home, ".ctxhop-desktop-recovery", run) }

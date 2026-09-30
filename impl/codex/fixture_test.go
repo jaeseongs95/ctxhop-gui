@@ -315,10 +315,18 @@ func projection(o options, op string, ms []member, complete bool) object {
 			if op == "reference" {
 				phase = "reference"
 			}
-			contexts = append(contexts, object{"memberId": m.ID, "ownerId": m.ID, "phase": phase, "cwd": o.Cwd, "rolloutSha256": m.SHA256, "settingsDigest": strings.Repeat("a", 64), "contextId": m.ID, "sqliteHome": o.Home})
+			var sha, sd any = m.SHA256, strings.Repeat("a", 64)
+			if op == "rollback" || op == "rollback-check" {
+				if _, e := os.Stat(m.Path); os.IsNotExist(e) {
+					phase = "rollbackAbsent"
+					sha = nil
+					sd = nil
+				}
+			}
+			contexts = append(contexts, object{"memberId": m.ID, "ownerId": m.ID, "phase": phase, "cwd": o.Cwd, "rolloutSha256": sha, "settingsDigest": sd, "contextId": m.ID, "sqliteHome": o.Home})
 		}
 	}
-	return object{"contractVersion": num(1), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false}}
+	return object{"contractVersion": num(1), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": complete && op != "plan" && op != "bootstrap"}}
 }
 func TestProjectionAndToken(t *testing.T) {
 	old := loaderContractID

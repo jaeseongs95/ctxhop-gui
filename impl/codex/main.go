@@ -18,7 +18,7 @@ import (
 	"unicode/utf8"
 )
 
-var engineSHA256, loaderContractID string // 배포 빌드가 검증된 엔진에 결속한다.
+var engineSHA256, normalEngineSHA256, loaderContractID string // 배포 빌드가 검증된 두 엔진에 결속한다.
 const implementation = "ctxhop-codex-r45-v1"
 const limit int64 = 1 << 30
 const lineLimit = 16 << 20
@@ -178,7 +178,7 @@ func within(root, p string) bool {
 	return e == nil && r != ".." && !strings.HasPrefix(r, ".."+string(os.PathSeparator)) && !filepath.IsAbs(r)
 }
 
-type options struct{ Home, Archive, Cwd, Token, Run, Engine string }
+type options struct{ Home, Archive, Cwd, Token, Run, Engine, NormalEngine string }
 
 func cli(args []string) (object, error) {
 	if len(args) == 0 {
@@ -193,6 +193,7 @@ func cli(args []string) (object, error) {
 	f.StringVar(&o.Token, "token", "", "")
 	f.StringVar(&o.Run, "run", "", "")
 	f.StringVar(&o.Engine, "engine", "", "")
+	f.StringVar(&o.NormalEngine, "normal-engine", "", "")
 	if e := f.Parse(args[1:]); e != nil || f.NArg() != 0 {
 		return nil, fail("arguments", "잘못된 명령 인자")
 	}

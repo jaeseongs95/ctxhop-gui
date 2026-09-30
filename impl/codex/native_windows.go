@@ -3,9 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -431,6 +434,24 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 	if e != nil {
 		return v, e
 	}
+	for _, p := range []string{statePath + "-wal", statePath + "-shm", statePath + "-journal"} {
+		if e = noReparse(p); e != nil {
+			return v, e
+		}
+	}
+	headerFile, e := os.Open(statePath)
+	if e != nil {
+		return v, e
+	}
+	header := make([]byte, 100)
+	_, e = io.ReadFull(headerFile, header)
+	headerFile.Close()
+	if e != nil || !bytes.Equal(header[:16], []byte("SQLite format 3\x00")) || (header[18] != 1 && header[18] != 2) || header[18] != header[19] {
+		return v, fail("engine_db_unknown", "DB 파일 header 구조 불명")
+	}
+	if header[18] == 2 && before[statePath+"-wal"] == "absent" {
+		return v, fail("engine_db_unknown", "WAL 모드의 WAL 부재는 무쓰기 열기를 증명할 수 없습니다")
+	}
 	dir, e := systemDirectory()
 	if e != nil {
 		return v, e
@@ -449,8 +470,9 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 		funcs[name] = p
 	}
 	var db uintptr
-	name := append([]byte(statePath), 0)
-	r, _, _ := funcs["sqlite3_open_v2"].Call(uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&db)), 1, 0)
+	uri := url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(statePath), RawQuery: "mode=ro"}
+	name := append([]byte(uri.String()), 0)
+	r, _, _ := funcs["sqlite3_open_v2"].Call(uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&db)), 0x41, 0)
 	if r != 0 {
 		if db != 0 {
 			funcs["sqlite3_close"].Call(db)

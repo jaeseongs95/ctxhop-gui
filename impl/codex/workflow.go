@@ -32,7 +32,7 @@ func stableProjection(p object) object {
 	return r
 }
 func tokenFor(o options, f *family, p object) string {
-	return digest(encoded(object{"archive": f.ArchiveSHA, "home": o.Home, "cwd": o.Cwd, "members": f.Members, "route": "go", "impl": implementation, "engineSha256": engineSHA256, "loader": stableProjection(p)}))
+	return digest(encoded(object{"archive": f.ArchiveSHA, "home": o.Home, "cwd": o.Cwd, "members": f.Members, "route": "go", "impl": implementation, "engineSha256": engineSHA256, "normalEngineSha256": normalEngineSHA256, "normalEnginePath": o.NormalEngine, "loader": stableProjection(p)}))
 }
 func plan(o options) (object, error) {
 	f, e := readArchive(o.Archive)
@@ -112,7 +112,7 @@ func importArchive(o options) (result object, retErr error) {
 	if e = os.Mkdir(run, 0700); e != nil {
 		return nil, fail("run_exists", "작업 ID를 재사용할 수 없습니다")
 	}
-	j := &journal{Version: 3, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, LoaderContractID: loaderContractID}
+	j := &journal{Version: 3, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
 	if e = saveJournal(run, j, true); e != nil {
 		return object{"pending": []string{o.Run}}, e
 	}
@@ -343,6 +343,22 @@ func admit(s *session, home string, ms []member, missing bool) (dbView, error) {
 	view, e := readState(home, text(s.Projection["stateDb"]), ms, missing)
 	if e != nil {
 		return view, e
+	}
+	if s.Operation == "rollback" || s.Operation == "rollback-check" {
+		for _, m := range s.Members {
+			if _, e := os.Stat(m.Path); os.IsNotExist(e) {
+				if view.IDs[m.ID] {
+					return view, fail("missing_rollout_metadata", "파일 없이 DB 행이 남은 구성원")
+				}
+				for _, edge := range view.Edges {
+					if text(edge["parent_thread_id"]) == m.ID || text(edge["child_thread_id"]) == m.ID {
+						return view, fail("missing_rollout_metadata", "없는 구성원의 DB 연결이 남았습니다")
+					}
+				}
+			} else if e != nil {
+				return view, e
+			}
+		}
 	}
 	if e = s.complete(view); e != nil {
 		return view, e
@@ -644,7 +660,7 @@ func rollback(o options) (result object, retErr error) {
 		}
 		return object{"status": "rolled_back", "pending": []string{}, "run": o.Run}, nil
 	}
-	if j.EngineSHA256 != engineSHA256 || j.LoaderContractID != loaderContractID {
+	if j.EngineSHA256 != engineSHA256 || j.NormalEngineSHA256 != normalEngineSHA256 || j.LoaderContractID != loaderContractID {
 		return nil, fail("engine_untrusted", "복구 기록의 protected engine pin이 바뀌었습니다")
 	}
 	o.Cwd = j.Cwd
@@ -670,6 +686,11 @@ func rollback(o options) (result object, retErr error) {
 	if e != nil {
 		return nil, e
 	}
+	for _, m := range j.Members {
+		if len(scan.Files[m.ID]) == 0 && before.IDs[m.ID] {
+			return nil, fail("missing_rollout_metadata", "파일 없는 DB 행은 안전한 삭제 context를 증명할 수 없습니다")
+		}
+	}
 	if _, e = verifyOwned(o.Home, j, false); e != nil {
 		return nil, e
 	}
@@ -693,6 +714,9 @@ func rollback(o options) (result object, retErr error) {
 		}
 	}
 	for _, m := range j.Members {
+		if !before.IDs[m.ID] && len(scan.Files[m.ID]) == 0 {
+			continue
+		}
 		a, e := pages(s, "thread/attachment/list", object{"threadId": m.ID}, "data")
 		if e != nil {
 			return nil, e
@@ -776,6 +800,16 @@ func rollback(o options) (result object, retErr error) {
 			}
 		}
 	}
+	if e = verifyAbsentAPI(o, j); e != nil {
+		return nil, e
+	}
+	finalDB, e := readState(o.Home, filepath.Join(o.Home, "state_5.sqlite"), j.Members, false)
+	if e != nil {
+		return nil, e
+	}
+	if !bytes.Equal(encoded(finalDB.IDs), encoded(after.IDs)) || !bytes.Equal(encoded(finalDB.Edges), encoded(after.Edges)) {
+		return nil, fail("delete_scope", "마지막 API 검사 중 DB 대상/연결 변경")
+	}
 	if e = cleanup(run); e != nil {
 		return nil, e
 	}
@@ -791,4 +825,47 @@ func rolloutID(path string) string {
 		return ""
 	}
 	return m[1]
+}
+func verifyAbsentAPI(o options, j *journal) error {
+	if e := checkGuard(nil); e != nil {
+		return e
+	}
+	s, e := prepareEngine(o, "rollback-check", currentMembers(o.Home, j))
+	if e != nil {
+		return e
+	}
+	defer s.Close()
+	v, e := admit(s, o.Home, j.Members, false)
+	if e != nil {
+		return e
+	}
+	for _, m := range j.Members {
+		if v.IDs[m.ID] {
+			return fail("delete_incomplete", "마지막 API 전 구성원 DB 행")
+		}
+	}
+	if e = s.activate(); e != nil {
+		return e
+	}
+	for _, m := range j.Members {
+		_, e := s.Call("thread/read", object{"threadId": m.ID})
+		var re *rpcError
+		if !asRPC(e, &re) || re.Code != -32600 {
+			return fail("delete_incomplete", "마지막 API 부재 확인 실패")
+		}
+	}
+	if e = s.Close(); e != nil {
+		return e
+	}
+	if e = checkGuard(nil); e != nil {
+		return e
+	}
+	scan, e := scanHome(o.Home, j.Members, true)
+	if e != nil {
+		return e
+	}
+	if hasFiles(scan) {
+		return fail("delete_incomplete", "마지막 API 후 구성원 파일")
+	}
+	return nil
 }
