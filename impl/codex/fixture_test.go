@@ -369,3 +369,33 @@ func TestProjectionAndToken(t *testing.T) {
 		t.Fatal("stale token")
 	}
 }
+
+func TestAcquisitionWireRejectsUnknownAndUnboundProvenance(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state_5.sqlite")
+	o := mockObservation(state, strings.Repeat("a", 64), nil)
+	if e := validateObservation(o, state); e != nil {
+		t.Fatal(e)
+	}
+	mutations := []func(object){
+		func(o object) { obj(o["acquisition"])["surprise"] = true },
+		func(o object) { obj(o["acquisition"])["rollbackJournalAbsent"] = false },
+		func(o object) { obj(obj(o["acquisition"])["source"])["directoryIdentity"] = "bad" },
+		func(o object) {
+			a := obj(o["acquisition"])
+			obj(obj(a["private"])["main"])["identity"] = obj(obj(a["source"])["main"])["identity"]
+		},
+		func(o object) { obj(obj(obj(o["acquisition"])["private"])["main"])["sha256"] = strings.Repeat("b", 64) },
+		func(o object) { obj(obj(obj(o["acquisition"])["source"])["main"])["size"] = num(1<<30 + 1) },
+		func(o object) { o["walSha256"] = strings.Repeat("b", 64) },
+		func(o object) {
+			obj(obj(o["acquisition"])["private"])["wal"] = obj(obj(obj(o["acquisition"])["private"])["main"])
+		},
+	}
+	for i, mutate := range mutations {
+		q := obj(clone(o))
+		mutate(q)
+		if e := validateObservation(q, state); e == nil {
+			t.Fatalf("provenance mutation %d accepted", i)
+		}
+	}
+}

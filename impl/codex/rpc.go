@@ -315,8 +315,8 @@ func (s *session) complete(observed dbView) error {
 	} else if s.P != nil {
 		return fail("engine_db_unknown", "complete에 유지된 raw acquisition 누락")
 	}
-	if !exact(observation, "stateDb", "mainSha256", "walSha256", "acquisition") || !samePath(text(observation["stateDb"]), text(s.Projection["stateDb"])) || !hashRE.MatchString(text(observation["mainSha256"])) || observation["walSha256"] != nil && !hashRE.MatchString(text(observation["walSha256"])) || !opRE.MatchString(text(obj(observation["acquisition"])["acquisitionId"])) {
-		return fail("engine_db_unknown", "complete acquisition descriptor 오류")
+	if e := validateObservation(observation, text(s.Projection["stateDb"])); e != nil {
+		return e
 	}
 	params := object{}
 	for k, v := range s.Binding {
@@ -351,6 +351,68 @@ func asRPC(e error, out **rpcError) bool {
 		*out = r
 	}
 	return ok
+}
+
+func validateObservation(raw object, state string) error {
+	// The local native builder uses Go integers; normalize through the same
+	// duplicate/type-rejecting JSON representation used by the pipe protocol.
+	v, e := parseJSON(encoded(raw))
+	if e != nil {
+		return e
+	}
+	o := obj(v)
+	a := obj(o["acquisition"])
+	src, private := obj(a["source"]), obj(a["private"])
+	version, vok := integer(a["schemaVersion"])
+	bad := func() error { return fail("engine_db_unknown", "complete acquisition descriptor 오류") }
+	if !exact(o, "stateDb", "mainSha256", "walSha256", "acquisition") || !samePath(text(o["stateDb"]), state) || !exact(a, "schemaVersion", "acquisitionId", "source", "private", "rollbackJournalAbsent") || !vok || version != 1 || !opRE.MatchString(text(a["acquisitionId"])) || a["rollbackJournalAbsent"] != true || !exact(src, "directoryIdentity", "main", "wal", "shm") || !exact(private, "directory", "directoryIdentity", "main", "wal") {
+		return bad()
+	}
+	dir := text(private["directory"])
+	if !filepath.IsAbs(dir) || within(filepath.Dir(state), dir) || within(dir, filepath.Dir(state)) || !fileIDRE.MatchString(text(src["directoryIdentity"])) || !fileIDRE.MatchString(text(private["directoryIdentity"])) || src["directoryIdentity"] == private["directoryIdentity"] {
+		return bad()
+	}
+	identities := map[string]bool{text(src["directoryIdentity"]): true, text(private["directoryIdentity"]): true}
+	var total int64
+	for _, name := range []string{"main", "wal", "shm"} {
+		if src[name] == nil {
+			if name == "main" || name == "wal" && (private[name] != nil || o["walSha256"] != nil) {
+				return bad()
+			}
+			continue
+		}
+		file := obj(src[name])
+		size, sok := integer(file["size"])
+		bound := limit
+		if name == "shm" {
+			bound = lineLimit
+		}
+		if !exact(file, "identity", "size", "sha256") || !sok || size < 0 || size > bound || !fileIDRE.MatchString(text(file["identity"])) || identities[text(file["identity"])] || !hashRE.MatchString(text(file["sha256"])) {
+			return bad()
+		}
+		identities[text(file["identity"])] = true
+		if name == "shm" {
+			continue
+		}
+		total += size
+		if total > limit || name == "main" && size < 100 {
+			return bad()
+		}
+		copy := obj(private[name])
+		n, nok := integer(copy["size"])
+		if !exact(copy, "identity", "size", "sha256") || !nok || n != size || copy["sha256"] != file["sha256"] || !fileIDRE.MatchString(text(copy["identity"])) || identities[text(copy["identity"])] {
+			return bad()
+		}
+		identities[text(copy["identity"])] = true
+		outer := "mainSha256"
+		if name == "wal" {
+			outer = "walSha256"
+		}
+		if o[outer] != file["sha256"] {
+			return bad()
+		}
+	}
+	return nil
 }
 func validateProjection(r object, n, operation string, o options, members []member, pid int64) error {
 	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "effects") {

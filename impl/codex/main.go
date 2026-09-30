@@ -26,6 +26,7 @@ const lineLimit = 16 << 20
 var uuidRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var opRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 var hashRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var fileIDRE = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
 type object = map[string]any
 type failure struct{ Code, Message string }

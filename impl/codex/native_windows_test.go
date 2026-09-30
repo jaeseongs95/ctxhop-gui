@@ -178,10 +178,37 @@ func sqliteFixture(t *testing.T, dir string, wal bool, sql string) func() {
 
 const fixtureSQL = `CREATE TABLE threads(id TEXT PRIMARY KEY); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT NOT NULL,child_thread_id TEXT NOT NULL PRIMARY KEY,status TEXT NOT NULL);`
 
+func liveFixtureSQL(t *testing.T) string {
+	t.Helper()
+	seal, e := liveSchema()
+	if e != nil {
+		t.Fatal(e)
+	}
+	var sql strings.Builder
+	for _, kind := range []string{"table", "index", "trigger", "view"} {
+		for _, raw := range array(seal["objects"]) {
+			row := obj(raw)
+			if row["type"] == kind && row["name"] != "sqlite_sequence" && row["sql"] != nil {
+				sql.WriteString(text(row["sql"]))
+				sql.WriteString(";\n")
+			}
+		}
+	}
+	for _, raw := range array(seal["migrations"]) {
+		m := obj(raw)
+		v, _ := integer(m["version"])
+		fmt.Fprintf(&sql, "INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(%d,'owned synthetic schema',1,X'%s',0);\n", v, text(m["checksum"]))
+	}
+	return sql.String()
+}
+func liveFixtureThread(id string) string {
+	return `INSERT INTO threads(id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES('` + id + `','D:/Go/owned-rollout.jsonl',1,1,'cli','openai','D:/Go','fixture','read-only','untrusted');`
+}
+
 func TestNativeReadOnlyDB(t *testing.T) {
 	t.Run("hidden_and_foreign", func(t *testing.T) {
 		home := t.TempDir()
-		close := sqliteFixture(t, home, false, fixtureSQL+` INSERT INTO threads VALUES('`+rootID+`');`)
+		close := sqliteFixture(t, home, false, liveFixtureSQL(t)+liveFixtureThread(rootID))
 		close()
 		v, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
 		if e != nil || !v.IDs[rootID] {
@@ -194,7 +221,7 @@ func TestNativeReadOnlyDB(t *testing.T) {
 	})
 	t.Run("WAL_and_SHM", func(t *testing.T) {
 		source := t.TempDir()
-		close := sqliteFixture(t, source, true, fixtureSQL+` INSERT INTO threads VALUES('`+rootID+`');`)
+		close := sqliteFixture(t, source, true, liveFixtureSQL(t)+liveFixtureThread(rootID))
 		defer close()
 		home := t.TempDir()
 		for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal"} {
@@ -274,6 +301,31 @@ func TestNativeReparse(t *testing.T) {
 		t.Log("directory junction used; symlink privilege unavailable")
 	}
 	assertCode(t, noReparse(filepath.Join(link, "absent")), "reparse")
+}
+
+func TestLiveSchemaSealMutations(t *testing.T) {
+	for _, sql := range []string{
+		`ALTER TABLE threads ADD COLUMN unexpected TEXT;`,
+		`DROP INDEX idx_threads_archived;`,
+		`CREATE TRIGGER unknown_trigger AFTER DELETE ON threads BEGIN SELECT 1; END;`,
+		`UPDATE _sqlx_migrations SET checksum=X'00' WHERE version=58;`,
+		`UPDATE _sqlx_migrations SET success=0 WHERE version=58;`,
+		`DELETE FROM _sqlx_migrations WHERE version=58;`,
+	} {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, liveFixtureSQL(t)+sql)
+		close()
+		before, e := dbHashes(filepath.Join(home, "state_5.sqlite"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, false)
+		assertCode(t, e, "engine_db_unknown")
+		after, e := dbHashes(filepath.Join(home, "state_5.sqlite"))
+		if e != nil || string(encoded(before)) != string(encoded(after)) {
+			t.Fatal("schema rejection changed source", e)
+		}
+	}
 }
 func makeJunction(system, link, target string) error {
 	cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)

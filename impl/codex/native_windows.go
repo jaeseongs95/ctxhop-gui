@@ -555,6 +555,9 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 		if e != nil || len(check) != 1 || check[0][0] != "ok" {
 			return fail("engine_db_unknown", "state DB integrity 오류")
 		}
+		if e := checkLiveSchema(dll, db); e != nil {
+			return e
+		}
 		for _, table := range []string{"threads", "thread_spawn_edges"} {
 			cols, e := query("PRAGMA table_info(" + table + ")")
 			if e != nil {

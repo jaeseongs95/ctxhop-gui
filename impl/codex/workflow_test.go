@@ -60,7 +60,7 @@ func installMock(t *testing.T, f *family) *mockEngine {
 		if hash := v.Hashes[state+"-wal"]; hash != "absent" {
 			wal = hash
 		}
-		v.Observation = object{"stateDb": state, "mainSha256": v.Hashes[state], "walSha256": wal, "acquisition": object{"acquisitionId": strings.Repeat("a", 32)}}
+		v.Observation = mockObservation(state, v.Hashes[state], wal)
 		return v, e
 	}
 	t.Cleanup(func() {
@@ -72,6 +72,21 @@ func installMock(t *testing.T, f *family) *mockEngine {
 		loaderContractID = oldLoader
 	})
 	return m
+}
+
+// Protocol-only fixture descriptors, never native/provenance evidence.
+func mockObservation(state, hash string, wal any) object {
+	main := func(id string, sha any) object {
+		return object{"identity": strings.Repeat(id, 24), "size": 4096, "sha256": sha}
+	}
+	var sw, pw any
+	if wal != nil {
+		sw, pw = main("5", wal), main("6", wal)
+	}
+	return object{"stateDb": state, "mainSha256": hash, "walSha256": wal, "acquisition": object{"schemaVersion": 1, "acquisitionId": strings.Repeat("a", 32), "rollbackJournalAbsent": true,
+		"source":  object{"directoryIdentity": strings.Repeat("1", 24), "main": main("2", hash), "wal": sw, "shm": nil},
+		"private": object{"directory": filepath.Join(os.TempDir(), "mock-private-acquisition"), "directoryIdentity": strings.Repeat("3", 24), "main": main("4", hash), "wal": pw},
+	}}
 }
 func (m *mockEngine) home(home string) *mockHome {
 	h := m.Homes[home]
