@@ -18,7 +18,9 @@ Go 구현은 표준 라이브러리와 Windows의 `winsqlite3.dll`을 사용합�
 
 `CODEX_SQLITE_HOME`이 존재하거나 루트 설정에서 SQLite 경로를 바꾸면 값이 같은 경로여도 차단합니다. 알려지지 않은 DB 구조, 실제 설정을 확정하지 못한 인증·정책, 승인하지 않은 구성원과 쓰기 대상도 차단합니다. 프로젝트 설정이 적용된 경로는 미리보기에서 알립니다.
 
-WAL 모드 DB는 읽기 전용 연결도 파일을 생성할 수 있습니다. 현재 개발 구현은 WAL이 없는 경우 DB를 열기 전에 차단합니다. 정상적으로 닫힌 홈까지 지원하는 검사 방식은 별도 설계·격리 시험 후 반영합니다. 이 제한을 전체 기존 홈 지원 완료로 해석하면 안 됩니다.
+WAL 모드 DB는 읽기 전용 연결도 파일을 생성할 수 있습니다. 원본을 raw 읽기 핸들로 확인하고 현재 사용자만 접근할 수 있는 새 사본에서 Go와 보호 엔진이 같은 DB 세대를 읽는 경로를 연결하고 있습니다. 사본은 준비 단계의 조회에만 쓰며 실제 복원 설정은 원래 DB를 가리킵니다. 원본 main·WAL·SHM을 바꾸지 않고, 사본의 sidecar 생성과 정리를 따로 확인합니다. 현재 생산 경로는 검증 전까지 WAL 부재를 차단합니다. 이 격리 시험을 전체 기존 홈 지원 완료로 해석하면 안 됩니다.
+
+정상 앱·CLI·IDE와 DB writer를 닫은 상태를 운영 조건으로 유지합니다. 검사 핸들을 해제한 뒤 설정·파일·DB와 프로세스를 다시 확인하고 복원을 시작합니다. 해제부터 첫 쓰기까지 경쟁 구간이 남으므로 모든 미래 writer를 원자적으로 막는다고 보장하지 않습니다.
 
 ## 실행 파일과 소스 결합
 
@@ -30,7 +32,7 @@ WAL 모드 DB는 읽기 전용 연결도 파일을 생성할 수 있습니다. �
 
 ## 빌드와 검증
 
-`build/build-codex-engine.ps1`은 고정 공식 소스의 LF archive에 검토한 패치를 적용해 `ctxhop-codex-engine.exe`를 만듭니다. 실행 파일을 실행하지 않습니다. Rust 1.95.0과 Windows MSVC/SDK 환경이 필요합니다. `build/build-exes.ps1`은 보호 엔진과 Go 구현을 빌드하고 모든 실행 파일의 핀을 검사합니다. `build/build.ps1`은 커밋된 파일만 패키지에 넣습니다.
+`build/build-codex-engine.ps1`은 고정 공식 소스의 LF archive에 검토한 패치를 적용해 `ctxhop-codex-engine.exe`를 만듭니다. Windows 정상 DB의 sqlx 체크섬과 호환되도록 canonical SQL 마이그레이션만 CRLF로 변환합니다. 빌드 영수증에 변환 전후 SHA-256과 sqlx SHA-384를 기록하며 기존 DB의 체크섬 검사를 완화하지 않습니다. 실행 파일을 실행하지 않습니다. Rust 1.95.0과 Windows MSVC/SDK 환경이 필요합니다. `build/build-exes.ps1`은 보호 엔진과 Go 구현을 빌드하고 모든 실행 파일의 핀을 검사합니다. `build/build.ps1`은 커밋된 파일만 패키지에 넣습니다.
 
 `impl/codex/Run-Fixtures.ps1`의 Go 시험은 자체 mock 엔진, 실제 Windows Job·이미지 핸들·읽기 전용 SQLite 및 guard 거절을 구분해 기록합니다. 핀이 없는 시험 빌드는 실제 보호 엔진 복원의 증거가 아닙니다. `Test-DesktopWorker.ps1`은 PowerShell 경로 고정과 실패·복구 연결을 검사합니다. `Test-PrestartEngine.ps1`은 별도 fixture 준비·관측을 담당하며 실제 엔진 수용 결과를 자체 검사와 분리합니다.
 
