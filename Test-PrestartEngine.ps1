@@ -7,7 +7,7 @@ File snapshots detect final differences; they do not prove absence of transient
 writes or networking. Engine effects require independent complete observation.
 #>
 param(
-    [ValidateSet('Prepare','SelfTest','Engine')][string]$Mode='SelfTest',
+    [ValidateSet('Prepare','SelfTest','ConnectionPlan','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
     [switch]$LibraryOnly
 )
@@ -142,6 +142,49 @@ function Get-PrestartCasePlan {
         @{id='protected-whitelist';sequence=@('initialize','thread/start','turn/start','config/auth/tool','unapproved resume');expected='reject every forbidden method/context';seed='existing synthetic seed only'}
     ) | ForEach-Object { [pscustomobject]@{id=$_.id;sequence=$_.sequence;expected=$_.expected;seed=$_.seed;engineStatus='notRun';needs=@('sealed source/provider/build pin','coordinator scenario agreement','complete effect observer')} }
 }
+function Get-PrestartConnectionPlan([object]$Provider=$null) {
+    # Metadata is diagnostic only. Even plausible pins cannot authorize a run.
+    $missing=@()
+    foreach ($field in @('baseCommit','loaderContractId','engineSha256','normalEngineSha256')) {
+        if ($null -eq $Provider -or $Provider.PSObject.Properties.Name -notcontains $field -or -not $Provider.$field) { $missing+=$field }
+    }
+    $phases=@(
+        @{id='standalone-prepare';source=@('config/auth/cloud denial before effects','no SQLite open','no background worker spawn');os=@('all application file writes including transient','process/thread/descendant creation','DNS/connect/send including denied attempts');allowed='applicationWrites0/network0; no SHM exception'},
+        @{id='complete-after-U-a';source=@('Go handles closed before complete','main/WAL observation and generation binding','read-only metadata/context');os=@('main/WAL write and mapping activity','exact observed SHM path only','network attempts');allowed='main/WAL0/network0; approved SHM only'},
+        @{id='accept-abort-eof';source=@('all six binding fields','incomplete/old generation rejected','accept never activates','EOF/abort cleanup');os=@('application writes/network attempts','whole owned Job descendants through active0');allowed='applicationWrites0/network0; Job closes'},
+        @{id='activate-initialize';source=@('single activation after final accept','MCP/plugin/OTEL/init workers','stable RPC whitelist');os=@('file/network activity by phase','children and grandchildren','timeouts and Job termination');allowed='coordinator must seal activation effect policy'},
+        @{id='legacy-paginated-full-child';source=@('canonical legacy/paginated/full-turns reader','approved parent settings/cwd','child membership and rollout digest','first resume whitelist');os=@('DB/rollout and auxiliary writes','per-member network attempts','worker descendants');allowed='scenario-specific sealed resume policy'},
+        @{id='archived-cold';source=@('archived membership','canonical cold export without new turn/start','DB/WAL/rollout consistency','fresh complete binding');os=@('archive/session file effects','main/WAL/SHM by exact phase','network and owned Job');allowed='scenario-specific sealed cold policy'},
+        @{id='rollback-pending';source=@('fresh prepare/complete','prefix/settings/foreign refs/attachments','placing+ stays pending on ambiguous ACK','no activation replay or automatic deletion');os=@('permitted recovery writes only','network attempts','whole Job active0 before final observation');allowed='explicit sealed recovery policy'}
+    ) | ForEach-Object { [pscustomobject]@{id=$_.id;sourceInstrumentation=$_.source;independentOsCoverage=$_.os;allowedEffects=$_.allowed;engineStatus='notRun';coverage='unverified'} }
+    return [ordered]@{
+        schemaVersion=1;purpose='connection preparation only';runnerStatus='blocked';engineExecuted=$false;engineAcceptance='notRun'
+        providerMetadataMissing=@($missing);providerTrust='notValidated';productionGuard='notMeasured'
+        lanes=@(
+            @{id='production-guard-negative';entry='original guard(nil)';expected='record actual reason, including engine_open while Codex is open';engineLaunches=0;status='notRun'},
+            @{id='pinned-provider-fixture';entry='serial Go TestPinnedProvider... in _test.go';status='notRun';guardAdapter=@('replace checkGuard only','p != nil must call p.provePrepared()','nil success restricted to owned fixture','save callback and restore with t.Cleanup');preserved=@('prepareEngine=openEngine','readState=checkDB','RPC and protected image handles/hash','native suspended launch and owned Job','SQL and projection binding');forbidden=@('runtime production bypass switch','test assignment of executable pins','mock provider substituted for actual provider')}
+        )
+        requiredSeals=@('source commit + archive digest + build receipt','compiled protected/normal image pins + loader contract','canonical synthetic seed provenance','coordinator phase/scenario agreement','activation runtime completeness','OS capture permissions and positive calibration','observer configuration + parser + loss statistics + whole Job correlation')
+        observerContract=@{
+            window='start before suspended provider resumes; end after whole Job active0'
+            identity='PID + creation time + locked image identity + Job descendants + phase timestamps'
+            loss='controller EventsLost/LogBuffersLost/RealTimeBuffersLost and decoded trace loss must be zero; EVENT_TRACE_LOGFILEW.EventsLost is not used'
+            limits=@('file tree hash detects final state only','source counters and stderr are not independent OS coverage','registered providers do not prove capture permission','PID filters alone may miss service-mediated effects','zero events without positive calibration is not absence evidence')
+        }
+        phases=@($phases)
+    }
+}
+function New-PrestartConnectionPlan([string]$Root) {
+    $path=Assert-OwnedFixturePath $Root
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    $provider=$null
+    $providerFile=Join-Path $PSScriptRoot 'engine/provider.json'
+    if (Test-Path -LiteralPath $providerFile) { $provider=Get-Content -LiteralPath $providerFile -Raw | ConvertFrom-Json }
+    $plan=Get-PrestartConnectionPlan $provider
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    Write-FixtureJson (Join-Path $path 'connection-plan.json') $plan
+    return $plan
+}
 function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
@@ -223,6 +266,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
