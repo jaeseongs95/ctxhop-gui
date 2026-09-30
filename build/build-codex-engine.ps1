@@ -59,25 +59,29 @@ foreach ($patch in $provider.patches) {
 # sqlx hashes the embedded SQL bytes. The supported Windows vendor build uses
 # CRLF migrations; compiling LF archive bytes would reject an existing DB.
 # Normalize only the canonical migration directories, and retain both hashes.
-$stateRoot=Join-Path $sourceTree 'codex-rs\state'
-$groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
-$migrationSource=[IO.File]::ReadAllText((Join-Path $stateRoot 'src\migrations.rs'))
-$declared=@([regex]::Matches($migrationSource,'migrate!\("\./([a-z_]+)"\)') | ForEach-Object { $_.Groups[1].Value })
-if (@(Compare-Object ($groups|Sort-Object) ($declared|Sort-Object)).Count) { throw 'unreviewed migration directory' }
-$utf8=[Text.UTF8Encoding]::new($false,$true)
-$migrations=@(foreach ($group in $groups) {
-    $files=@(Get-ChildItem -LiteralPath (Join-Path $stateRoot $group) -File | Sort-Object Name)
-    if (-not $files.Count) { throw "missing migrations: $group" }
-    foreach ($file in $files) {
-        if ($file.Name -cnotmatch '^[0-9]{4}_[a-z0-9_]+\.sql$') { throw 'unreviewed migration file' }
-        $bytes=[IO.File]::ReadAllBytes($file.FullName)
-        $sql=$utf8.GetString($bytes)
-        if ($sql.Contains("`r") -or $sql.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) { throw 'migration source must be committed LF without BOM' }
-        $lfHash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        [IO.File]::WriteAllBytes($file.FullName,$utf8.GetBytes($sql.Replace("`n","`r`n")))
-        [ordered]@{path="codex-rs/state/$group/$($file.Name)";lfSha256=$lfHash;crlfSha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant();sqlxSha384=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA384).Hash.ToLowerInvariant()}
-    }
-})
+function Convert-EngineMigrationLineEndings([string]$SourceTree) {
+    $stateRoot=Join-Path $sourceTree 'codex-rs\state'
+    $groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
+    $migrationSource=[IO.File]::ReadAllText((Join-Path $stateRoot 'src\migrations.rs'))
+    $declared=@([regex]::Matches($migrationSource,'migrate!\("\./([a-z_]+)"\)') | ForEach-Object { $_.Groups[1].Value })
+    if (@(Compare-Object ($groups|Sort-Object) ($declared|Sort-Object)).Count) { throw 'unreviewed migration directory' }
+    $utf8=[Text.UTF8Encoding]::new($false,$true)
+    $migrations=@(foreach ($group in $groups) {
+        $files=@(Get-ChildItem -LiteralPath (Join-Path $stateRoot $group) -File | Sort-Object Name)
+        if (-not $files.Count) { throw "missing migrations: $group" }
+        foreach ($file in $files) {
+            if ($file.Name -cnotmatch '^[0-9]{4}_[a-z0-9_]+\.sql$') { throw 'unreviewed migration file' }
+            $bytes=[IO.File]::ReadAllBytes($file.FullName)
+            $sql=$utf8.GetString($bytes)
+            if ($sql.Contains("`r") -or $sql.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) { throw 'migration source must be committed LF without BOM' }
+            $lfHash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllBytes($file.FullName,$utf8.GetBytes($sql.Replace("`n","`r`n")))
+            [ordered]@{path="codex-rs/state/$group/$($file.Name)";lfSha256=$lfHash;crlfSha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant();sqlxSha384=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA384).Hash.ToLowerInvariant()}
+        }
+    })
+    return $migrations
+}
+$migrations=@(Convert-EngineMigrationLineEndings $sourceTree)
 
 $env:TEMP='D:\Go\temp'; $env:TMP=$env:TEMP
 $null=[IO.Directory]::CreateDirectory($env:TEMP)
