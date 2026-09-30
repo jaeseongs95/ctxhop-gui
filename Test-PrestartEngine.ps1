@@ -378,7 +378,7 @@ function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Co
         $comparison=Get-SchemaMigrationComparison @($export.migrations) (Join-Path $pristine 'codex-rs/state/migrations')
         Assert-Fixture ($comparison.allMatchCrlf -and -not $comparison.allMatchLf) '58 expected CRLF checksums'
         $groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
-        $groupChecks=@()
+        $groupChecks=@(); $totalFiles=0
         foreach ($group in $groups) {
             $files=@(Get-ChildItem -LiteralPath (Join-Path $pristine "codex-rs/state/$group") -File)
             Assert-Fixture ($files.Count -gt 0) "migration group present: $group"
@@ -386,12 +386,12 @@ function Invoke-EngineMigrationChecks([string]$Root,[string]$Archive,[string]$Co
                 $text=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($file.FullName))
                 Assert-Fixture (-not $text.Contains("`r") -and -not $text.StartsWith([string][char]0xfeff,[StringComparison]::Ordinal)) "LF input: $($file.Name)"
             }
-            $groupChecks+=[ordered]@{group=$group;fileCount=$files.Count;before='LF/noBOM';after='pending'}
+            $totalFiles+=$files.Count; $groupChecks+=[ordered]@{group=$group;fileCount=$files.Count;before='LF/noBOM';after='pending'}
         }
         $positive=Join-Path $path 'positive'
         Copy-Item -LiteralPath $pristine -Destination $positive -Recurse
         $actual=@(Convert-EngineMigrationLineEndings $positive)
-        Assert-Fixture ($actual.Count -eq ($groupChecks | Measure-Object fileCount -Sum).Sum) 'all six groups returned'
+        Assert-Fixture ($actual.Count -eq $totalFiles) 'all six groups returned'
         $stateCount=0
         foreach ($row in $actual) {
             $file=Join-Path $positive $row.path
