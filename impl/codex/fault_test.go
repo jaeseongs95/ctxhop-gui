@@ -40,6 +40,19 @@ func TestEveryJournalPhaseFailure(t *testing.T) {
 			advanceJournal = oldAdvance
 			stageFile = oldStage
 			r, e = rollback(o)
+			if phase == "placed" {
+				// The mock has no registered child edge before the first engine read.
+				// A partial root delete must keep recovery pending, never hide the leaf.
+				assertCode(t, e, "delete_incomplete")
+				if r["status"] != "needs_attention" {
+					t.Fatal(r)
+				}
+				j, loadErr := loadJournal(o.Home, o.Run)
+				if loadErr != nil || j.Status != "pending" {
+					t.Fatal(loadErr, j)
+				}
+				return
+			}
 			if e != nil || r["status"] != "rolled_back" {
 				t.Fatalf("manual recovery %v %v", r, e)
 			}
