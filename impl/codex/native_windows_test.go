@@ -1,0 +1,247 @@
+//go:build windows
+
+package main
+
+import (
+	"bufio"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+// 소유 테스트 실행파일의 좁은 하위 프로세스. vendor engine/auth/socket은 사용하지 않는다.
+func init() {
+	switch os.Getenv("CTXHOP_OWNED_JOB_FIXTURE") {
+	case "pipe":
+		os.Stdout.WriteString("fixture-ready\n")
+		io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+	case "child":
+		exe, _ := os.Executable()
+		child := exec.Command(exe)
+		child.Env = []string{"CTXHOP_OWNED_JOB_FIXTURE=grandchild"}
+		child.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if e := child.Start(); e != nil {
+			os.Exit(3)
+		}
+		os.Stdout.WriteString("descendant-ready\n")
+		io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+	case "grandchild":
+		time.Sleep(5 * time.Minute)
+		os.Exit(0)
+	}
+}
+func TestNativeJobAndPreparedIdentity(t *testing.T) {
+	exe, e := os.Executable()
+	if e != nil {
+		t.Fatal(e)
+	}
+	p, e := startProcess(exe, t.TempDir(), []string{"CTXHOP_OWNED_JOB_FIXTURE=pipe"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer p.close()
+	line, e := streamLine(bufio.NewReader(p.Out))
+	if e != nil || string(line) != "fixture-ready" {
+		t.Fatal(string(line), e)
+	}
+	p.prepared = true
+	if e = p.provePrepared(); e != nil {
+		t.Fatal(e)
+	}
+	p.Created++
+	assertCode(t, p.provePrepared(), "guard_binding")
+	p.Created--
+	if e = p.close(); e != nil {
+		t.Fatal(e)
+	}
+	if !p.closed {
+		t.Fatal("active0")
+	}
+}
+func TestNativeJobDescendants(t *testing.T) {
+	exe, _ := os.Executable()
+	p, e := startProcess(exe, t.TempDir(), []string{"CTXHOP_OWNED_JOB_FIXTURE=child"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer p.close()
+	line, e := streamLine(bufio.NewReader(p.Out))
+	if e != nil || string(line) != "descendant-ready" {
+		t.Fatal(string(line), e)
+	}
+	n, e := p.active()
+	if e != nil || n < 2 {
+		t.Fatal("descendant not in owned Job", n, e)
+	}
+	if e = p.close(); e != nil {
+		t.Fatal(e)
+	}
+	if !p.closed {
+		t.Fatal("job active")
+	}
+}
+func TestNativeImageHolding(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "pinned-image.bin")
+	os.WriteFile(image, []byte("pinned"), 0600)
+	locks, e := lockImage(image)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(image, []byte("changed"), 0600); e == nil {
+		t.Fatal("write bypassed held image")
+	}
+	if e = moveFile(image, filepath.Join(dir, "replacement.bin"), false); e == nil {
+		t.Fatal("rename bypassed held image")
+	}
+	for _, f := range locks {
+		f.Close()
+	}
+	if e = os.WriteFile(image, []byte("after-close"), 0600); e != nil {
+		t.Fatal(e)
+	}
+}
+func TestNativeGuardObservation(t *testing.T) {
+	e := guard(nil)
+	if e != nil && reason(e) != "engine_open" {
+		t.Fatal(e)
+	}
+	if e == nil {
+		t.Log("actual guard closed: no external writer observed")
+	} else {
+		t.Log("actual guard rejected external writer/unknown snapshot; no process terminated")
+	}
+}
+func sqliteFixture(t *testing.T, dir string, wal bool, sql string) func() {
+	t.Helper()
+	system, e := systemDirectory()
+	if e != nil {
+		t.Fatal(e)
+	}
+	dll, e := syscall.LoadDLL(filepath.Join(system, "winsqlite3.dll"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	open := dll.MustFindProc("sqlite3_open_v2")
+	closeDB := dll.MustFindProc("sqlite3_close")
+	execSQL := dll.MustFindProc("sqlite3_exec")
+	var db uintptr
+	b := append([]byte(filepath.Join(dir, "state_5.sqlite")), 0)
+	r, _, _ := open.Call(uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&db)), 6, 0)
+	if r != 0 {
+		t.Fatal("fixture open", r)
+	}
+	if wal {
+		sql = "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; " + sql
+	}
+	b = append([]byte(sql), 0)
+	r, _, _ = execSQL.Call(db, uintptr(unsafe.Pointer(&b[0])), 0, 0, 0)
+	if r != 0 {
+		closeDB.Call(db)
+		dll.Release()
+		t.Fatal("fixture SQL", r)
+	}
+	return func() { closeDB.Call(db); dll.Release() }
+}
+
+const fixtureSQL = `CREATE TABLE threads(id TEXT PRIMARY KEY); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT NOT NULL,child_thread_id TEXT NOT NULL PRIMARY KEY,status TEXT NOT NULL);`
+
+func TestNativeReadOnlyDB(t *testing.T) {
+	t.Run("hidden_and_foreign", func(t *testing.T) {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, fixtureSQL+` INSERT INTO threads VALUES('`+rootID+`');`)
+		close()
+		v, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+		if e != nil || !v.IDs[rootID] {
+			t.Fatal(e, v)
+		}
+		close = sqliteFixture(t, home, false, `INSERT INTO thread_spawn_edges VALUES('`+rootID+`','`+otherID+`','open');`)
+		close()
+		_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+		assertCode(t, e, "foreign_link")
+	})
+	t.Run("WAL_and_SHM", func(t *testing.T) {
+		source := t.TempDir()
+		close := sqliteFixture(t, source, true, fixtureSQL+` INSERT INTO threads VALUES('`+rootID+`');`)
+		defer close()
+		home := t.TempDir()
+		for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal"} {
+			b, e := os.ReadFile(filepath.Join(source, name))
+			if e != nil {
+				t.Fatal(e)
+			}
+			os.WriteFile(filepath.Join(home, name), b, 0600)
+		}
+		before, _ := dbHashes(filepath.Join(home, "state_5.sqlite"))
+		v, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+		if e != nil || !v.IDs[rootID] {
+			t.Fatal(e)
+		}
+		after, _ := dbHashes(filepath.Join(home, "state_5.sqlite"))
+		if string(encoded(before)) != string(encoded(after)) {
+			t.Fatal("body/WAL changed")
+		}
+		if _, e = os.Stat(filepath.Join(home, "state_5.sqlite-shm")); e != nil {
+			t.Fatal("SHM exception not observed", e)
+		}
+		os.Remove(filepath.Join(home, "state_5.sqlite-wal"))
+		_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+		assertCode(t, e, "engine_db_unknown")
+	})
+	t.Run("missing", func(t *testing.T) {
+		home := t.TempDir()
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, false)
+		assertCode(t, e, "engine_db_unknown")
+		if _, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, true); e != nil {
+			t.Fatal(e)
+		}
+	})
+	t.Run("unknown", func(t *testing.T) {
+		home := t.TempDir()
+		close := sqliteFixture(t, home, false, `CREATE TABLE threads(wrong TEXT);`)
+		close()
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, false)
+		assertCode(t, e, "engine_db_unknown")
+	})
+	t.Run("other_state", func(t *testing.T) {
+		home := t.TempDir()
+		os.WriteFile(filepath.Join(home, "state_6.sqlite"), nil, 0600)
+		_, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), nil, true)
+		assertCode(t, e, "engine_db_unknown")
+	})
+	t.Run("descriptor_outside", func(t *testing.T) {
+		_, e := checkDB(t.TempDir(), filepath.Join(t.TempDir(), "state_5.sqlite"), nil, true)
+		assertCode(t, e, "engine_db_unknown")
+	})
+}
+func TestNativeReparse(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	os.Mkdir(target, 0700)
+	link := filepath.Join(dir, "link")
+	if e := os.Symlink(target, link); e != nil {
+		t.Skip("symlink privilege unavailable; native reparse positive fixture not run")
+	}
+	assertCode(t, noReparse(filepath.Join(link, "absent")), "reparse")
+}
+func TestEnginePinFailClosed(t *testing.T) {
+	old := engineSHA256
+	engineSHA256 = ""
+	defer func() { engineSHA256 = old }()
+	_, e := enginePath(options{Engine: filepath.Join(t.TempDir(), "engine.exe")})
+	assertCode(t, e, "engine_untrusted")
+	if versionAllowed("0.155.9") || !versionAllowed("0.156.0-alpha") || !versionAllowed("1.0.0") || versionAllowed("garbage") {
+		t.Fatal("version")
+	}
+	if opRE.MatchString(strings.Repeat("A", 32)) {
+		t.Fatal("run")
+	}
+}
