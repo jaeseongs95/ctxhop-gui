@@ -11,6 +11,8 @@ import (
 var prepareEngine = openEngine
 var checkGuard = guard
 var readState = checkDB
+var advanceJournal = advance
+var stageFile = createFile
 
 func summary(f *family) object {
 	r := obj(f.Members[0].Data["thread"])
@@ -152,7 +154,7 @@ func importArchive(o options) (result object, retErr error) {
 	copy(staged, f.Members)
 	for i, m := range f.Members {
 		p := filepath.Join(run, "stage", fmt.Sprintf("%04d.jsonl", i))
-		if e = createFile(p, m.Raw); e != nil {
+		if e = stageFile(p, m.Raw); e != nil {
 			return nil, e
 		}
 		b, e := readBounded(p, limit)
@@ -161,7 +163,7 @@ func importArchive(o options) (result object, retErr error) {
 		}
 		staged[i].Path = p
 	}
-	if e = advance(run, j, "staged"); e != nil {
+	if e = advanceJournal(run, j, "staged"); e != nil {
 		return nil, e
 	}
 	if e = bootstrapIfNeeded(o); e != nil {
@@ -203,7 +205,7 @@ func importArchive(o options) (result object, retErr error) {
 	if hasFiles(scan) {
 		return nil, fail("exists", "배치 전 같은 ID 파일이 생겼습니다")
 	}
-	if e = advance(run, j, "placing"); e != nil {
+	if e = advanceJournal(run, j, "placing"); e != nil {
 		return nil, e
 	}
 	for i, m := range f.Members {
@@ -220,13 +222,13 @@ func importArchive(o options) (result object, retErr error) {
 			return nil, e
 		}
 	}
-	if e = advance(run, j, "placed"); e != nil {
+	if e = advanceJournal(run, j, "placed"); e != nil {
 		return nil, e
 	}
 	if e = register(active, f.Members); e != nil {
 		return nil, e
 	}
-	if e = advance(run, j, "engine"); e != nil {
+	if e = advanceJournal(run, j, "engine"); e != nil {
 		return nil, e
 	}
 	if _, e = resumeAll(active, f.Members, o.Cwd, true); e != nil {
@@ -235,7 +237,7 @@ func importArchive(o options) (result object, retErr error) {
 	if _, e = verifyOwned(o.Home, j, true); e != nil {
 		return nil, e
 	}
-	if e = advance(run, j, "settled"); e != nil {
+	if e = advanceJournal(run, j, "settled"); e != nil {
 		return nil, e
 	}
 	title := text(summary(f)["title"])
@@ -289,7 +291,7 @@ func importArchive(o options) (result object, retErr error) {
 	if e = checkGuard(nil); e != nil {
 		return nil, e
 	}
-	if e = advance(run, j, "verified"); e != nil {
+	if e = advanceJournal(run, j, "verified"); e != nil {
 		return nil, e
 	}
 	if f.Archived {
@@ -309,7 +311,7 @@ func importArchive(o options) (result object, retErr error) {
 		if e = checkMetadata(active, f, o.Cwd); e != nil {
 			return nil, e
 		}
-		if e = advance(run, j, "archived"); e != nil {
+		if e = advanceJournal(run, j, "archived"); e != nil {
 			return nil, e
 		}
 		if _, e = verifyOwned(o.Home, j, true); e != nil {
@@ -702,7 +704,7 @@ func rollback(o options) (result object, retErr error) {
 		ids[m.ID] = true
 	}
 	for _, archived := range []bool{false, true} {
-		rows, e := pages(s, "thread/list", object{"archived": archived, "sourceKinds": []string{"cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"}}, "data")
+		rows, e := pages(s, "thread/list", object{"archived": archived, "useStateDbOnly": true, "sourceKinds": []string{"cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"}}, "data")
 		if e != nil {
 			return nil, e
 		}

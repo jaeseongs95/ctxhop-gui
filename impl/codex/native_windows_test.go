@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -48,6 +49,9 @@ func TestNativeJobAndPreparedIdentity(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer p.close()
+	var nested int32
+	proc("IsProcessInJob").Call(^uintptr(0), 0, uintptr(unsafe.Pointer(&nested)))
+	t.Logf("parent Job membership=%t; child assigned to owned Job", nested != 0)
 	line, e := streamLine(bufio.NewReader(p.Out))
 	if e != nil || string(line) != "fixture-ready" {
 		t.Fatal(string(line), e)
@@ -64,6 +68,26 @@ func TestNativeJobAndPreparedIdentity(t *testing.T) {
 	}
 	if !p.closed {
 		t.Fatal("active0")
+	}
+}
+func TestNativeJobAssignmentFailure(t *testing.T) {
+	old := assignOwnedJob
+	defer func() { assignOwnedJob = old }()
+	var held syscall.Handle
+	assignOwnedJob = func(job, h syscall.Handle) error {
+		syscall.DuplicateHandle(syscall.Handle(^uintptr(0)), h, syscall.Handle(^uintptr(0)), &held, 0, false, syscall.DUPLICATE_SAME_ACCESS)
+		return syscall.ERROR_ACCESS_DENIED
+	}
+	exe, _ := os.Executable()
+	_, e := startProcess(exe, t.TempDir(), []string{"CTXHOP_OWNED_JOB_FIXTURE=pipe"})
+	assertCode(t, e, "job_assignment")
+	if held == 0 {
+		t.Fatal("owned suspended PID not observed")
+	}
+	defer syscall.CloseHandle(held)
+	var code uint32
+	if e = syscall.GetExitCodeProcess(held, &code); e != nil || code == 259 {
+		t.Fatal("owned suspended process survived assignment failure", code, e)
 	}
 }
 func TestNativeJobDescendants(t *testing.T) {
@@ -237,14 +261,20 @@ func TestNativeReparse(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		if b, e := cmd.CombinedOutput(); e != nil {
-			t.Fatalf("junction fixture failed %v %s", e, b)
+		if e = makeJunction(system, link, target); e != nil {
+			t.Fatal(e)
 		}
 		t.Log("directory junction used; symlink privilege unavailable")
 	}
 	assertCode(t, noReparse(filepath.Join(link, "absent")), "reparse")
+}
+func makeJunction(system, link, target string) error {
+	cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if b, e := cmd.CombinedOutput(); e != nil {
+		return fmt.Errorf("junction fixture: %w %s", e, b)
+	}
+	return nil
 }
 func TestEnginePinFailClosed(t *testing.T) {
 	old := engineSHA256

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -22,6 +23,13 @@ import (
 )
 
 var kernel = syscall.NewLazyDLL("kernel32.dll")
+var assignOwnedJob = func(job, handle syscall.Handle) error {
+	r, _, e := proc("AssignProcessToJobObject").Call(uintptr(job), uintptr(handle))
+	if r == 0 {
+		return e
+	}
+	return nil
+}
 
 func proc(name string) *syscall.LazyProc { return kernel.NewProc(name) }
 func noReparse(path string) error {
@@ -297,8 +305,8 @@ func startProcess(image, dir string, env []string) (*process, error) {
 			syscall.CloseHandle(pi.Process)
 		}
 	}()
-	r, _, e = proc("AssignProcessToJobObject").Call(jr, uintptr(pi.Process))
-	if r == 0 {
+	e = assignOwnedJob(job, pi.Process)
+	if e != nil {
 		return nil, fail("job_assignment", "중첩 Job 할당 실패: "+e.Error())
 	}
 	created, e := incarnation(pi.Process)
@@ -379,13 +387,15 @@ func guard(p *process) error {
 		return e
 	}
 	shell := filepath.Join(dir, "WindowsPowerShell", "v1.0", "powershell.exe")
-	script := fmt.Sprintf(`$ErrorActionPreference='Stop'; $writers=@(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne %d -and ($_.Name -match '^(?i)(codex|ctxhop-codex-engine|codex-app|codex-code-mode-host|code-mode-host|ChatGPT|Code|Cursor|Windsurf)\.exe$' -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)(@openai[\\/]codex|[\\/]codex[\\/]bin[\\/]|codex.*app-server)')) }); if ($writers.Count) { exit 2 }; exit 0`, excluded)
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'; $all=@(Get-CimInstance Win32_Process); if (@($all | Where-Object { $_.Name -eq 'node.exe' -and -not $_.CommandLine }).Count) { exit 3 }; $writers=@($all | Where-Object { $_.ProcessId -ne %d -and ($_.Name -match '^(?i)(codex|ctxhop-codex-engine|codex-app|codex-code-mode-host|code-mode-host|ChatGPT|Code|Cursor|Windsurf)\.exe$' -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)(@openai[\\/]codex|[\\/]codex[\\/]bin[\\/]|codex.*app-server)')) }); if ($writers.Count) { exit 2 }; exit 0`, excluded)
 	u := utf16.Encode([]rune(script))
 	b := make([]byte, len(u)*2)
 	for i, v := range u {
 		binary.LittleEndian.PutUint16(b[i*2:], v)
 	}
-	cmd := exec.Command(shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	cmd.Stdout = ioDiscard{}
 	cmd.Stderr = ioDiscard{}
@@ -462,7 +472,7 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 	}
 	defer dll.Release()
 	funcs := map[string]*syscall.Proc{}
-	for _, name := range []string{"sqlite3_open_v2", "sqlite3_close", "sqlite3_prepare_v2", "sqlite3_step", "sqlite3_finalize", "sqlite3_column_text", "sqlite3_column_count"} {
+	for _, name := range []string{"sqlite3_open_v2", "sqlite3_close", "sqlite3_prepare_v2", "sqlite3_step", "sqlite3_finalize", "sqlite3_column_text", "sqlite3_column_count", "sqlite3_column_bytes"} {
 		p, e := dll.FindProc(name)
 		if e != nil {
 			return v, e
@@ -508,13 +518,14 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 					row = append(row, "")
 					continue
 				}
-				b := []byte{}
-				for k := uintptr(0); k < lineLimit; k++ {
-					c := *(*byte)(unsafe.Pointer(p + k))
-					if c == 0 {
-						break
-					}
-					b = append(b, c)
+				length, _, _ := funcs["sqlite3_column_bytes"].Call(stmt, i)
+				if length > lineLimit {
+					return nil, fail("engine_db_unknown", "DB 값 크기 초과")
+				}
+				b := make([]byte, length)
+				if length > 0 {
+					proc("RtlMoveMemory").Call(uintptr(unsafe.Pointer(&b[0])), p, length)
+					runtime.KeepAlive(b)
 				}
 				row = append(row, string(b))
 			}
@@ -523,6 +534,9 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 	}
 	inspectErr = func() error {
 		if _, e := query("PRAGMA query_only=1"); e != nil {
+			return e
+		}
+		if _, e := query("BEGIN"); e != nil {
 			return e
 		}
 		check, e := query("PRAGMA quick_check")
@@ -549,6 +563,9 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 			} else {
 				if len(got) != 3 {
 					return fail("engine_db_unknown", "edge 구조 불명")
+				}
+				if got["child_thread_id"][5] != "1" || got["parent_thread_id"][5] != "0" || got["status"][5] != "0" {
+					return fail("engine_db_unknown", "edge 기본 키 구조 불명")
 				}
 				for _, key := range []string{"parent_thread_id", "child_thread_id", "status"} {
 					c := got[key]
@@ -587,7 +604,8 @@ func checkDB(home, statePath string, members []member, allowMissing bool) (dbVie
 				return fail("foreign_link", "DB에 묶음 밖 연결이 있습니다")
 			}
 		}
-		return nil
+		_, e = query("COMMIT")
+		return e
 	}()
 	rc, _, _ := funcs["sqlite3_close"].Call(db)
 	if rc != 0 {

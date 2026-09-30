@@ -85,7 +85,13 @@ func parseJSON(b []byte) (any, error) {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
 	var read func() (any, error)
+	depth := 0
 	read = func() (any, error) {
+		depth++
+		defer func() { depth-- }()
+		if depth > 128 {
+			return nil, fail("invalid_json", "JSON 깊이 한도 초과")
+		}
 		t, e := d.Token()
 		if e != nil {
 			return nil, e

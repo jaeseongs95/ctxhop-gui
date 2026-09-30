@@ -187,6 +187,9 @@ func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error
 			}
 			return object{"data": a, "nextCursor": nil}, nil
 		case "thread/list":
+			if p["useStateDbOnly"] != true {
+				return nil, fail("mock_list", "thread/list must useStateDbOnly")
+			}
 			a := []any{}
 			for _, member := range h.IDs {
 				a = append(a, m.metadata(o, h, member))
