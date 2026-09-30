@@ -4,8 +4,10 @@ Worker(`Worker.ps1`)가 벤더 구현을 부르는 방법입니다. 벤더를 �
 
 | 벤더 | 구현 | 대화 저장·전송 |
 |---|---|---|
-| `codex-desktop` | `CodexDesktop.ps1` | 고정한 Python 백엔드(`backend\desktop_sessions.py`)가 내보내고 가져옵니다. 전송은 공통 도구 `bin\ctxhop.exe bundle`입니다. |
+| `codex-desktop` | `CodexDesktop.ps1` | 고정한 Python 백엔드(`backend\desktop_sessions.py`)가 목록·백업과 기존 ID 경로를 맡습니다. 새 ID 복원은 Go 구현(`bin\ctxhop-codex.exe`)과 보호 엔진을 사용합니다. 전송은 공통 도구 `bin\ctxhop.exe bundle`입니다. |
 | `claude-code` | `ClaudeCode.ps1` | `ClaudeWorker.ps1`의 대화 작업을 그대로 감쌉니다. 전송은 `bin\ctxhop-claude.exe push/resume`입니다. |
+
+S4의 새 ID 복원 경로와 실행 파일 결합은 [`s4-prestart.md`](s4-prestart.md)에 설명합니다. 미리보기의 영수증은 Go/Python 경로를 고정하며, Go 오류나 차단을 Python 복원으로 우회하지 않습니다. 개발 중인 실제 엔진 검증 상태도 그 문서와 검증 기록에서 구분합니다.
 
 ## 1. 역할
 

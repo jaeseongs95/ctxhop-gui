@@ -701,3 +701,17 @@ PowerShell 시험은 `powershell.exe -NoProfile -ExecutionPolicy Bypass [-STA] -
 - 실행 파일(`Run-CtxHop-GUI-vNext.cmd`)과 설치 파일의 바로가기는 `-ExecutionPolicy RemoteSigned`를 씁니다. 폴더 선택 수정 뒤의 시험 6개는 이 설정으로 통과했습니다. 브라우저로 받은 zip을 그대로 풀면 인터넷 출처 표시 때문에 실행이 막힐 수 있습니다(zip 속성에서 차단 해제 후 풀기). 설치 파일로 설치한 파일에는 이 표시가 붙지 않습니다.
 - `gui-*-preview.png` 스크린샷에는 이 PC 이름과 사용자 경로가 보입니다.
 - Python은 260자를 넘는 경로를 읽지 못합니다(Windows 긴 경로 설정이 꺼진 경우). 아주 긴 데이터 폴더 경로에서는 가져오기가 실패하고 복구가 필요할 수 있습니다.
+
+## S4 개발 후보 검증 (2026-09-30)
+
+이 절은 위의 배포된 S3 및 이전 시험과 별개의 진행 기록입니다. S4의 실제 보호 엔진 복원·전체 효과 관측·최종 독립 감사는 아직 미완료입니다.
+
+| 고정 후보 | 실행한 검사 | 결과와 한계 |
+|---|---|---|
+| `300856f` | Test-Strings, Test-Contract | 2092·95 assertions PASS. native 엔진은 실행하지 않음 |
+| `6119f15` | Test-DesktopWorker | 976 assertions PASS. 새 Go/provider/backend 연결은 mock, 기존 Job 자손 검사는 실제 owned process |
+| `38e18cf` | Go 전체 시험, go vet, 두 번 빌드 | 전체 PASS, skip0, 빌드 SHA-256 일치. 보호 엔진 핀이 없는 fixture 빌드이며 실제 엔진 복원은 검증하지 않음 |
+| `a7b9f15` | Test-PrestartEngine 자체 검사 | 22 PASS, 실제 owned junction 거절, 실제 엔진 모드는 선행 차단. 엔진 사례 22개는 미실행 |
+| `58975b2` 준비 코드 | PS 빌드 스크립트 parser, 변경 범위 검사 | parser/diff 검사 PASS, 범위 외 변경0. provider/Go 핀 미확정으로 실제 패키지 빌드는 아직 실행하지 않음 |
+
+초기 Go 시험에서는 읽기 전용 SQLite도 WAL 부재 시 WAL을 만들 수 있는 문제를 확인했습니다. 후속 후보는 DB 열기 전에 이를 차단하지만, 정상적으로 닫힌 WAL 부재 홈까지 지원한 결과는 아닙니다. 사본 검사 전략과 canonical 활성화는 설계·시험 후 별도로 수용해야 합니다. 준비 엔진의 단위 시험 결과만으로 실제 복원·무쓰기·무네트워크를 선언하지 않습니다.
