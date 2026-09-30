@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 2,
+  "vendorCommit": "ff6aec96948b70d94983af2641a6b67c94faeff5",
+  "memberOrder": "approvedPlan",
+  "memberLimit": 2000,
+  "countType": "nonnegativeExactI64",
+  "storeProofFields": ["schemaVersion","observationDigest","members"],
+  "memberFields": ["memberId","relations"],
+  "relationFields": ["kind","relationClass","counts"],
+  "relationScopes": [
+    "active",
+    "internal",
+    "externalIncoming",
+    "externalOutgoing",
+    "sharedGlobal",
+    "passive"
+  ],
+  "stores": [
+    {"kind":"state","filename":"state_5.sqlite","relationClasses":["thread","sessionSource","spawnEdge","attachment","dynamicTool","project","section","migrationCursor","skippedRollout"]},
+    {"kind":"logs","filename":"logs_2.sqlite","relationClasses":["thread"]},
+    {"kind":"goals","filename":"goals_1.sqlite","relationClasses":["goal","deferral"]},
+    {"kind":"memories","filename":"memories_1.sqlite","relationClasses":["stage1","stage1Job","globalJob"]},
+    {"kind":"memoriesV2","filename":"memories_v2_1.sqlite","relationClasses":["stage1","stage1Job","globalJob"]},
+    {"kind":"queue","filename":"queue_1.sqlite","relationClasses":["item","revision"]},
+    {"kind":"threadHistory","filename":"thread_history_1.sqlite","relationClasses":["turn","item","realtimeItem","projection"]},
+    {"kind":"agentMessageBoard","filename":"agent_message_board_1.sqlite","relationClasses":["channel","post","subscription","optOut","deletedBoard"]}
+  ],
+  "edgeDirections": {
+    "state.sessionSource": "childToParent",
+    "state.spawnEdge": "parentToChild",
+    "memories.stage1Job": "jobOwnerToWorker",
+    "memoriesV2.stage1Job": "jobOwnerToWorker",
+    "agentMessageBoard.post": "boardRootToCaller",
+    "agentMessageBoard.subscription": "boardRootToAgent",
+    "agentMessageBoard.optOut": "boardRootToAgent"
+  },
+  "retainedKinds": [
+    "state.migrationCursor",
+    "queue.revision",
+    "agentMessageBoard.deletedBoard"
+  ]
+}

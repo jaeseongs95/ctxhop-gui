@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 2,
+  "cases": [
+    {
+      "name": "unicode-path",
+      "inputJson": "{\"z\":null,\"path\":\"D:\\\\한글\\\\🙂<>&  \\\"quoted\\\"\",\"a\":0}",
+      "canonicalUtf8": "{\"a\":0,\"path\":\"D:\\\\한글\\\\🙂<>&  \\\"quoted\\\"\",\"z\":null}",
+      "sha256": "7bdc6bb817d33613db74cca6edbbace42313e364ccd663851db9190a5ea403cf"
+    },
+    {
+      "name": "ordered-object",
+      "inputJson": "{\"z\":{\"two\":2,\"one\":1},\"a\":[false,true,null,{\"b\":1,\"a\":0}]}",
+      "canonicalUtf8": "{\"a\":[false,true,null,{\"a\":0,\"b\":1}],\"z\":{\"one\":1,\"two\":2}}",
+      "sha256": "9ba20ae0294a43f8188e9a4857a36ea98da6e9368096904d6cee6f844b6a7dfe"
+    },
+    {
+      "name": "same-object-reordered",
+      "inputJson": "{\"a\":[false,true,null,{\"a\":0,\"b\":1}],\"z\":{\"one\":1,\"two\":2}}",
+      "canonicalUtf8": "{\"a\":[false,true,null,{\"a\":0,\"b\":1}],\"z\":{\"one\":1,\"two\":2}}",
+      "sha256": "9ba20ae0294a43f8188e9a4857a36ea98da6e9368096904d6cee6f844b6a7dfe"
+    },
+    {
+      "name": "exact-integer-count",
+      "inputJson": "{\"count\":9223372036854775807,\"zero\":0,\"version\":2}",
+      "canonicalUtf8": "{\"count\":9223372036854775807,\"version\":2,\"zero\":0}",
+      "sha256": "460eed374b290eada67941f9dc0b75be925eb7d4a700f53bf65b4e71542fcd04"
+    },
+    {
+      "name": "control-escapes",
+      "inputJson": "{\"text\":\"line\\nreturn\\rtab\\tbackspace\\bformfeed\\fzero\\u0000slash/\\\\end\"}",
+      "canonicalUtf8": "{\"text\":\"line\\nreturn\\rtab\\tbackspace\\bformfeed\\fzero\\u0000slash/\\\\end\"}",
+      "sha256": "8b1220ccf41152bc7c6532f719e702b3a59940e1edf05b7dbb7dc62923baeb41"
+    }
+  ]
+}
