@@ -185,6 +185,9 @@ func liveFixtureSQL(t *testing.T) string {
 		t.Fatal(e)
 	}
 	var sql strings.Builder
+	// The migrated schema retains sqlite_sequence after its earlier AUTOINCREMENT
+	// table was replaced. Recreate that history in this new synthetic namespace.
+	sql.WriteString("CREATE TABLE fixture_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE fixture_sequence;\n")
 	for _, kind := range []string{"table", "index", "trigger", "view"} {
 		for _, raw := range array(seal["objects"]) {
 			row := obj(raw)
