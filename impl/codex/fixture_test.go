@@ -401,7 +401,7 @@ func TestAcquisitionWireRejectsUnknownAndUnboundProvenance(t *testing.T) {
 }
 
 func TestOtherStoreUnknownNeverMeansEmpty(t *testing.T) {
-	for _, kind := range []string{"logs", "goals", "memories", "memoriesV2", "queue", "threadHistory"} {
+	for _, kind := range []string{"logs", "goals", "memories", "memoriesV2", "queue", "threadHistory", "agentMessageBoard", "unknownStore"} {
 		t.Run(kind, func(t *testing.T) {
 			o := options{Home: t.TempDir(), Cwd: t.TempDir()}
 			p := projection(o, "rollback", nil, true)
@@ -414,6 +414,12 @@ func TestOtherStoreUnknownNeverMeansEmpty(t *testing.T) {
 				if target["kind"] == kind {
 					path = text(target["path"])
 				}
+			}
+			if kind == "agentMessageBoard" {
+				path = filepath.Join(o.Home, "agent_message_board_1.sqlite")
+			}
+			if kind == "unknownStore" {
+				path = filepath.Join(o.Home, "unrecognized_1.sqlite")
 			}
 			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
 				if e := os.WriteFile(path+suffix, []byte("unknown store bytes"), 0600); e != nil {

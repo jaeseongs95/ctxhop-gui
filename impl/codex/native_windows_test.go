@@ -343,6 +343,21 @@ func TestStateAttachmentAndDynamicToolReferencesBlock(t *testing.T) {
 		assertCode(t, e, "foreign_reference")
 	}
 }
+
+func TestStateEdgesSurviveUnrelatedReferenceRows(t *testing.T) {
+	home := t.TempDir()
+	sql := liveFixtureSQL(t) + liveFixtureThread(rootID) + liveFixtureThread(childID) + liveFixtureThread(otherID) +
+		`INSERT INTO thread_spawn_edges VALUES('` + rootID + `','` + childID + `','open');` +
+		`INSERT INTO thread_dynamic_tools(thread_id,position,name,description,input_schema) VALUES('` + otherID + `',0,'unrelated','fixture','{}');`
+	close := sqliteFixture(t, home, false, sql)
+	close()
+	v, e := checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}, {ID: childID}}, false)
+	if e != nil || len(v.Edges) != 1 || v.Edges[0]["parent_thread_id"] != rootID || v.Edges[0]["child_thread_id"] != childID {
+		t.Fatal("edge rows lost behind unrelated references", e, v.Edges)
+	}
+	_, e = checkDB(home, filepath.Join(home, "state_5.sqlite"), []member{{ID: rootID}}, false)
+	assertCode(t, e, "foreign_link")
+}
 func makeJunction(system, link, target string) error {
 	cmd := exec.Command(filepath.Join(system, "cmd.exe"), "/d", "/c", "mklink", "/J", link, target)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}

@@ -66,9 +66,9 @@ func TestBackendSequence(t *testing.T) {
 		t.Fatal("fixed Rust source artifact pin mismatch", e)
 	}
 	base := `D:\Go\codex-s4\backend-fixtures`
-	// The runner creates only this common parent; Go exclusively creates a case.
+	// Go alone creates the common parent and cases; the runner only reads them.
 	namespace := &dbAcquisition{Files: map[string]snapshotEntry{}}
-	if e := namespace.lockDirs(base); e != nil {
+	if e := namespace.lockDirs(filepath.Dir(base)); e != nil {
 		t.Fatal(e)
 	}
 	defer func() {
@@ -81,6 +81,14 @@ func TestBackendSequence(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer proc("LocalFree").Call(uintptr(unsafe.Pointer(sd)))
+	if e := snapshotAbsent(base); e == nil {
+		if e := backendDirectory(base, sd); e != nil {
+			t.Fatal("new backend parent creation failed", e)
+		}
+	}
+	if e := namespace.lockDirs(base); e != nil {
+		t.Fatal(e)
+	}
 	root := filepath.Join(base, *backendCaseID)
 	if e := backendDirectory(root, sd); e != nil {
 		t.Fatal("fresh case CREATE_NEW failed", e)

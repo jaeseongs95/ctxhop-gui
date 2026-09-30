@@ -589,12 +589,15 @@ func (s *session) revalidateHandoff() error {
 func checkOtherStoreAbsence(projection object) error {
 	// No original SQLite opens for other stores. Until their own schema and
 	// references have acquisition evidence, presence is unknown and blocks.
+	paths := []string{filepath.Join(filepath.Dir(text(projection["stateDb"])), "agent_message_board_1.sqlite")}
 	for _, raw := range array(projection["writeTargets"]) {
 		target := obj(raw)
 		if target["kind"] == "state" {
 			continue
 		}
-		path := text(target["path"])
+		paths = append(paths, text(target["path"]))
+	}
+	for _, path := range paths {
 		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
 			if e := noReparse(path + suffix); e != nil {
 				return e
@@ -603,6 +606,18 @@ func checkOtherStoreAbsence(projection object) error {
 				return fail("foreign_store_unknown", "다른 DB store/queue의 참조·목표 부재가 미증명입니다")
 			}
 		}
+	}
+	// Future or unrecognized SQLite namespaces cannot silently count as empty.
+	state := text(projection["stateDb"])
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(state), "*.sqlite*"))
+	if e != nil {
+		return fail("foreign_store_unknown", "DB namespace 열거 실패")
+	}
+	for _, path := range files {
+		if samePath(path, state) || samePath(path, state+"-wal") || samePath(path, state+"-shm") || samePath(path, state+"-journal") {
+			continue
+		}
+		return fail("foreign_store_unknown", "알 수 없는 SQLite namespace의 참조·목표 부재가 미증명입니다")
 	}
 	return nil
 }
