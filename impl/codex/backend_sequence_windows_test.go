@@ -189,6 +189,7 @@ func TestBackendSequence(t *testing.T) {
 		if e := createFile(filepath.Join(s.Private, "unknown-entry"), []byte("retain for attention")); e != nil {
 			t.Fatal(e)
 		}
+		expectedReason = "acquisitionUnknown"
 	}
 	manifest := object{"schemaVersion": 1, "caseId": *backendCaseID, "dbObservation": observation, "threadIds": []string{rootID, otherID}, "expectedReason": expectedReason}
 	manifestPath := filepath.Join(root, "manifest.json")
