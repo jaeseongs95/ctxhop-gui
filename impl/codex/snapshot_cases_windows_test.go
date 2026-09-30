@@ -292,7 +292,7 @@ func TestSnapshotSharingIdentityAndDrain(t *testing.T) {
 		t.Fatal(e)
 	}
 	var info syscall.ByHandleFileInformation
-	if e := syscall.GetFileInformationByHandle(handle, &info); e != syscall.ERROR_INVALID_HANDLE {
+	if e := syscall.GetFileInformationByHandle(handle, &info); e != syscall.Errno(6) {
 		t.Fatal("source handle not drained", e)
 	}
 	writer, e := syscall.CreateFile(u, syscall.GENERIC_WRITE, 7, nil, syscall.OPEN_EXISTING, 0, 0)
