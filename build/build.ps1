@@ -10,6 +10,8 @@ param(
     [string]$GoExe = 'go',
     [string]$TempDir = (Join-Path ([IO.Path]::GetTempPath()) 'ctxhop-go'),
     [string]$GoWork = '',
+    [string]$EngineSourceGit = 'https://github.com/openai/codex.git',
+    [string]$CargoExe = 'cargo',
     [string]$Iscc = (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
     [switch]$NoInstaller
 )
@@ -24,6 +26,7 @@ $Out = (Resolve-Path -LiteralPath $Out).Path
 # Empty values are left out: powershell.exe -File drops an empty argument and the parameter would miss its value.
 $exeArgs = @('-Out', (Join-Path $Out 'exes'), '-GoExe', $GoExe, '-TempDir', $TempDir)
 if ($GoWork) { $exeArgs += @('-GoWork', $GoWork) }
+$exeArgs += @('-EngineSourceGit',$EngineSourceGit,'-CargoExe',$CargoExe)
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-exes.ps1') @exeArgs
 if ($LASTEXITCODE -ne 0) { throw "build-exes.ps1 failed (exit $($LASTEXITCODE)): exes that differ from the pins, or a build error" }
 
@@ -37,12 +40,13 @@ New-Item -ItemType Directory -Path $pkg | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
 Remove-Item -LiteralPath $tar
 New-Item -ItemType Directory -Path (Join-Path $pkg 'bin') | Out-Null
-foreach ($exe in 'ctxhop.exe', 'ctxhop-claude.exe') { Copy-Item -LiteralPath (Join-Path $Out "exes\$exe") -Destination (Join-Path $pkg "bin\$exe") }
+foreach ($exe in 'ctxhop.exe', 'ctxhop-claude.exe', 'ctxhop-codex.exe') { Copy-Item -LiteralPath (Join-Path $Out "exes\$exe") -Destination (Join-Path $pkg "bin\$exe") }
+Copy-Item -LiteralPath (Join-Path $Out 'exes\engine') -Destination (Join-Path $pkg 'bin\engine') -Recurse
 # What this package was built from: this repository's commit, the upstream commit, patch and exe hashes, Go.
 $info = Get-Content -LiteralPath (Join-Path $Out 'exes\build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $info | Add-Member -NotePropertyName repository -NotePropertyValue 'https://github.com/jaeseongs95/ctxhop-gui'
 $info | Add-Member -NotePropertyName commit -NotePropertyValue (git -C $repo rev-parse HEAD)
-[IO.File]::WriteAllText((Join-Path $pkg 'build-info.json'), ($info | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
+[IO.File]::WriteAllText((Join-Path $pkg 'build-info.json'), ($info | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding $false))
 "package files: $(@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Force).Count)"
 
 # Zip entries are ctxhop-gui-vnext/<path> with forward slashes and no directory entries; every entry is checked.

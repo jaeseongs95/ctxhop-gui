@@ -12,7 +12,9 @@ param(
     [string]$Upstream = 'https://github.com/CCCCY-ci/ctxhop',        # any git URL or local clone that has $Commit
     [string]$GoExe = 'go',
     [string]$TempDir = (Join-Path ([IO.Path]::GetTempPath()) 'ctxhop-go'),   # TMP, TEMP and GOTMPDIR
-    [string]$GoWork = ''                                             # GOPATH and GOCACHE parent; empty = Go defaults
+    [string]$GoWork = '',                                            # GOPATH and GOCACHE parent; empty = Go defaults
+    [string]$EngineSourceGit = 'https://github.com/openai/codex.git',
+    [string]$CargoExe = 'cargo'
 )
 $ErrorActionPreference = 'Stop'
 # Upstream main "release: CtxHop v0.2.0". The v0.2.0 tag (b8a18e9) has the same parent and the same Go files;
@@ -80,5 +82,33 @@ foreach ($t in $targets) {
     $info.exes += [ordered]@{ name = $t.Name; sha256 = $hash; ldflags = $t.LdFlags
         patches = @($t.Patches | ForEach-Object { [ordered]@{ name = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $patches $_)).Hash } }) }
 }
-[IO.File]::WriteAllText((Join-Path $Out 'build-info.json'), ($info | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
+# Build the protected provider first and bind the local Go helper to its exact image.
+$providerPath=Join-Path $PSScriptRoot '..\engine\provider.json'
+$provider=Get-Content -LiteralPath $providerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($provider.engineSha256 -cnotmatch '^[0-9a-f]{64}$' -or $provider.normalEngineSha256 -cnotmatch '^[0-9a-f]{64}$' -or $provider.loaderContractId -cnotmatch '^ctxhop-prestart-v1:[0-9a-f]{64}$') { throw 'protected provider pins are not finalized' }
+$goAdapter=Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\CodexDesktop.ps1') -Raw -Encoding UTF8
+$goPin=[regex]::Match($goAdapter, "DesktopGoSHA256='([A-Fa-f0-9]{64})'")
+if (-not $goPin.Success) { throw 'Codex Go adapter pin is not finalized' }
+$engineOut=Join-Path $Out 'protected-build'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-codex-engine.ps1') -Out $engineOut -SourceGit $EngineSourceGit -CargoExe $CargoExe -VerifyPin
+if ($LASTEXITCODE -ne 0) { throw "protected engine build failed: $LASTEXITCODE" }
+$engine=Join-Path $Out 'engine'; $null=[IO.Directory]::CreateDirectory($engine)
+Copy-Item -LiteralPath (Join-Path $engineOut 'ctxhop-codex-engine.exe') -Destination (Join-Path $engine 'ctxhop-codex-engine.exe')
+Copy-Item -LiteralPath (Join-Path $engineOut 'engine-build-info.json') -Destination (Join-Path $engine 'engine-build-info.json')
+
+# No checkout conversion: this helper is built only from committed LF archive bytes.
+$repo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$helperZip=Join-Path $Out 'codex-helper.zip'; $helperSource=Join-Path $Out 'codex-helper-source'
+Invoke-Native git @('-c','core.autocrlf=false','-C',$repo,'archive','--format=zip','-o',$helperZip,'HEAD','impl/codex')
+Expand-Archive -LiteralPath $helperZip -DestinationPath $helperSource
+$helperExe=Join-Path $Out 'ctxhop-codex.exe'
+$helperFlags='-s -w -X main.engineSHA256='+$provider.engineSha256+' -X main.normalEngineSHA256='+$provider.normalEngineSha256+' -X main.loaderContractID='+$provider.loaderContractId
+Push-Location -LiteralPath (Join-Path $helperSource 'impl\codex')
+try { Invoke-Native $GoExe @('build','-buildvcs=false','-trimpath','-ldflags',$helperFlags,'-o',$helperExe,'.') }
+finally { Pop-Location }
+$helperHash=(Get-FileHash -LiteralPath $helperExe -Algorithm SHA256).Hash
+if ($helperHash -cne $goPin.Groups[1].Value.ToUpperInvariant()) { $failed++; "Codex Go helper hash mismatch: $helperHash" }
+$info.exes += [ordered]@{name='ctxhop-codex.exe';sha256=$helperHash;ldflags=$helperFlags;source='impl/codex';engineSha256=$provider.engineSha256;normalEngineSha256=$provider.normalEngineSha256;loaderContractId=$provider.loaderContractId}
+$info | Add-Member -NotePropertyName protectedEngine -NotePropertyValue (Get-Content -LiteralPath (Join-Path $engineOut 'engine-build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+[IO.File]::WriteAllText((Join-Path $Out 'build-info.json'), ($info | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding $false))
 exit $failed

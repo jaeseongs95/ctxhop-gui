@@ -17,9 +17,21 @@ jobs:
         with:
           go-version: '1.27.1'
           cache: false
-      - name: Build the package from git (both exes must match the pinned hashes)
+      - name: Prepare the pinned Rust and MSVC toolchain
         shell: powershell
-        run: .\build\build.ps1 -Out "$env:RUNNER_TEMP\out" -Tag 00000000 -NoInstaller
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+      - name: Build the package from git (all exes must match the pinned hashes)
+        shell: powershell
+        run: |
+          $env:RUSTUP_TOOLCHAIN = '1.95.0'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'MSVC toolchain unavailable' }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          .\build\build.ps1 -Out "$env:RUNNER_TEMP\out" -Tag 00000000 -NoInstaller
       - name: Test suites that need no Codex engine
         shell: powershell
         run: |
@@ -31,3 +43,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed += $t }
           }
           if ($failed) { throw "failed: $($failed -join ', ')" }
+
+      - name: Go fixtures and static checks (no vendor engine)
+        shell: powershell
+        run: |
+          Push-Location impl/codex
+          try {
+            go test -count=1 ./...
+            if ($LASTEXITCODE -ne 0) { throw 'Go fixtures failed' }
+            go vet ./...
+            if ($LASTEXITCODE -ne 0) { throw 'Go static checks failed' }
+          } finally { Pop-Location }
+      - name: Preparation runner self-checks (no vendor engine)
+        shell: pwsh
+        run: .\Test-PrestartEngine.ps1 -Mode SelfTest -OutRoot 'D:\Go\codex-s4\helper3-r45-fixture-ci-selftest'
