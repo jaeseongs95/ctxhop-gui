@@ -7,8 +7,10 @@ File snapshots detect final differences; they do not prove absence of transient
 writes or networking. Engine effects require independent complete observation.
 #>
 param(
-    [ValidateSet('Prepare','SelfTest','ConnectionPlan','Engine')][string]$Mode='SelfTest',
+    [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
+    [string]$SourceArchive,
+    [string]$SourceCommit,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
@@ -185,6 +187,106 @@ function New-PrestartConnectionPlan([string]$Root) {
     Write-FixtureJson (Join-Path $path 'connection-plan.json') $plan
     return $plan
 }
+function Invoke-SchemaCommand([string]$Executable,[string[]]$Arguments,[string]$Log) {
+    $ErrorActionPreference='Continue'
+    $lines=@(& $Executable @Arguments 2>&1); $code=$LASTEXITCODE
+    $ErrorActionPreference='Stop'
+    Write-FixtureText $Log (($lines -join "`n")+"`n")
+    if ($code -ne 0) { throw "schemaCommandFailed:${code}:$Executable" }
+}
+function Get-SchemaMigrationComparison([object[]]$Migrations,[string]$Directory) {
+    $root=Assert-OwnedFixturePath $Directory
+    $files=@(Get-ChildItem -LiteralPath $root -File -Filter '*.sql' | Sort-Object Name)
+    if ($files.Count -ne 58 -or $Migrations.Count -ne 58) { throw 'schemaMigrationSetIncomplete' }
+    $seen=@{}; $comparison=@()
+    $sha384=[Security.Cryptography.SHA384]::Create()
+    try {
+        foreach ($file in $files) {
+            if ($file.Name -cnotmatch '^([0-9]{4})_.+\.sql$') { throw 'schemaMigrationName' }
+            $version=[int]$Matches[1]
+            $rows=@($Migrations | Where-Object version -eq $version)
+            if ($version -lt 1 -or $version -gt 58 -or $seen.ContainsKey($version) -or $rows.Count -ne 1 -or
+                $rows[0].checksum -cnotmatch '^[0-9A-Fa-f]{96}$' -or $rows[0].success -notin @($true,1)) { throw 'schemaMigrationSetIncomplete' }
+            $seen[$version]=$true
+            $bytes=[IO.File]::ReadAllBytes($file.FullName)
+            $text=[Text.UTF8Encoding]::new($false,$true).GetString($bytes)
+            if ($text.Contains("`r") -or $text.StartsWith([string][char]0xFEFF)) { throw 'schemaSourceNotLf' }
+            $lf=([BitConverter]::ToString($sha384.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+            $crlfBytes=$script:Utf8.GetBytes($text.Replace("`n","`r`n"))
+            $crlf=([BitConverter]::ToString($sha384.ComputeHash($crlfBytes))).Replace('-','').ToLowerInvariant()
+            $observed=$rows[0].checksum.ToLowerInvariant()
+            $comparison+=[pscustomobject]@{version=$version;file=$file.Name;sourceSha256=(Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant();lfSha384=$lf;crlfSha384=$crlf;observedChecksum=$observed;matchesLf=($observed -ceq $lf);matchesCrlf=($observed -ceq $crlf)}
+        }
+    } finally { $sha384.Dispose() }
+    return [ordered]@{baseCommit='ff6aec96948b70d94983af2641a6b67c94faeff5';migrationCount=58;allMatchLf=(@($comparison|Where-Object { -not $_.matchesLf }).Count -eq 0);allMatchCrlf=(@($comparison|Where-Object { -not $_.matchesCrlf }).Count -eq 0);rows=$comparison;runtimeCompatibility='notTested'}
+}
+function Assert-SyntheticSchemaReceipt([object]$Receipt) {
+    foreach ($field in @('engineExecutions','sourceSQLiteOpens','sqlDirectWrites','threadRowsExported')) {
+        if ($Receipt.PSObject.Properties.Name -notcontains $field -or ($Receipt.$field -isnot [int] -and $Receipt.$field -isnot [long]) -or $Receipt.$field -ne 0) { throw 'schemaForbiddenExecutionOrExport' }
+    }
+    if ($Receipt.kind -cne 'observed-synthetic-state-schema' -or $Receipt.status -cne 'observed' -or
+        $Receipt.source -cne 'D:\Go\codex-s4\run-helper2-v2-63fc48d2e59e48ef88ea7ef193662432\source-v2\state_5.sqlite' -or
+        $Receipt.sourceMainWALUnchanged -cne $true -or $Receipt.sourceSHMCopied -cne $false -or
+        $Receipt.privateCopiesRemoved -cne $true -or $Receipt.sourceReadShareHandlesDrained -cne $true -or
+        $Receipt.privateSQLiteReadersDrained -cne $true -or $Receipt.canonicalEngineSchemaSeal -cne $false -or
+        $Receipt.dll.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $Receipt.migrationCount -ne 58) { throw 'schemaObservationIncomplete' }
+    foreach ($object in @($Receipt.objects)) {
+        if ($object.type -cin @('table','view') -and $Receipt.tableXinfo.PSObject.Properties.Name -cnotcontains $object.name) { throw 'schemaXinfoIncomplete' }
+    }
+}
+function Invoke-SyntheticSchemaExport([string]$Root,[string]$Archive,[string]$Commit) {
+    $path=Assert-OwnedFixturePath $Root
+    $archivePath=Assert-OwnedFixturePath $Archive
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$') { throw 'schemaSourceCommitRequired' }
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    if (-not [IO.File]::Exists($archivePath) -or -not [string]::Equals($PSScriptRoot,(Join-Path (Split-Path $archivePath) 'source'),[StringComparison]::OrdinalIgnoreCase)) { throw 'schemaFixedArchiveRequired' }
+    $repo='D:\claude\세션인계\ctxhop-work-20260927\ctxhop-gui'
+    $stateRepo='D:\claude\세션인계\ctxhop-work-20260927\codex-prestart-r45'
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $receipt=[ordered]@{schemaVersion=1;purpose='synthetic schema observation only';sourceCommit=$Commit;engineExecuted=$false;traceStarted=$false;debugLaunches=0;engineAcceptance='notRun';runnerStatus='failed';step='archive'}
+    try {
+        $reference=Join-Path $path 'source-reference.tar'
+        Invoke-SchemaCommand 'git' @('-C',$repo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$Commit) (Join-Path $path 'archive.log')
+        $receipt.sourceArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant()
+        if ((Get-FileHash -LiteralPath $reference).Hash.ToLowerInvariant() -cne $receipt.sourceArchiveSha256) { throw 'schemaArchiveCommitMismatch' }
+        $receipt.runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
+        $receipt.step='build'
+        . 'D:\Go\ctxhop-s4-toolchain-r45\Enter-R45Toolchain.ps1'
+        $env:CGO_ENABLED='0'; $env:GOWORK='off'; $env:GOPROXY='off'; $env:GOSUMDB='off'; $env:GOFLAGS=''; $env:GOEXPERIMENT=''
+        $go=Join-Path $env:GOROOT 'bin/go.exe'
+        $receipt.goSha256=(Get-FileHash -LiteralPath $go).Hash.ToLowerInvariant()
+        $receipt.goVersion=(& $go version) -join ''
+        if ($LASTEXITCODE -ne 0 -or $receipt.goVersion -cne 'go version go1.27.1 windows/amd64') { throw 'schemaGoVersion' }
+        $testExe=Join-Path $path 'schema-export.test.exe'
+        Push-Location -LiteralPath (Join-Path $PSScriptRoot 'impl/codex')
+        try { Invoke-SchemaCommand $go @('test','-c','-tags','ctxhop_schema_export','-trimpath','-buildvcs=false','-o',$testExe,'.') (Join-Path $path 'build.log') } finally { Pop-Location }
+        Invoke-SchemaCommand $testExe @('-test.list','^TestExportCanonicalSyntheticSchema$') (Join-Path $path 'test-list.log')
+        if ((Get-Content -LiteralPath (Join-Path $path 'test-list.log') -Raw).Trim() -cne 'TestExportCanonicalSyntheticSchema') { throw 'schemaExporterMissing' }
+        $receipt.testExeSha256=(Get-FileHash -LiteralPath $testExe).Hash.ToLowerInvariant()
+        $originReport='D:\Go\codex-s4\run-helper2-v2-63fc48d2e59e48ef88ea7ef193662432\report-helper2-v2.json'
+        $receipt.seedOriginReportSha256=(Get-FileHash -LiteralPath $originReport).Hash.ToLowerInvariant()
+        if ($receipt.seedOriginReportSha256 -cne '5a63f8b9f5a287fe4814d3797d6f175de1519d9e01519b8749665f8887c22007') { throw 'schemaSeedProvenanceChanged' }
+        $receipt.step='private-schema-query'
+        $exportRoot=Join-Path $path 'schema-export'
+        Invoke-SchemaCommand $testExe @('-test.run','^TestExportCanonicalSyntheticSchema$','-test.count=1','-test.v',('-ctxhop-schema-export-output='+$exportRoot)) (Join-Path $path 'export.log')
+        $exportFile=Join-Path $exportRoot 'schema-export.json'
+        $export=Get-Content -LiteralPath $exportFile -Raw | ConvertFrom-Json
+        Assert-SyntheticSchemaReceipt $export
+        $receipt.exportSha256=(Get-FileHash -LiteralPath $exportFile).Hash.ToLowerInvariant()
+        $receipt.step='migration-comparison'
+        $migrationTar=Join-Path $path 'state-migrations.tar'; $migrationRoot=Join-Path $path 'normal-source'
+        Invoke-SchemaCommand 'git' @('-C',$stateRepo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$migrationTar),'ff6aec96948b70d94983af2641a6b67c94faeff5','codex-rs/state/migrations') (Join-Path $path 'migration-archive.log')
+        [IO.Directory]::CreateDirectory($migrationRoot) | Out-Null
+        Invoke-SchemaCommand 'tar' @('-xf',$migrationTar,'-C',$migrationRoot) (Join-Path $path 'migration-extract.log')
+        $receipt.migrationArchiveSha256=(Get-FileHash -LiteralPath $migrationTar).Hash.ToLowerInvariant()
+        $comparison=Get-SchemaMigrationComparison @($export.migrations) (Join-Path $migrationRoot 'codex-rs/state/migrations')
+        Write-FixtureJson (Join-Path $path 'migration-comparison.json') $comparison
+        $receipt.objectCount=@($export.objects).Count; $receipt.allMigrationsMatchLf=$comparison.allMatchLf; $receipt.allMigrationsMatchCrlf=$comparison.allMatchCrlf
+        $receipt.productionGuardObservation=$export.productionGuardObservation; $receipt.absoluteWriterExclusion=$export.absoluteWriterExclusion; $receipt.dll=$export.dll
+        $receipt.runnerStatus='passed'; $receipt.step='complete'; $receipt.schemaSeal='observed synthetic objects/checksums; runtime compatibility not tested'
+    } catch { $receipt.error=$_.Exception.Message; throw } finally { Write-FixtureJson (Join-Path $path 'schema-runner-result.json') $receipt }
+    return $receipt
+}
 function New-PrestartFixtures([string]$Root) {
     $path=Assert-OwnedFixturePath $Root
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
@@ -266,6 +368,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
