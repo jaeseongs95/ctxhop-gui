@@ -28,6 +28,9 @@ type dbAcquisition struct {
 	Files           map[string]snapshotEntry
 	Copies          map[string]syscall.ByHandleFileInformation
 	SID             string
+	Pinned          bool
+	PrivateCreated  bool
+	Finalized       bool
 	Closed          bool
 	PrivateRemoved  bool
 	CloseErr        error
@@ -170,17 +173,28 @@ func snapshotOwnedACL(path, sid string, inheritedSidecar bool) error {
 	}
 	return fmt.Errorf("snapshot DACL descriptor too long")
 }
-func acquireSnapshot(source, private string, max int64, hook func(string) error, copyBytes func(io.Writer, io.Reader) (int64, error)) (s *dbAcquisition, retErr error) {
-	s = &dbAcquisition{Source: filepath.Clean(source), Private: filepath.Clean(private), ID: nonce(), Files: map[string]snapshotEntry{}, Copies: map[string]syscall.ByHandleFileInformation{}}
-	if !filepath.IsAbs(source) || !filepath.IsAbs(private) || filepath.Base(source) != "state_5.sqlite" || within(filepath.Dir(source), private) || within(private, filepath.Dir(source)) || max < 100 || max > limit {
-		return s, fmt.Errorf("snapshot arguments rejected")
+
+// Internal canonical filenames do not grant provider descriptor authority.
+func snapshotCanonicalBase(name string) bool {
+	switch name {
+	case "state_5.sqlite", "logs_2.sqlite", "goals_1.sqlite", "memories_1.sqlite", "memories_v2_1.sqlite", "queue_1.sqlite", "thread_history_1.sqlite", "agent_message_board_1.sqlite":
+		return true
 	}
-	created := false
+	return false
+}
+
+// Pin performs metadata operations only, including for an existing SHM. A set
+// owner must pin every source before calling any member's finalizeCopy.
+func pinSnapshotSource(source string, max int64) (s *dbAcquisition, retErr error) {
+	s = &dbAcquisition{Source: filepath.Clean(source), ID: nonce(), Files: map[string]snapshotEntry{}, Copies: map[string]syscall.ByHandleFileInformation{}}
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, s.Close(created))
+			retErr = errors.Join(retErr, s.releaseLeases())
 		}
 	}()
+	if !filepath.IsAbs(source) || !snapshotCanonicalBase(filepath.Base(source)) || max < 100 || max > limit {
+		return s, fmt.Errorf("snapshot source arguments rejected")
+	}
 	if e := s.lockDirs(filepath.Dir(source)); e != nil {
 		return s, e
 	}
@@ -188,9 +202,10 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 	if e := snapshotAbsent(source + "-journal"); e != nil {
 		return s, e // any rollback journal is conservative failure
 	}
-	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"} {
+	base := filepath.Base(source)
+	for _, name := range []string{base, base + "-wal", base + "-shm"} {
 		entry, e := snapshotOpen(filepath.Join(filepath.Dir(source), name), false)
-		if name != "state_5.sqlite" && e == syscall.ERROR_FILE_NOT_FOUND {
+		if name != base && e == syscall.ERROR_FILE_NOT_FOUND {
 			continue
 		}
 		if e != nil {
@@ -198,26 +213,48 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 		}
 		s.Files[name] = entry
 	}
-	// Both handles are acquired before reading/copying either file.
-	if hook != nil {
-		if e := hook("locked"); e != nil {
-			return s, e
-		}
-	}
-	if e := s.lockDirs(filepath.Dir(private)); e != nil {
+	if _, e := s.sourceBytes(max); e != nil {
 		return s, e
 	}
-	if entry, exists := s.Files["state_5.sqlite-shm"]; exists {
-		hash, _, e := snapshotHash(entry.File, lineLimit)
-		if e != nil {
-			return s, e
+	s.Pinned = true
+	return s, nil
+}
+
+// Unsigned metadata and subtraction avoid overflow before any byte is read.
+// The aggregate owner sums these main/WAL budgets once across all sources.
+func (s *dbAcquisition) sourceBytes(max int64) (int64, error) {
+	if max < 100 || max > limit {
+		return 0, fmt.Errorf("snapshot size bound rejected")
+	}
+	var total uint64
+	base := filepath.Base(s.Source)
+	for name, entry := range s.Files {
+		size := uint64(entry.Info.FileSizeHigh)<<32 | uint64(entry.Info.FileSizeLow)
+		if name == base+"-shm" {
+			if size > uint64(lineLimit) {
+				return 0, fmt.Errorf("snapshot SHM size limit")
+			}
+			continue
 		}
-		entry.Hash = hash
-		s.Files["state_5.sqlite-shm"] = entry
+		if name != base && name != base+"-wal" || size > uint64(max)-total {
+			return 0, fmt.Errorf("snapshot combined size limit")
+		}
+		total += size
+	}
+	return int64(total), nil
+}
+
+func (s *dbAcquisition) createPrivate(private string) error {
+	if !s.Pinned || s.Closed || s.PrivateCreated || s.Finalized || !filepath.IsAbs(private) || within(filepath.Dir(s.Source), private) || within(private, filepath.Dir(s.Source)) {
+		return fmt.Errorf("snapshot private phase/arguments rejected")
+	}
+	s.Private = filepath.Clean(private)
+	if e := s.lockDirs(filepath.Dir(private)); e != nil {
+		return e
 	}
 	sid, sd, e := snapshotSecurity()
 	if e != nil {
-		return s, e
+		return e
 	}
 	defer proc("LocalFree").Call(uintptr(unsafe.Pointer(sd)))
 	s.SID = sid
@@ -225,45 +262,66 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 	u, _ := syscall.UTF16PtrFromString(private)
 	r, _, e := proc("CreateDirectoryW").Call(uintptr(unsafe.Pointer(u)), uintptr(unsafe.Pointer(&sa)))
 	if r == 0 {
-		return s, e
+		return e
 	}
-	created = true
+	s.PrivateCreated = true
 	if e := s.lockDirs(private); e != nil {
-		return s, e
+		return e
 	}
 	s.PrivateDir = s.Dirs[len(s.Dirs)-1].Info
 	if e := snapshotACL(private, sid); e != nil {
-		return s, e // before any private bytes are written
+		return e // before any private bytes are written
 	}
-	if hook != nil {
-		if e := hook("private"); e != nil {
-			return s, e
+	return nil
+}
+
+func (s *dbAcquisition) finalizeCopy(max int64, copyBytes func(io.Writer, io.Reader) (int64, error)) error {
+	if !s.Pinned || !s.PrivateCreated || s.Finalized || s.Closed {
+		return fmt.Errorf("snapshot finalize phase rejected")
+	}
+	if e := s.verifySourceMetadata(max); e != nil {
+		return e
+	}
+	if e := snapshotACL(s.Private, s.SID); e != nil {
+		return e
+	}
+	sid, sd, e := snapshotSecurity()
+	if e != nil {
+		return e
+	}
+	defer proc("LocalFree").Call(uintptr(unsafe.Pointer(sd)))
+	if sid != s.SID {
+		return fmt.Errorf("snapshot private owner changed")
+	}
+	sa := syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: uintptr(unsafe.Pointer(sd))}
+	base := filepath.Base(s.Source)
+	if entry, exists := s.Files[base+"-shm"]; exists {
+		hash, size, e := snapshotHash(entry.File, lineLimit)
+		if e != nil || size != snapshotSize(entry.Info) {
+			return fmt.Errorf("snapshot SHM size/read mismatch: %v", e)
 		}
+		entry.Hash = hash
+		s.Files[base+"-shm"] = entry
 	}
-	var total int64
-	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal"} {
+	for _, name := range []string{base, base + "-wal"} {
 		entry, exists := s.Files[name]
 		if !exists {
 			continue
 		}
 		hash, size, e := snapshotHash(entry.File, max)
-		if e != nil || size != int64(entry.Info.FileSizeHigh)<<32|int64(entry.Info.FileSizeLow) {
-			return s, fmt.Errorf("snapshot source size mismatch: %w", e)
+		if e != nil || size != snapshotSize(entry.Info) {
+			return fmt.Errorf("snapshot source size mismatch: %v", e)
 		}
 		entry.Hash = hash
 		s.Files[name] = entry
-		total += size
-		if total > max {
-			return s, fmt.Errorf("snapshot combined size limit")
-		}
 		if _, e = entry.File.Seek(0, io.SeekStart); e != nil {
-			return s, e
+			return e
 		}
-		path := filepath.Join(private, name)
+		path := filepath.Join(s.Private, name)
 		u, _ := syscall.UTF16PtrFromString(path)
 		h, e := syscall.CreateFile(u, syscall.GENERIC_READ|syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, &sa, syscall.CREATE_NEW, 0x00200000, 0)
 		if e != nil {
-			return s, e
+			return e
 		}
 		out := os.NewFile(uintptr(h), path)
 		info, e := snapshotInfo(out, false)
@@ -271,11 +329,11 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 			e = fmt.Errorf("snapshot shares source identity")
 		}
 		if e != nil {
-			return s, errors.Join(e, out.Close())
+			return errors.Join(e, out.Close())
 		}
 		s.Copies[name] = info
 		if e := snapshotACL(path, sid); e != nil {
-			return s, errors.Join(e, out.Close())
+			return errors.Join(e, out.Close())
 		}
 		var n int64
 		if copyBytes == nil {
@@ -304,8 +362,46 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 		}
 		e = errors.Join(e, out.Close())
 		if e != nil {
+			return e
+		}
+	}
+	if e := s.verifySourceBytes(max); e != nil {
+		return e
+	}
+	s.Finalized = true
+	return nil
+}
+
+// The v1 state-only wrapper retains its wire and hook order. Set acquisition
+// uses the individual phases, not eight calls to this copying wrapper.
+func acquireSnapshot(source, private string, max int64, hook func(string) error, copyBytes func(io.Writer, io.Reader) (int64, error)) (s *dbAcquisition, retErr error) {
+	if !filepath.IsAbs(private) || filepath.Base(source) != "state_5.sqlite" || within(filepath.Dir(source), private) || within(private, filepath.Dir(source)) {
+		return &dbAcquisition{}, fmt.Errorf("snapshot arguments rejected")
+	}
+	s, retErr = pinSnapshotSource(source, max)
+	if retErr != nil {
+		return s, retErr
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, s.Close(true))
+		}
+	}()
+	if hook != nil {
+		if e := hook("locked"); e != nil {
 			return s, e
 		}
+	}
+	if e := s.createPrivate(private); e != nil {
+		return s, e
+	}
+	if hook != nil {
+		if e := hook("private"); e != nil {
+			return s, e
+		}
+	}
+	if e := s.finalizeCopy(max, copyBytes); e != nil {
+		return s, e
 	}
 	if hook != nil {
 		if e := hook("copied"); e != nil {
@@ -315,14 +411,21 @@ func acquireSnapshot(source, private string, max int64, hook func(string) error,
 	return s, s.Verify(max)
 }
 func (s *dbAcquisition) Verify(max int64) error {
-	if s.Closed {
-		return fmt.Errorf("snapshot handles already drained")
+	if !s.Finalized {
+		return fmt.Errorf("snapshot copy not finalized")
+	}
+	return s.verifySourceBytes(max)
+}
+
+func (s *dbAcquisition) verifySourceMetadata(max int64) error {
+	if !s.Pinned || s.Closed {
+		return fmt.Errorf("snapshot source not pinned or handles already drained")
 	}
 	if e := snapshotAbsent(s.Source + "-journal"); e != nil {
 		return e
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if _, exists := s.Files["state_5.sqlite"+suffix]; !exists {
+		if _, exists := s.Files[filepath.Base(s.Source)+suffix]; !exists {
 			if e := snapshotAbsent(s.Source + suffix); e != nil {
 				return e
 			}
@@ -337,13 +440,23 @@ func (s *dbAcquisition) Verify(max int64) error {
 			return fmt.Errorf("snapshot ancestor changed: %v", e)
 		}
 	}
-	for name, entry := range s.Files {
+	for _, entry := range s.Files {
 		info, e := snapshotInfo(entry.File, false)
 		if e != nil || !snapshotIdentity(info, entry.Info) || info.FileSizeHigh != entry.Info.FileSizeHigh || info.FileSizeLow != entry.Info.FileSizeLow {
 			return fmt.Errorf("snapshot source identity/size changed: %v", e)
 		}
+	}
+	_, e := s.sourceBytes(max)
+	return e
+}
+
+func (s *dbAcquisition) verifySourceBytes(max int64) error {
+	if e := s.verifySourceMetadata(max); e != nil {
+		return e
+	}
+	for name, entry := range s.Files {
 		bound := max
-		if name == "state_5.sqlite-shm" {
+		if name == filepath.Base(s.Source)+"-shm" {
 			bound = lineLimit
 		}
 		hash, _, e := snapshotHash(entry.File, bound)
@@ -361,6 +474,9 @@ func snapshotSize(info syscall.ByHandleFileInformation) int64 {
 	return int64(info.FileSizeHigh)<<32 | int64(info.FileSizeLow)
 }
 func (s *dbAcquisition) Observation() (object, error) {
+	if filepath.Base(s.Source) != "state_5.sqlite" {
+		return nil, fmt.Errorf("v1 observation requires state acquisition")
+	}
 	if e := s.Verify(limit); e != nil {
 		return nil, e
 	}
@@ -391,19 +507,20 @@ func (s *dbAcquisition) Observation() (object, error) {
 // Run only after every Go/provider private reader has closed. Register permitted
 // private sidecars without changing the original presence captured by Files.
 func (s *dbAcquisition) VerifyPrivate() error {
-	if s.Closed || s.PrivateRemoved {
-		return fmt.Errorf("snapshot private namespace already drained")
+	if !s.Finalized || !s.PrivateCreated || s.Closed || s.PrivateRemoved {
+		return fmt.Errorf("snapshot private copy not finalized or namespace drained")
 	}
-	if e := snapshotAbsent(filepath.Join(s.Private, "state_5.sqlite-journal")); e != nil {
+	base := filepath.Base(s.Source)
+	if e := snapshotAbsent(filepath.Join(s.Private, base+"-journal")); e != nil {
 		return e
 	}
 	if e := snapshotACL(s.Private, s.SID); e != nil {
 		return e
 	}
-	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"} {
+	for _, name := range []string{base, base + "-wal", base + "-shm"} {
 		entry, e := snapshotOpen(filepath.Join(s.Private, name), false)
 		source, copied := s.Files[name]
-		copied = copied && name != "state_5.sqlite-shm"
+		copied = copied && name != base+"-shm"
 		if e == syscall.ERROR_FILE_NOT_FOUND && !copied {
 			continue
 		}
@@ -423,7 +540,7 @@ func (s *dbAcquisition) VerifyPrivate() error {
 				if e != nil || n != snapshotSize(source.Info) || hash != source.Hash {
 					return fmt.Errorf("snapshot private copied bytes changed: %v", e)
 				}
-			} else if (name == "state_5.sqlite-wal" && size != 0) || (name == "state_5.sqlite-shm" && size > lineLimit) {
+			} else if (name == base+"-wal" && size != 0) || (name == base+"-shm" && size > lineLimit) {
 				return fmt.Errorf("snapshot private sidecar size rejected")
 			}
 			s.Copies[name] = entry.Info
@@ -439,63 +556,68 @@ func (s *dbAcquisition) VerifyPrivate() error {
 // Fresh raw-only source acquisition after private cleanup/source release. This
 // observes a handoff gap; it does not turn the observation into a writer lease.
 func (s *dbAcquisition) VerifyReleasedSource() (retErr error) {
-	if !s.Closed || s.CloseErr != nil || !s.PrivateRemoved {
+	if !s.Finalized || !s.Closed || s.CloseErr != nil || !s.PrivateRemoved {
 		return fmt.Errorf("snapshot source handoff before successful cleanup/drain")
 	}
-	fresh := &dbAcquisition{Source: s.Source, Files: map[string]snapshotEntry{}}
-	defer func() { retErr = errors.Join(retErr, fresh.Close(false)) }()
-	if e := fresh.lockDirs(filepath.Dir(s.Source)); e != nil {
+	fresh, e := pinSnapshotSource(s.Source, limit)
+	if e != nil {
 		return e
 	}
-	if !snapshotIdentity(fresh.Dirs[len(fresh.Dirs)-1].Info, s.SourceDir) {
+	defer func() { retErr = errors.Join(retErr, fresh.releaseLeases()) }()
+	if !snapshotIdentity(fresh.SourceDir, s.SourceDir) {
 		return fmt.Errorf("snapshot source directory changed after release")
 	}
-	for _, name := range []string{"state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"} {
+	base := filepath.Base(s.Source)
+	for _, name := range []string{base, base + "-wal", base + "-shm"} {
 		expected, exists := s.Files[name]
-		if !exists {
-			if e := snapshotAbsent(filepath.Join(filepath.Dir(s.Source), name)); e != nil {
-				return e
-			}
+		entry, present := fresh.Files[name]
+		if exists != present {
+			return fmt.Errorf("snapshot source presence changed after release")
+		}
+		if !present {
 			continue
 		}
-		entry, e := snapshotOpen(filepath.Join(filepath.Dir(s.Source), name), false)
-		if e != nil {
-			return e
-		}
-		fresh.Files[name] = entry
 		if !snapshotIdentity(entry.Info, expected.Info) || snapshotSize(entry.Info) != snapshotSize(expected.Info) {
 			return fmt.Errorf("snapshot source identity/size changed after release")
 		}
 		entry.Hash = expected.Hash
 		fresh.Files[name] = entry
 	}
-	return fresh.Verify(limit)
+	return fresh.verifySourceBytes(limit)
 }
 func (s *dbAcquisition) Close(clean bool) error {
 	if s.Closed {
 		return s.CloseErr
 	}
-	var result error
 	// Private readers must already be drained. Source leases remain held through
 	// identity-checked cleanup, including errors; every lease is then drained.
-	if clean {
-		result = s.CleanupPrivate()
+	if clean && s.PrivateCreated {
+		s.CloseErr = errors.Join(s.CloseErr, s.CleanupPrivate())
+	}
+	return s.releaseLeases()
+}
+
+// A set owner calls this only after all members' private cleanup has finished.
+// Pin failures also use it; it never starts cleanup or reads source bytes.
+func (s *dbAcquisition) releaseLeases() error {
+	if s.Closed {
+		return s.CloseErr
 	}
 	for _, entry := range s.Files {
-		result = errors.Join(result, entry.File.Close())
+		s.CloseErr = errors.Join(s.CloseErr, entry.File.Close())
 	}
 	for i := len(s.Dirs) - 1; i >= 0; i-- {
 		if s.Dirs[i].File != nil {
-			result = errors.Join(result, s.Dirs[i].File.Close())
+			s.CloseErr = errors.Join(s.CloseErr, s.Dirs[i].File.Close())
 			s.Dirs[i].File = nil
 		}
 	}
-	s.Closed, s.CloseErr = true, result
-	return result
+	s.Closed = true
+	return s.CloseErr
 }
 func (s *dbAcquisition) CleanupPrivate() error {
-	if s.Closed {
-		return fmt.Errorf("snapshot cleanup after source release")
+	if !s.PrivateCreated || s.Closed {
+		return fmt.Errorf("snapshot cleanup before private creation or after source release")
 	}
 	if s.PrivateRemoved {
 		return nil
@@ -525,9 +647,10 @@ func (s *dbAcquisition) CleanupPrivate() error {
 	if e != nil {
 		return e
 	}
+	base := filepath.Base(s.Source)
 	for _, item := range entries {
 		name := item.Name()
-		if name != "state_5.sqlite" && name != "state_5.sqlite-wal" && name != "state_5.sqlite-shm" {
+		if name != base && name != base+"-wal" && name != base+"-shm" {
 			return fmt.Errorf("snapshot cleanup refused unknown entry: %s", name)
 		}
 		entry, e := snapshotOpen(filepath.Join(s.Private, name), false)
