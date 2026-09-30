@@ -4,7 +4,7 @@
 
 Back up Claude Code and Codex Desktop conversations from one window and restore them on another PC. The GUI runs on Windows PowerShell 5.1, which comes with Windows. It does not replace the existing `ctxhop-gui` package or your existing storage.
 
-> **Preview.** All isolated tests pass, but a real round trip of a conversation between two PCs has not been run yet. Start with a short test conversation.
+> **S4 development candidate.** The instructions below describe the published S3 behavior. The Go implementation and protected engine for restoring new IDs are in development; actual engine restore tests and the final audit are unfinished. See the [S4 implementation notes](docs/s4-prestart.md) and [verification record](verification.md) for scope and evidence.
 
 ## What you need
 
