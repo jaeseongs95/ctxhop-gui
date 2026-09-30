@@ -123,7 +123,7 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             return @{status='rolled_back'}
         }
         guard {
-            if ($script:GuardOpen) {
+            if ($script:GuardOpen -or $script:GuardBusy) {
                 $e=[InvalidOperationException]::new('synthetic active Codex writer')
                 $e.Data['backendResult']=[pscustomobject]@{status='busy';reasonCode='busy';error='synthetic active Codex writer'}
                 throw $e
@@ -488,9 +488,9 @@ try {
                 apply {
                     # 가져왔으면 백엔드처럼 작업 ID 이름의 run 폴더에 완료 journal을 남긴다. equal·local_newer는 기록이 없다.
                     if ($script:ApplyStatus -eq 'imported') {
-                        $goFixtureHome2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $goFixtureHome2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
+                        $home2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $home2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
                         $null=New-Item -ItemType Directory -Path $run -Force
-                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$goFixtureHome2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$home2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
                     }
                     return @{status=$script:ApplyStatus}
                 }
