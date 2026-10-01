@@ -102,12 +102,12 @@ func processEnv(home string) ([]string, error) {
 			return nil, fail("engine_db_unknown", "CODEX_SQLITE_HOME 재지정은 지원하지 않습니다")
 		case "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE":
 			return nil, fail("engine_db_unknown", "테스트 설정 주입 환경은 지원하지 않습니다")
-		case "CODEX_HOME", "TEMP", "TMP":
+		case "CODEX_HOME":
 			continue
 		}
 		env = append(env, s)
 	}
-	return append(env, "CODEX_HOME="+home, "TEMP=D:\\Go\\temp", "TMP=D:\\Go\\temp"), nil
+	return append(env, "CODEX_HOME="+home), nil
 }
 func openEngine(o options, operation string, members []member) (*session, error) {
 	image, e := enginePath(o)

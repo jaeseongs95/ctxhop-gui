@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -214,5 +215,36 @@ func TestRPCV2NeverPromotesV1OrUnlocksProduction(t *testing.T) {
 	s.P = &process{}
 	if e := s.complete(dbView{}); e == nil {
 		t.Fatal("production schema/metadata/inventory gate unlocked")
+	}
+}
+
+func TestEngineEnvironmentPreservesParentTemp(t *testing.T) {
+	t.Setenv("TEMP", t.TempDir())
+	t.Setenv("TMP", t.TempDir())
+	t.Setenv("CODEX_HOME", "unapproved-parent-home")
+	// These unsupported overrides are rejected even when inherited.
+	for _, key := range []string{"CODEX_SQLITE_HOME", "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE"} {
+		if _, ok := os.LookupEnv(key); ok {
+			t.Fatal("fixture inherited unsupported DB/config override")
+		}
+	}
+	home := t.TempDir()
+	env, e := processEnv(home)
+	if e != nil {
+		t.Fatal(e)
+	}
+	got := map[string][]string{}
+	for _, entry := range env {
+		key, value, _ := strings.Cut(entry, "=")
+		got[strings.ToUpper(key)] = append(got[strings.ToUpper(key)], value)
+	}
+	for key, want := range map[string]string{"TEMP": os.Getenv("TEMP"), "TMP": os.Getenv("TMP"), "CODEX_HOME": home} {
+		if len(got[key]) != 1 || got[key][0] != want {
+			t.Fatal("parent environment replaced or home not bound", key, got[key])
+		}
+	}
+	t.Setenv("CODEX_SQLITE_HOME", home)
+	if _, e := processEnv(home); e == nil {
+		t.Fatal("DB redirection accepted")
 	}
 }

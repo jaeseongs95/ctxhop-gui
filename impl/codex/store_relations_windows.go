@@ -87,6 +87,7 @@ func validStoreKeyText(s string, max int) bool {
 	return len(s) <= max && utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 func threadStoreKey(s string) storeKey { return storeKey{"thread", s} }
+func boardStoreKey(s string) storeKey  { return storeKey{"boardRoot", s} }
 func (t *storeProofKeys) historyKey(id string) *storeKey {
 	if t.members[id] {
 		key := threadStoreKey(id)
@@ -99,19 +100,21 @@ func (t *storeProofKeys) historyKey(id string) *storeKey {
 	return nil
 }
 func (t *storeProofKeys) pairScope(owner string, peer *storeKey) string {
-	if peer == nil {
-		if t.members[owner] {
+	return storePairScope(t.members[owner], peer != nil && t.members[peer.ID], peer != nil)
+}
+func storePairScope(owner, peer, hasPeer bool) string {
+	if !hasPeer {
+		if owner {
 			return "active"
 		}
 		return ""
 	}
-	a, b := t.members[owner], t.members[peer.ID]
 	switch {
-	case a && b:
+	case owner && peer:
 		return "internal"
-	case a:
+	case owner:
 		return "externalOutgoing"
-	case b:
+	case peer:
 		return "externalIncoming"
 	}
 	return ""
@@ -521,14 +524,14 @@ func readStoreKeyRelations(kind string, t *storeProofKeys, scan func(string, []s
 				}
 				scope := ""
 				if peer != nil {
-					scope = t.pairScope(root, peer)
+					scope = storePairScope(t.roots[root], t.members[peer.ID], true)
 				} else if t.roots[root] {
 					scope = "active"
 					if spec.class == "deletedBoard" {
 						scope = "passive"
 					}
 				}
-				if e := record(spec.class, scope, threadStoreKey(root), peer); e != nil {
+				if e := record(spec.class, scope, boardStoreKey(root), peer); e != nil {
 					return proof, e
 				}
 			}

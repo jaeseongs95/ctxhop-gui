@@ -45,7 +45,7 @@ func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *
 		}
 	}
 	defer func() {
-		retErr = errors.Join(retErr, s.Verify())
+		retErr = errors.Join(retErr, s.Verify(), ctx.Err())
 		if retErr != nil {
 			facts = nil
 		}

@@ -2,22 +2,43 @@
 
 package main
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Source-only proof preparation; production RPC continues to reject aggregate
 // complete. Schema, file/metadata uncertainty and operation policy are independent
 // gates. No context/admission/delete/retained marker is minted by these counts.
 func inspectPrivateStoreProof(ctx context.Context, s *storeAcquisition, targets *storeProofKeys) (observation, proof object, retErr error) {
+	if ctx == nil {
+		return nil, nil, fail("engine_db_unknown", "store proof context 누락")
+	}
+	defer func() {
+		retErr = errors.Join(retErr, ctx.Err())
+		if retErr != nil {
+			observation, proof = nil, nil
+		}
+	}()
 	facts, e := inspectPrivateStoreKeys(ctx, s, targets)
 	if e != nil {
+		return nil, nil, e
+	}
+	if e := ctx.Err(); e != nil {
 		return nil, nil, e
 	}
 	observation, e = s.Observation()
 	if e != nil {
 		return nil, nil, e
 	}
+	if e := ctx.Err(); e != nil {
+		return nil, nil, e
+	}
 	d, e := validateStoreObservationV2(observation, s.SourceRoot, s.targets)
 	if e != nil {
+		return nil, nil, e
+	}
+	if e := ctx.Err(); e != nil {
 		return nil, nil, e
 	}
 	present := make([]bool, len(s.Stores))
@@ -65,6 +86,8 @@ func projectStoreKeyProof(facts []storeKeyEvidence, t *storeProofKeys, present [
 		switch key.Domain {
 		case "thread":
 			return key.ID == id
+		case "boardRoot":
+			return t.roots[key.ID] && key.ID == id
 		case "rollout":
 			return t.rollouts[key.ID] == id
 		case "global":
@@ -74,7 +97,7 @@ func projectStoreKeyProof(facts []storeKeyEvidence, t *storeProofKeys, present [
 	}
 	validKey := func(key storeKey) bool {
 		switch key.Domain {
-		case "thread", "rollout", "project", "section":
+		case "thread", "rollout", "boardRoot", "project", "section":
 			return uuidRE.MatchString(key.ID)
 		case "global":
 			return key.ID == ""
@@ -101,6 +124,13 @@ func projectStoreKeyProof(facts []storeKeyEvidence, t *storeProofKeys, present [
 				}
 			}
 			if classIndex < 0 || !scopeKnown || !validKey(r.Owner) || r.Related != nil && !validKey(*r.Related) {
+				return nil, bad()
+			}
+			if fact.Kind == "agentMessageBoard" {
+				if r.Owner.Domain != "boardRoot" || r.Related != nil && r.Related.Domain != "thread" {
+					return nil, bad()
+				}
+			} else if r.Owner.Domain == "boardRoot" || r.Related != nil && r.Related.Domain == "boardRoot" {
 				return nil, bad()
 			}
 			if r.Owner.Domain == "global" {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -238,6 +239,10 @@ func loadJournal(home, run string) (*journal, error) {
 	if e != nil {
 		return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다")
 	}
+	return decodeJournal(home, b)
+}
+func decodeJournal(home string, b []byte) (*journal, error) {
+	var e error
 	if _, e = parseJSON(b); e != nil {
 		return nil, e
 	}
@@ -249,6 +254,9 @@ func loadJournal(home, run string) (*journal, error) {
 	}
 	if j.Version != 3 || j.Impl != "ctxhop-codex" || !samePath(j.Home, home) || !uuidRE.MatchString(j.ID) || len(j.Members) == 0 || j.ID != j.Members[0].ID || !hashRE.MatchString(j.ArchiveSHA256) {
 		return nil, fail("unsupported_record", "복구 기록 계약 오류")
+	}
+	if _, ok := phases[j.Phase]; !ok || (j.Status != "pending" && j.Status != "complete" && j.Status != "rolled_back") || len(j.Members) > 2000 {
+		return nil, fail("unsupported_record", "복구 상태/단계 오류")
 	}
 	seen := map[string]bool{}
 	for _, m := range j.Members {
@@ -410,19 +418,81 @@ func pendingRuns(home string) ([]string, error) {
 		if !d.IsDir() {
 			continue
 		}
-		b, e := readBounded(filepath.Join(root, d.Name(), "journal.json"), 4<<20)
+		if !opRE.MatchString(d.Name()) {
+			return nil, fail("pending_record", "복구 작업 폴더 이름 불명")
+		}
+		run := filepath.Join(root, d.Name())
+		live, resolved := filepath.Join(run, "journal.json"), filepath.Join(run, "journal.resolved.json")
+		present := []string{}
+		for _, path := range []string{live, resolved} {
+			if _, e := os.Lstat(path); e == nil {
+				present = append(present, path)
+			} else if !os.IsNotExist(e) {
+				return nil, fail("pending_record", "복구 기록 이름 확인 실패")
+			}
+		}
+		if len(present) != 1 {
+			return nil, fail("pending_record", "단일 복구 기록 누락/중복")
+		}
+		closed := present[0] == resolved
+		b, e := readRecoveryRecord(present[0], !closed)
 		if e != nil {
 			return nil, fail("pending_record", "읽을 수 없는 복구 기록")
 		}
+		if closed {
+			// GUI resolve is an explicit user closure, including corrupt JSON.
+			// Preserve its bounded regular file; its contents grant no authority.
+			continue
+		}
 		v, e := parseJSON(b)
 		if e != nil {
-			return nil, e
+			return nil, fail("pending_record", "복구 기록 JSON 오류")
 		}
-		if text(obj(v)["status"]) == "pending" {
+		record := obj(v)
+		if !samePath(text(record["home"]), home) || !uuidRE.MatchString(text(record["id"])) {
+			return nil, fail("pending_record", "복구 기록 home/id 결속 오류")
+		}
+		if record["impl"] == "ctxhop-codex" {
+			if _, e := decodeJournal(home, b); e != nil {
+				return nil, fail("pending_record", "Go 복구 기록 계약 오류")
+			}
+		} else if record["impl"] != nil {
+			return nil, fail("pending_record", "알 수 없는 복구 구현")
+		} else if record["version"] != nil {
+			version, ok := integer(record["version"])
+			if !ok || version != 2 || len(array(record["members"])) == 0 {
+				return nil, fail("pending_record", "기존 복구 기록 형식 불명")
+			}
+		}
+		switch record["status"] {
+		case "pending":
 			out = append(out, d.Name())
+		case "complete", "rolled_back":
+		default:
+			return nil, fail("pending_record", "복구 기록 상태 불명")
 		}
 	}
 	return out, nil
+}
+
+func readRecoveryRecord(path string, contents bool) (b []byte, retErr error) {
+	entry, e := snapshotOpen(path, false)
+	if e != nil {
+		return nil, e
+	}
+	defer func() { retErr = errors.Join(retErr, entry.File.Close()) }()
+	info, e := entry.File.Stat()
+	if e != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 4<<20 {
+		return nil, fail("pending_record", "복구 기록 파일 형식/크기 오류")
+	}
+	if !contents {
+		return nil, nil
+	}
+	b, e = io.ReadAll(io.LimitReader(entry.File, (4<<20)+1))
+	if e != nil || len(b) > 4<<20 || int64(len(b)) != info.Size() {
+		return nil, fail("pending_record", "복구 기록 읽기/크기 변경")
+	}
+	return b, nil
 }
 func streamLine(r *bufio.Reader) ([]byte, error) {
 	var b []byte
