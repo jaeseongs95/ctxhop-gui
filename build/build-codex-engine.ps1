@@ -21,6 +21,7 @@ if (@(git -C $repo status --porcelain).Count) { throw 'the working tree has unco
 $providerPath=Join-Path $repo 'engine\provider.json'
 $provider=Get-Content -LiteralPath $providerPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($provider.schemaVersion -ne 1 -or $provider.baseCommit -cnotmatch '^[0-9a-f]{40}$' -or $provider.target -cne 'x86_64-pc-windows-msvc' -or $provider.rustVersion -cne '1.95.0' -or $provider.migrationLineEndings -cne 'CRLF') { throw 'invalid provider manifest' }
+if ($provider.normalEngineSha256 -isnot [string] -or $provider.normalEngineSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'normal engine pin is not finalized' }
 if ($provider.loaderContractId -isnot [string] -or $provider.loaderContractId -cnotmatch '^ctxhop-prestart-v2:[0-9a-f]{64}$' -or -not @($provider.patches).Count) { throw 'protected engine provider is not finalized' }
 if ($VerifyPin -and $provider.engineSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'protected engine pin is not finalized' }
 $Out=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
@@ -87,6 +88,7 @@ $env:TEMP=Join-Path $Out 'temp'; $env:TMP=$env:TEMP
 $null=[IO.Directory]::CreateDirectory($env:TEMP)
 $env:CARGO_TARGET_DIR=Join-Path $Out 'rust-target'
 $env:CTXHOP_LOADER_CONTRACT_ID=$provider.loaderContractId
+$env:CTXHOP_NORMAL_ENGINE_SHA256=$provider.normalEngineSha256
 $env:STABLE_GIT_COMMIT=$provider.baseCommit
 Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 $env:CARGO_ENCODED_RUSTFLAGS=(@('-C','link-arg=/Brepro',"--remap-path-prefix=$sourceTree=.") -join [char]31)
@@ -100,6 +102,6 @@ $engine=Join-Path $Out 'ctxhop-codex-engine.exe'
 Copy-Item -LiteralPath $built -Destination $engine
 $hash=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($VerifyPin -and $hash -cne $provider.engineSha256) { throw "protected engine hash mismatch: $hash" }
-$info=[ordered]@{schemaVersion=1;baseRepository=$provider.baseRepository;baseCommit=$provider.baseCommit;sourceVersion=$provider.sourceVersion;providerSha256=(Get-FileHash -LiteralPath $frozenProvider -Algorithm SHA256).Hash.ToLowerInvariant();loaderContractId=$provider.loaderContractId;rust=$provider.rustVersion;target=$provider.target;patches=$provider.patches;migrationLineEndings=$provider.migrationLineEndings;migrations=$migrations;sha256=$hash;profile='release';cargoLocked=$true;runtimeExecuted=$false}
+$info=[ordered]@{schemaVersion=1;baseRepository=$provider.baseRepository;baseCommit=$provider.baseCommit;sourceVersion=$provider.sourceVersion;providerSha256=(Get-FileHash -LiteralPath $frozenProvider -Algorithm SHA256).Hash.ToLowerInvariant();loaderContractId=$provider.loaderContractId;normalEngineSha256=$provider.normalEngineSha256;rust=$provider.rustVersion;target=$provider.target;patches=$provider.patches;migrationLineEndings=$provider.migrationLineEndings;migrations=$migrations;sha256=$hash;profile='release';cargoLocked=$true;runtimeExecuted=$false}
 [IO.File]::WriteAllText((Join-Path $Out 'engine-build-info.json'),($info|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
 "$hash  ctxhop-codex-engine.exe"
