@@ -725,7 +725,7 @@ function Invoke-AggregateSeedChecks([string]$Root) {
         @{name='success-bool';reason='seedIntegerType';change={param($r) $r.stores[0].migrations[0].success=$true}},
         @{name='checksum-mismatch';reason='seedMigrationReceiptMismatch';change={param($r) $r.stores[0].migrations[0].checksumHex=('2'*96)}},
         @{name='missing-table-xinfo';reason='seedTableInventoryIncomplete';change={param($r) $r.stores[0].tables[0].xinfo=@()}},
-        @{name='omitted-table';reason='seedTableInventoryIncomplete';change={param($r) $r.stores[0].tables=@()}},
+        @{name='omitted-table';reason='seedInventoryMissing';change={param($r) $r.stores[0].tables=@()}},
         @{name='master-object-order';reason='seedObjectOrder';change={param($r) $r.stores[0].objects+=@{type='index';name='idx';table='_sqlx_migrations';sql='synthetic inventory only'}}}
     )
     foreach ($case in $receiptNegative) {
