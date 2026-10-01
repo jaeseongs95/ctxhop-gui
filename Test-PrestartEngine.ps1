@@ -707,11 +707,36 @@ function Invoke-AggregateSeedChecks([string]$Root) {
     Assert-FixtureThrows { Assert-SeedStoreInventory $bad $manifest 7 } 'seedAbsentFileDescriptor'
     $bad=ConvertFrom-SeedJson (ConvertTo-Json $board -Depth 30 -Compress); $bad.files[0].present='true'
     Assert-FixtureThrows { Assert-SeedStoreInventory $bad $manifest 7 } 'seedFileVectorOrder'
+    $stateStores=@(); $dbNames=@('state_5.sqlite','logs_2.sqlite','goals_1.sqlite','memories_1.sqlite','memories_v2_1.sqlite','queue_1.sqlite','thread_history_1.sqlite')
+    for ($i=0;$i -lt 7;$i++) {
+        $store=ConvertFrom-SeedJson (ConvertTo-Json $board -Depth 30 -Compress)
+        $store.kind=$kinds[$i]; $store.path=($manifest.sqliteHome+'\'+$dbNames[$i]); $store.objects[0].name='_sqlx_migrations'; $store.objects[0].table='_sqlx_migrations'; $store.tables[0].name='_sqlx_migrations'
+        $store.migrations=@($expected[$i].versions | ForEach-Object { @{version=$_.version;success=1;checksumHex=$_.checksumHex} }); $stateStores+=$store
+    }
+    $stateReceipt=@{schemaVersion=2;seedId=$manifest.seedId;producer='state';manifestSha256=('e'*64);build=$manifest.build;sqliteVersion='3.51.3';sqliteSourceId=('2026-03-13 10:38:09 '+('f'*64));allPoolsClosed=$true;originalSQLiteOpens=0;engineExecutions=0;stores=$stateStores}
+    Assert-CanonicalSeedReceipt $stateReceipt $manifest ('e'*64) 'state'
+    $receiptNegative=@(
+        @{name='closed-string';reason='seedReceiptBinding';change={param($r) $r.allPoolsClosed='True'}},
+        @{name='not-closed';reason='seedReceiptBinding';change={param($r) $r.allPoolsClosed=$false}},
+        @{name='engine-executed';reason='seedReceiptBinding';change={param($r) $r.engineExecutions=1}},
+        @{name='original-sqlite-open';reason='seedReceiptBinding';change={param($r) $r.originalSQLiteOpens=1}},
+        @{name='manifest-hash';reason='seedReceiptBinding';change={param($r) $r.manifestSha256=('d'*64)}},
+        @{name='build-mismatch';reason='seedReceiptBuildMismatch';change={param($r) $r.build.cargoLockSha256=('d'*64)}},
+        @{name='success-bool';reason='seedIntegerType';change={param($r) $r.stores[0].migrations[0].success=$true}},
+        @{name='checksum-mismatch';reason='seedMigrationReceiptMismatch';change={param($r) $r.stores[0].migrations[0].checksumHex=('2'*96)}},
+        @{name='missing-table-xinfo';reason='seedTableInventoryIncomplete';change={param($r) $r.stores[0].tables[0].xinfo=@()}},
+        @{name='omitted-table';reason='seedTableInventoryIncomplete';change={param($r) $r.stores[0].tables=@()}},
+        @{name='master-object-order';reason='seedObjectOrder';change={param($r) $r.stores[0].objects+=@{type='index';name='idx';table='_sqlx_migrations';sql='synthetic inventory only'}}}
+    )
+    foreach ($case in $receiptNegative) {
+        $bad=ConvertFrom-SeedJson (ConvertTo-Json $stateReceipt -Depth 30 -Compress); & $case.change $bad
+        Assert-FixtureThrows { Assert-CanonicalSeedReceipt $bad $manifest ('e'*64) 'state' } $case.reason
+    }
     $manifestFile=Join-Path $path 'synthetic-manifest.json'; Write-FixtureJson $manifestFile $manifest
     $hash=(Get-FileHash -LiteralPath $manifestFile).Hash.ToLowerInvariant(); $blockedRoot=Join-Path $path 'must-not-be-created'
     Assert-FixtureThrows { Invoke-AggregateSchemaSeed $blockedRoot $manifestFile $hash } 'seedArtifactPinsNotBound'
     Assert-Fixture (-not (Test-Path -LiteralPath $blockedRoot) -and -not (Test-Path -LiteralPath $seedRoot)) 'pin gate precedes output or seed creation'
-    return [ordered]@{schemaVersion=2;purpose='pure seed ABI checks using synthetic JSON, not a schema seal';runnerStatus='passed';runnerChecks=$script:FixtureChecks;manifestNegativeCases=$negative.Count;seedNamespaceCreated=$false;seedSelectorsExecuted=0;SQLiteOpens=0;historicalExportRepeats=0;engineExecuted=$false;canonicalSchemaSeal=$false;runtimeCompatibility='notTested';engineAcceptance='notRun'}
+    return [ordered]@{schemaVersion=2;purpose='pure seed ABI checks using synthetic JSON, not a schema seal';runnerStatus='passed';runnerChecks=$script:FixtureChecks;manifestNegativeCases=$negative.Count;receiptNegativeCases=$receiptNegative.Count;seedNamespaceCreated=$false;seedSelectorsExecuted=0;SQLiteOpens=0;historicalExportRepeats=0;engineExecuted=$false;canonicalSchemaSeal=$false;runtimeCompatibility='notTested';engineAcceptance='notRun'}
 }
 function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Repository,[string]$BackendArchive,[string]$BackendCommit,[string]$Requested) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'backendRunnerRequiresPs7' }
