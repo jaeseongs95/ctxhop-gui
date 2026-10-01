@@ -21,12 +21,17 @@ param(
     [string]$BackendCases,
     [string]$SeedManifest,
     [string]$SeedManifestSha256,
+    [string]$SeedSourceArchive,
+    [string]$SeedCargoLock,
     [switch]$LibraryOnly
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
 $script:FixtureChecks=0
 $script:Utf8=[Text.UTF8Encoding]::new($false)
+# Filled only in a new reviewed source commit after the coordinator reads the
+# actual CRLF artifacts/provenance and freezes the full launch manifest bytes.
+$script:ApprovedSeedManifestSha256=$null
 function Assert-Fixture([bool]$Value,[string]$Message) {
     $script:FixtureChecks++
     if (-not $Value) { throw "fixtureAssertion:$Message" }
@@ -646,7 +651,167 @@ function Assert-CanonicalSeedReceipt([object]$Receipt,[object]$Manifest,[string]
     if ($Receipt.stores -isnot [array] -or $Receipt.stores.Count -ne $count) { throw 'seedReceiptStoreCount' }
     for ($i=0;$i -lt $count;$i++) { Assert-SeedStoreInventory $Receipt.stores[$i] $Manifest $(if ($Producer -ceq 'state') { $i } else { 7 }) }
 }
-function Invoke-AggregateSchemaSeed([string]$Root,[string]$ManifestFile,[string]$ManifestHash) {
+function Assert-SeedArtifactReceipt([object]$Receipt,[object]$Manifest,[string]$Kind) {
+    Assert-SeedKeys $Receipt @('schemaVersion','kind','build','executable','migrationInventory')
+    Assert-SeedInteger $Receipt.schemaVersion; Assert-SeedBuild $Receipt.build
+    if ($Receipt.schemaVersion -ne 2 -or $Receipt.kind -isnot [string] -or $Receipt.kind -cne $Kind) { throw 'seedArtifactReceiptBinding' }
+    foreach ($key in $Manifest.build.Keys) { if ($Receipt.build[$key] -cne $Manifest.build[$key]) { throw 'seedArtifactReceiptBinding' } }
+    Assert-SeedKeys $Receipt.executable @('path','sha256'); Assert-SeedKeys $Receipt.migrationInventory @('path','sha256')
+    Assert-SeedHex $Receipt.executable.sha256 64; Assert-SeedHex $Receipt.migrationInventory.sha256 64
+    if (-not [string]::Equals((Assert-SeedReadPath $Receipt.executable.path),(Assert-SeedReadPath $Manifest.artifacts[$Kind].path),[StringComparison]::OrdinalIgnoreCase) -or
+        $Receipt.executable.sha256 -cne $Manifest.artifacts[$Kind].sha256 -or $Receipt.migrationInventory.sha256 -cne $Manifest.build.migrationInventorySha256) { throw 'seedArtifactReceiptBinding' }
+    Assert-SeedReadPath $Receipt.migrationInventory.path | Out-Null
+}
+function Assert-SeedMigrationInventory([object]$Rows,[object]$Manifest) {
+    if ($Rows -isnot [array] -or $Rows.Count -ne 73) { throw 'seedNormalizedInventoryCount' }
+    $groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations')
+    $indexes=@(0,1,2,3,5,6); $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($row in $Rows) {
+        Assert-SeedKeys $row @('path','lfSha256','crlfSha256','sqlxSha384')
+        Assert-SeedHex $row.lfSha256 64; Assert-SeedHex $row.crlfSha256 64; Assert-SeedHex $row.sqlxSha384 96
+        if ($row.path -isnot [string] -or $row.path -cnotmatch '^codex-rs/state/(migrations|logs_migrations|goals_migrations|memory_migrations|queue_migrations|thread_history_migrations)/([0-9]{4})_[A-Za-z0-9_-]+\.sql$' -or -not $seen.Add($row.path) -or $row.lfSha256 -ceq $row.crlfSha256) { throw 'seedNormalizedInventoryPath' }
+        $group=$matches[1]; $version=[int]$matches[2]; $index=[array]::IndexOf($groups,$group)
+        if ($index -lt 0 -or $version -lt 1 -or $version -gt $Manifest.expectedMigrations[$indexes[$index]].versions.Count -or
+            $row.sqlxSha384 -cne $Manifest.expectedMigrations[$indexes[$index]].versions[$version-1].checksumHex) { throw 'seedNormalizedInventoryChecksum' }
+    }
+    for ($i=0;$i -lt $groups.Count;$i++) {
+        $rowsForGroup=@($Rows | Where-Object { $_.path.StartsWith(('codex-rs/state/'+$groups[$i]+'/'),[StringComparison]::Ordinal) })
+        if ($rowsForGroup.Count -ne $Manifest.expectedMigrations[$indexes[$i]].versions.Count) { throw 'seedNormalizedInventoryCount' }
+        $versions=@($rowsForGroup | ForEach-Object { [int]([IO.Path]::GetFileName($_.path).Substring(0,4)) } | Sort-Object -Unique)
+        if ($versions.Count -ne $rowsForGroup.Count) { throw 'seedNormalizedInventoryVersionDuplicate' }
+    }
+}
+function Initialize-SeedNative {
+    if ('CtxhopSeedNativeV2' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public sealed class CtxhopSeedFileInfoV2 {
+    public string Identity;
+    public string Path;
+    public ulong Size;
+    public uint Attributes;
+    public uint Links;
+}
+public static class CtxhopSeedNativeV2 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Info {
+        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh,
+            WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", ExactSpelling=true, SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    [DllImport("kernel32.dll", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+    [DllImport("kernel32.dll", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+    public static SafeFileHandle OpenDirectory(string path) {
+        var handle=CreateFileW(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (handle.IsInvalid) { int error=Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error); }
+        return handle;
+    }
+    public static CtxhopSeedFileInfoV2 Read(SafeFileHandle handle) {
+        Info info;
+        if (!GetFileInformationByHandle(handle,out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var path=new StringBuilder(32768);
+        uint length=GetFinalPathNameByHandleW(handle,path,(uint)path.Capacity,0);
+        if (length==0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (length>=path.Capacity) throw new InvalidOperationException("seedFinalPathTooLong");
+        string resolved=path.ToString();
+        if (resolved.StartsWith(@"\\?\",StringComparison.Ordinal)) resolved=resolved.Substring(4);
+        return new CtxhopSeedFileInfoV2 {
+            Identity=String.Format("{0:x8}{1:x8}{2:x8}",info.Volume,info.IndexHigh,info.IndexLow),
+            Path=resolved, Size=((ulong)info.SizeHigh<<32)|info.SizeLow,
+            Attributes=info.Attributes, Links=info.Links
+        };
+    }
+}
+'@ | Out-Null
+}
+function Open-SeedFileLease([string]$Path,[string]$Hash=$null) {
+    $full=Assert-SeedReadPath $Path; Initialize-SeedNative
+    $stream=[IO.File]::Open($full,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $info=[CtxhopSeedNativeV2]::Read($stream.SafeFileHandle)
+        if (($info.Attributes -band 0x410) -or $info.Links -ne 1 -or -not [string]::Equals($info.Path,$full,[StringComparison]::OrdinalIgnoreCase)) { throw 'seedRawFileAliasOrReparse' }
+        if ($info.Size -gt [long]::MaxValue) { throw 'seedRawSizeOverflow' }
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try { $actual=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose(); $stream.Position=0 }
+        $after=[CtxhopSeedNativeV2]::Read($stream.SafeFileHandle)
+        if ($after.Identity -cne $info.Identity -or $after.Size -ne $info.Size -or ($Hash -and $actual -cne $Hash)) { throw 'seedRawFilePinMismatch' }
+        return @{path=$full;stream=$stream;identity=$info.Identity;size=[long]$info.Size;sha256=$actual}
+    } catch { $stream.Dispose(); throw }
+}
+function Read-SeedLeaseJson([object]$Lease) {
+    if ($Lease.size -gt 16MB) { throw 'seedJsonTooLarge' }
+    $Lease.stream.Position=0; $reader=[IO.BinaryReader]::new($Lease.stream,$script:Utf8,$true)
+    try { $bytes=$reader.ReadBytes([int]$Lease.size) } finally { $reader.Dispose(); $Lease.stream.Position=0 }
+    if ($bytes.Length -ne $Lease.size) { throw 'seedJsonReadIncomplete' }
+    return ConvertFrom-SeedJson ([Text.UTF8Encoding]::new($false,$true).GetString($bytes))
+}
+function Assert-SeedOwner([object]$Owner,[object]$Manifest,[string]$Hash) {
+    Assert-SeedKeys $Owner @('schemaVersion','seedId','manifestSha256'); Assert-SeedInteger $Owner.schemaVersion
+    Assert-SeedHex $Owner.seedId 32; Assert-SeedHex $Owner.manifestSha256 64
+    if ($Owner.schemaVersion -ne 2 -or $Owner.seedId -cne $Manifest.seedId -or $Owner.manifestSha256 -cne $Hash) { throw 'seedOwnerBinding' }
+}
+function Get-SeedNamespaceVector([object]$Manifest,[string]$Stage,[Collections.Generic.List[object]]$DirectoryLeases) {
+    $root=Assert-SeedReadPath $Manifest.seedRoot; $home=Assert-SeedReadPath $Manifest.sqliteHome
+    $ids=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($directory in @($root,$home,(Join-Path $root 'receipts'))) {
+        $handle=[CtxhopSeedNativeV2]::OpenDirectory($directory); $DirectoryLeases.Add($handle)
+        $info=[CtxhopSeedNativeV2]::Read($handle)
+        if (-not ($info.Attributes -band 0x10) -or ($info.Attributes -band 0x400) -or -not $ids.Add($info.Identity) -or -not [string]::Equals($info.Path,$directory,[StringComparison]::OrdinalIgnoreCase)) { throw 'seedDirectoryIdentity' }
+    }
+    $expectedRoot=@('sqlite','receipts','seed-owner.json'); $expectedReceipts=if ($Stage -ceq 'state') { @('state-seed.json') } else { @('state-seed.json','board-seed.json') }
+    foreach ($pair in @(@($root,$expectedRoot),@((Join-Path $root 'receipts'),$expectedReceipts))) {
+        $entries=@(Get-ChildItem -LiteralPath $pair[0] -Force)
+        if ($entries.Count -ne $pair[1].Count) { throw 'seedUnknownNamespace' }
+        foreach ($entry in $entries) { if ($entry.Name -cnotin $pair[1] -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'seedUnknownNamespace' } }
+    }
+    return @($DirectoryLeases | Select-Object -Last 3 | ForEach-Object { ([CtxhopSeedNativeV2]::Read($_)).Identity })
+}
+function Assert-SeedRawVectors([object[]]$Stores,[object]$Manifest) {
+    $allowed=@(); $ids=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); [long]$total=0
+    foreach ($store in $Stores) {
+        for ($i=0;$i -lt 4;$i++) {
+            $suffix=@('','-wal','-shm','-journal')[$i]; $path=Assert-SeedReadPath ($store.path+$suffix); $file=$store.files[$i]
+            if (-not $file.present) { if (Test-Path -LiteralPath $path) { throw 'seedRawAbsenceMismatch' }; continue }
+            $allowed+=[IO.Path]::GetFileName($path)
+            if ($i -eq 3 -or ($i -eq 2 -and $file.size -gt 16MB)) { throw 'seedClosedSidecarUnexpected' }
+            if ($i -lt 2) { if ($file.size -gt 1GB-$total) { throw 'seedRawSizeLimit' }; $total+=$file.size }
+            $lease=Open-SeedFileLease $path $file.sha256
+            try { if ($lease.identity -cne $file.identity -or $lease.size -ne $file.size -or -not $ids.Add($lease.identity)) { throw 'seedRawVectorMismatch' } } finally { $lease.stream.Dispose() }
+        }
+    }
+    $entries=@(Get-ChildItem -LiteralPath (Assert-SeedReadPath $Manifest.sqliteHome) -Force)
+    if ($entries.Count -ne $allowed.Count) { throw 'seedUnknownSqliteEntry' }
+    foreach ($entry in $entries) { if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $entry.Name -cnotin $allowed) { throw 'seedUnknownSqliteEntry' } }
+}
+function Invoke-SeedSelector([string]$Executable,[string]$Selector,[string]$ManifestFile,[string]$Hash,[string]$Directory,[string]$Log) {
+    $start=[Diagnostics.ProcessStartInfo]::new(); $start.FileName=$Executable; $start.WorkingDirectory=$Directory
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    foreach ($argument in @('--exact',$Selector,'--ignored','--nocapture','--test-threads=1')) { $start.ArgumentList.Add($argument) }
+    $start.Environment['CTXHOP_R45_SEED_MANIFEST']=$ManifestFile; $start.Environment['CTXHOP_R45_SEED_MANIFEST_SHA256']=$Hash
+    $process=[Diagnostics.Process]::Start($start)
+    $stdout=$process.StandardOutput.ReadToEndAsync(); $stderr=$process.StandardError.ReadToEndAsync()
+    try {
+        if (-not $process.WaitForExit(210000)) { $process.Kill($true); if (-not $process.WaitForExit(5000)) { throw 'seedOwnedProcessStillActive' }; throw 'seedOwnedProcessTimeout' }
+        if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),5000)) { throw 'seedChildOutputNotDrained' }
+        Write-FixtureText $Log ($stdout.Result+"`n"+$stderr.Result)
+        if ($process.ExitCode -ne 0) { throw "seedSelectorFailed:$($process.ExitCode)" }
+        return @{selector=$Selector;pid=$process.Id;exitCode=$process.ExitCode;parentProcessExited=$process.HasExited;wholeJobExit='notMeasured'}
+    } finally {
+        if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit(5000) | Out-Null }
+        if ($stdout.IsCompletedSuccessfully -and $stderr.IsCompletedSuccessfully -and -not (Test-Path -LiteralPath $Log)) { Write-FixtureText $Log ($stdout.Result+"`n"+$stderr.Result) }
+        Write-FixtureJson ($Log+'.process.json') @{pid=$process.Id;parentProcessExited=$process.HasExited;exitCode=$(if ($process.HasExited) { $process.ExitCode } else { $null });stdoutDrained=$stdout.IsCompletedSuccessfully;stderrDrained=$stderr.IsCompletedSuccessfully;wholeJobExit='notMeasured'}
+        $process.Dispose()
+    }
+}
+function Invoke-AggregateSchemaSeed([string]$Root,[string]$ManifestFile,[string]$ManifestHash,[string]$Archive,[string]$Commit,[string]$Repository,[string]$SeedArchive,[string]$CargoLock,[string]$Builder) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'seedRunnerRequiresPs7' }
     $path=Assert-OwnedFixturePath $Root; $input=Assert-OwnedFixturePath $ManifestFile
     Assert-SeedHex $ManifestHash 64
@@ -655,9 +820,65 @@ function Invoke-AggregateSchemaSeed([string]$Root,[string]$ManifestFile,[string]
     $manifest=ConvertFrom-SeedJson ([Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($input)))
     Assert-SeedManifest $manifest
     if (Test-Path -LiteralPath (Assert-SeedReadPath $manifest.seedRoot)) { throw 'seedNamespaceAlreadyExists' }
-    # The coordinator must first bind the actual CRLF artifact/provenance receipt
-    # ABI and reviewed manifest digest. Preparation cannot launch arbitrary pins.
-    throw 'seedArtifactPinsNotBound'
+    if (-not $script:ApprovedSeedManifestSha256 -or $ManifestHash -cne $script:ApprovedSeedManifestSha256) { throw 'seedArtifactPinsNotBound' }
+    $archivePath=Assert-OwnedFixturePath $Archive; $repo=Assert-OwnedFixturePath $Repository
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or -not [string]::Equals($PSScriptRoot,(Join-Path (Split-Path $archivePath) 'source'),[StringComparison]::OrdinalIgnoreCase)) { throw 'seedFixedRunnerRequired' }
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $leases=[Collections.Generic.List[object]]::new(); $directories=[Collections.Generic.List[object]]::new()
+    $summary=[ordered]@{schemaVersion=2;runnerStatus='failed';seedId=$manifest.seedId;manifestSha256=$ManifestHash;sourceCommit=$Commit;selectors=@();stateSelectorAttempted=$false;boardSelectorAttempted=$false;canonicalSchemaSeal=$false;seedNamespaceWriter='Rust canonical-seed role only';originalSQLiteOpens=0;engineExecuted=$false;engineAcceptance='notRun';runtimeCompatibility='notTested';completeEffects='notMeasured'}
+    try {
+        # Reparse only the hash-verified leased bytes before consuming paths or
+        # artifact pins; the earlier unlocked grammar check is not authoritative.
+        $manifestLease=Open-SeedFileLease $input $ManifestHash; $leases.Add($manifestLease)
+        $manifest=Read-SeedLeaseJson $manifestLease; Assert-SeedManifest $manifest
+        foreach ($pair in @(@($SeedArchive,$manifest.build.lfSourceArchiveSha256),@($CargoLock,$manifest.build.cargoLockSha256),@($Builder,$manifest.build.builderSha256))) { $leases.Add((Open-SeedFileLease $pair[0] $pair[1])) }
+        $artifactPins=@{}
+        foreach ($kind in @('state','agentMessageBoard')) {
+            $artifact=$manifest.artifacts[$kind]; $exe=Open-SeedFileLease $artifact.path $artifact.sha256; $leases.Add($exe)
+            $receiptLease=Open-SeedFileLease $artifact.receiptPath $artifact.receiptSha256; $leases.Add($receiptLease)
+            $receipt=Read-SeedLeaseJson $receiptLease; Assert-SeedArtifactReceipt $receipt $manifest $kind
+            $inventoryLease=Open-SeedFileLease $receipt.migrationInventory.path $receipt.migrationInventory.sha256; $leases.Add($inventoryLease)
+            Assert-SeedMigrationInventory (Read-SeedLeaseJson $inventoryLease) $manifest
+            $artifactPins[$kind]=@{executable=$exe.sha256;receipt=$receiptLease.sha256;migrationInventory=$inventoryLease.sha256}
+        }
+        $reference=Join-Path $path 'runner-reference.tar'
+        Invoke-SchemaCommand 'git' @('-C',$repo,'-c','core.autocrlf=false','archive','--format=tar',('--output='+$reference),$Commit) (Join-Path $path 'runner-archive.log')
+        if ((Get-FileHash -LiteralPath $reference).Hash -cne (Get-FileHash -LiteralPath $archivePath).Hash) { throw 'seedRunnerArchiveMismatch' }
+        $summary.runnerArchiveSha256=(Get-FileHash -LiteralPath $archivePath).Hash.ToLowerInvariant(); $summary.runnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant(); $summary.artifactPins=$artifactPins
+        $launchManifest=Join-Path $path 'manifest.json'
+        $manifestLease.stream.Position=0; $reader=[IO.BinaryReader]::new($manifestLease.stream,$script:Utf8,$true)
+        try { $bytes=$reader.ReadBytes([int]$manifestLease.size) } finally { $reader.Dispose(); $manifestLease.stream.Position=0 }
+        if ($bytes.Length -ne $manifestLease.size) { throw 'seedJsonReadIncomplete' }
+        [IO.File]::WriteAllBytes($launchManifest,$bytes)
+        $leases.Add((Open-SeedFileLease $launchManifest $ManifestHash))
+        if (Test-Path -LiteralPath (Assert-SeedReadPath $manifest.seedRoot)) { throw 'seedNamespaceAlreadyExists' }
+        $summary.stateSelectorAttempted=$true
+        $summary.selectors+=Invoke-SeedSelector $manifest.artifacts.state.path 'sqlite::prestart_seed_tests::create_canonical_store_seed_from_manifest' $launchManifest $ManifestHash $path (Join-Path $path 'state-selector.log')
+        $summary.directoryIdentities=Get-SeedNamespaceVector $manifest 'state' $directories
+        $ownerLease=Open-SeedFileLease (Join-Path $manifest.seedRoot 'seed-owner.json'); $leases.Add($ownerLease); Assert-SeedOwner (Read-SeedLeaseJson $ownerLease) $manifest $ManifestHash
+        $stateLease=Open-SeedFileLease $manifest.stateReceipt; $leases.Add($stateLease); $state=Read-SeedLeaseJson $stateLease
+        Assert-CanonicalSeedReceipt $state $manifest $ManifestHash 'state'; Assert-SeedRawVectors @($state.stores) $manifest
+        $summary.stateReceiptSha256=$stateLease.sha256; $summary.ownerSha256=$ownerLease.sha256
+        $summary.boardSelectorAttempted=$true
+        $summary.selectors+=Invoke-SeedSelector $manifest.artifacts.agentMessageBoard.path 'local::prestart_seed_tests::create_canonical_board_seed_from_manifest' $launchManifest $ManifestHash $path (Join-Path $path 'board-selector.log')
+        $afterDirectories=Get-SeedNamespaceVector $manifest 'board' $directories
+        if (($afterDirectories -join ',') -cne ($summary.directoryIdentities -join ',')) { throw 'seedDirectoryChanged' }
+        $boardLease=Open-SeedFileLease $manifest.boardReceipt; $leases.Add($boardLease); $board=Read-SeedLeaseJson $boardLease
+        Assert-CanonicalSeedReceipt $board $manifest $ManifestHash 'agentMessageBoard'
+        if ($board.sqliteVersion -cne $state.sqliteVersion -or $board.sqliteSourceId -cne $state.sqliteSourceId) { throw 'seedSqliteBuildMismatch' }
+        $stores=@($state.stores)+@($board.stores); Assert-SeedRawVectors $stores $manifest
+        $summary.boardReceiptSha256=$boardLease.sha256; $summary.stores=$stores; $summary.sqliteVersion=$state.sqliteVersion; $summary.sqliteSourceId=$state.sqliteSourceId
+        $summary.canonicalSchemaSeal=$true; $summary.runnerStatus='passed'; $summary.seedNamespacePreserved=$true
+    } catch { $summary.error=$_.Exception.Message; throw } finally {
+        $closeFailures=@()
+        foreach ($lease in $leases) { try { $lease.stream.Dispose() } catch { $closeFailures+=$_.Exception.Message } }
+        foreach ($directory in $directories) { try { $directory.Dispose() } catch { $closeFailures+=$_.Exception.Message } }
+        $summary.readerLeasesClosed=($closeFailures.Count -eq 0)
+        if ($closeFailures.Count) { $summary.runnerStatus='failed'; $summary.canonicalSchemaSeal=$false; $summary.closeErrors=$closeFailures }
+        if (Test-Path -LiteralPath $path) { Write-FixtureJson (Join-Path $path 'aggregate-schema-seed-result.json') $summary }
+        if ($closeFailures.Count) { throw 'seedReadLeaseCloseFailed' }
+    }
+    return $summary
 }
 function Invoke-AggregateSeedChecks([string]$Root) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'seedRunnerRequiresPs7' }
@@ -741,11 +962,46 @@ function Invoke-AggregateSeedChecks([string]$Root) {
         $bad=ConvertFrom-SeedJson (ConvertTo-Json $stateReceipt -Depth 30 -Compress); & $case.change $bad
         Assert-FixtureThrows { Assert-CanonicalSeedReceipt $bad $manifest ('e'*64) 'state' } $case.reason
     }
+    $artifactReceipt=@{schemaVersion=2;kind='state';build=$manifest.build;executable=@{path=$manifest.artifacts.state.path;sha256=$manifest.artifacts.state.sha256};migrationInventory=@{path='D:\Go\codex-s4\synthetic-contract-artifacts\inventory.json';sha256=$manifest.build.migrationInventorySha256}}
+    Assert-SeedArtifactReceipt $artifactReceipt $manifest 'state'
+    foreach ($case in @(
+        @{reason='seedObjectFields';change={param($r) $r.extra=1}},
+        @{reason='seedArtifactReceiptBinding';change={param($r) $r.kind='agentMessageBoard'}},
+        @{reason='seedArtifactReceiptBinding';change={param($r) $r.executable.sha256=('f'*64)}},
+        @{reason='seedArtifactReceiptBinding';change={param($r) $r.migrationInventory.sha256=('f'*64)}},
+        @{reason='seedPinFormat';change={param($r) $r.executable.sha256=$null}}
+    )) {
+        $bad=ConvertFrom-SeedJson (ConvertTo-Json $artifactReceipt -Depth 30 -Compress); & $case.change $bad
+        Assert-FixtureThrows { Assert-SeedArtifactReceipt $bad $manifest 'state' } $case.reason
+    }
+    $groups=@('migrations','logs_migrations','goals_migrations','memory_migrations','queue_migrations','thread_history_migrations'); $groupCounts=@(58,2,2,2,2,7)
+    $inventory=@()
+    for ($i=0;$i -lt 6;$i++) { for ($j=1;$j -le $groupCounts[$i];$j++) { $inventory+=@{path=('codex-rs/state/'+$groups[$i]+'/'+$j.ToString('D4')+'_synthetic.sql');lfSha256=('a'*64);crlfSha256=('b'*64);sqlxSha384=('1'*96)} } }
+    Assert-SeedMigrationInventory $inventory $manifest
+    Assert-FixtureThrows { Assert-SeedMigrationInventory @($inventory | Select-Object -First 72) $manifest } 'seedNormalizedInventoryCount'
+    foreach ($case in @(
+        @{reason='seedNormalizedInventoryPath';change={param($r) $r[0].path='codex-rs/state/unknown/0001_synthetic.sql'}},
+        @{reason='seedNormalizedInventoryPath';change={param($r) $r[1].path=$r[0].path}},
+        @{reason='seedNormalizedInventoryChecksum';change={param($r) $r[0].sqlxSha384=('2'*96)}},
+        @{reason='seedNormalizedInventoryPath';change={param($r) $r[0].crlfSha256=$r[0].lfSha256}},
+        @{reason='seedNormalizedInventoryVersionDuplicate';change={param($r) $r[1].path='codex-rs/state/migrations/0001_other.sql'}}
+    )) {
+        $bad=ConvertFrom-SeedJson (ConvertTo-Json $inventory -Depth 30 -Compress); & $case.change $bad
+        Assert-FixtureThrows { Assert-SeedMigrationInventory $bad $manifest } $case.reason
+    }
+    $owner=@{schemaVersion=2;seedId=$manifest.seedId;manifestSha256=('e'*64)}; Assert-SeedOwner $owner $manifest ('e'*64)
+    $owner.manifestSha256=('f'*64); Assert-FixtureThrows { Assert-SeedOwner $owner $manifest ('e'*64) } 'seedOwnerBinding'
+    $owner.manifestSha256=('e'*64); $owner.extra=1; Assert-FixtureThrows { Assert-SeedOwner $owner $manifest ('e'*64) } 'seedObjectFields'
+    # Compile and check struct layout only. No Win32 API or raw file read is
+    # invoked until actual artifacts and the reviewed manifest are bound.
+    Initialize-SeedNative
+    $nativeInfo=[CtxhopSeedNativeV2].GetNestedType('Info',[Reflection.BindingFlags]::NonPublic)
+    Assert-Fixture ([Runtime.InteropServices.Marshal]::SizeOf([type]$nativeInfo) -eq 52) 'Win32 information struct layout compiles'
     $manifestFile=Join-Path $path 'synthetic-manifest.json'; Write-FixtureJson $manifestFile $manifest
     $hash=(Get-FileHash -LiteralPath $manifestFile).Hash.ToLowerInvariant(); $blockedRoot=Join-Path $path 'must-not-be-created'
     Assert-FixtureThrows { Invoke-AggregateSchemaSeed $blockedRoot $manifestFile $hash } 'seedArtifactPinsNotBound'
     Assert-Fixture (-not (Test-Path -LiteralPath $blockedRoot) -and -not (Test-Path -LiteralPath $seedRoot)) 'pin gate precedes output or seed creation'
-    return [ordered]@{schemaVersion=2;purpose='pure seed ABI checks using synthetic JSON, not a schema seal';runnerStatus='passed';runnerChecks=$script:FixtureChecks;manifestNegativeCases=$negative.Count;receiptNegativeCases=$receiptNegative.Count;seedNamespaceCreated=$false;seedSelectorsExecuted=0;SQLiteOpens=0;historicalExportRepeats=0;engineExecuted=$false;canonicalSchemaSeal=$false;runtimeCompatibility='notTested';engineAcceptance='notRun'}
+    return [ordered]@{schemaVersion=2;purpose='pure seed ABI checks using synthetic JSON, not a schema seal';runnerStatus='passed';runnerChecks=$script:FixtureChecks;manifestNegativeCases=$negative.Count;receiptNegativeCases=$receiptNegative.Count;nativeInteropCompiled=$true;nativeRawReads=0;seedNamespaceCreated=$false;seedSelectorsExecuted=0;SQLiteOpens=0;historicalExportRepeats=0;engineExecuted=$false;canonicalSchemaSeal=$false;runtimeCompatibility='notTested';engineAcceptance='notRun'}
 }
 function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Commit,[string]$Repository,[string]$BackendArchive,[string]$BackendCommit,[string]$Requested) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'backendRunnerRequiresPs7' }
@@ -912,6 +1168,6 @@ if ($Mode -ceq 'Engine') {
     exit 2
 }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
-$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit $BackendCases } elseif ($Mode -ceq 'AggregateSchemaSeed') { Invoke-AggregateSchemaSeed $OutRoot $SeedManifest $SeedManifestSha256 } elseif ($Mode -ceq 'AggregateSchemaSeedChecks') { Invoke-AggregateSeedChecks $OutRoot } else { New-PrestartFixtures $OutRoot }
+$result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit $BackendCases } elseif ($Mode -ceq 'AggregateSchemaSeed') { Invoke-AggregateSchemaSeed $OutRoot $SeedManifest $SeedManifestSha256 $SourceArchive $SourceCommit $SourceRepository $SeedSourceArchive $SeedCargoLock $BuilderScript } elseif ($Mode -ceq 'AggregateSchemaSeedChecks') { Invoke-AggregateSeedChecks $OutRoot } else { New-PrestartFixtures $OutRoot }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
