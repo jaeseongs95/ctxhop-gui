@@ -337,3 +337,109 @@ func TestApprovalResourceAndJournalBounds(t *testing.T) {
 		t.Fatal("oversize journal accepted")
 	}
 }
+
+func TestApprovalRejectsChangedCanonicalHeaderAndReparse(t *testing.T) {
+	for _, kind := range []string{"root-parent", "duplicate-header", "member-junction"} {
+		t.Run(kind, func(t *testing.T) {
+			o, f, _ := approvalFixture(t)
+			root := filepath.Dir(o.ApprovalEvidence.ManifestPath)
+			if kind == "member-junction" {
+				members := filepath.Join(root, "members")
+				target := filepath.Join(root, "original-members")
+				if e := os.Rename(members, target); e != nil {
+					t.Fatal(e)
+				}
+				if e := os.Symlink(target, members); e != nil {
+					system, e := systemDirectory()
+					if e != nil {
+						t.Fatal(e)
+					}
+					if e = makeJunction(system, members, target); e != nil {
+						t.Fatal(e)
+					}
+				}
+			} else {
+				raw := append([]byte(nil), f.Members[0].Raw...)
+				end := bytes.IndexByte(raw, '\n')
+				if kind == "duplicate-header" {
+					raw = append(raw, raw[:end+1]...)
+				} else {
+					v, e := parseJSON(raw[:end])
+					if e != nil {
+						t.Fatal(e)
+					}
+					obj(obj(v)["payload"])["parent_thread_id"] = otherID
+					raw = append(append(encoded(v), '\n'), raw[end+1:]...)
+				}
+				f.Members[0].Size = int64(len(raw))
+				m := approvalManifest{1, approvalProfile, f.ArchiveSHA, 2, o.Run, o.Home, o.Cwd, approvalPins{engineSHA256, normalEngineSHA256, loaderContractID}, familyApprovalMembers(f, root)}
+				m.Members[0].Source.SHA256 = digest(raw)
+				if e := os.WriteFile(m.Members[0].Source.Path, raw, 0600); e != nil {
+					t.Fatal(e)
+				}
+				manifest := append(encoded(m), '\n')
+				if e := os.WriteFile(o.ApprovalEvidence.ManifestPath, manifest, 0600); e != nil {
+					t.Fatal(e)
+				}
+				o.ApprovalEvidence.ManifestSHA256 = digest(manifest)
+			}
+			l, e := pinApproval(o, f.Members)
+			if e == nil {
+				l.Close()
+				t.Fatal("changed canonical source accepted", kind)
+			}
+		})
+	}
+}
+
+func TestApprovalV3RollbackKeepsLegacyBoundaries(t *testing.T) {
+	for _, phase := range []string{"staged", "placing", "placing-pin-changed"} {
+		t.Run(phase, func(t *testing.T) {
+			f := fixtureFamily("legacy")
+			m := installMock(t, f)
+			o := options{Home: t.TempDir(), Cwd: t.TempDir(), Run: nonce()}
+			if e := support(f, o.Home); e != nil {
+				t.Fatal(e)
+			}
+			p := phase
+			if p == "placing-pin-changed" {
+				p = "placing"
+			}
+			j := &journal{Version: 3, Impl: "ctxhop-codex", Status: "pending", Phase: p, Home: o.Home, Cwd: o.Cwd, ID: rootID, Members: f.Members, ArchiveSHA256: strings.Repeat("a", 64), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
+			if phase == "placing-pin-changed" {
+				j.NormalEngineSHA256 = strings.Repeat("c", 64)
+			}
+			run := runPath(o.Home, o.Run)
+			if e := saveJournal(run, j, true); e != nil {
+				t.Fatal(e)
+			}
+			before, e := os.ReadFile(filepath.Join(run, "journal.json"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			r, e := rollback(o)
+			if phase == "staged" {
+				if e != nil || r["status"] != "rolled_back" {
+					t.Fatal(r, e)
+				}
+				r, e = rollback(o)
+				if e != nil || r["status"] != "rolled_back" {
+					t.Fatal("legacy idempotence", r, e)
+				}
+			} else {
+				code := "approval_evidence"
+				if phase == "placing-pin-changed" {
+					code = "engine_untrusted"
+				}
+				assertCode(t, e, code)
+				after, e := os.ReadFile(filepath.Join(run, "journal.json"))
+				if e != nil || !bytes.Equal(before, after) {
+					t.Fatal("v3 rewritten or upgraded", e)
+				}
+			}
+			if m.Deletes != 0 || m.Active {
+				t.Fatal("legacy rollback activated/deleted without approval")
+			}
+		})
+	}
+}

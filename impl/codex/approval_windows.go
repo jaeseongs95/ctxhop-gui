@@ -340,10 +340,12 @@ func pinApproval(o options, ms []member) (lease *approvalLease, retErr error) {
 			}
 			if first {
 				q, e := canonicalRolloutSessionID(header)
-				if e != nil || record["type"] != "session_meta" || header["id"] != m.ID || q != m.SessionID || m.ParentID != nil && header["parent_thread_id"] != *m.ParentID {
+				if e != nil || record["type"] != "session_meta" || header["id"] != m.ID || q != m.SessionID || m.ParentID == nil && header["parent_thread_id"] != nil || m.ParentID != nil && header["parent_thread_id"] != *m.ParentID {
 					return nil, fail("approval_evidence", "승인 member M/Q/parent 불일치")
 				}
 				first = false
+			} else if record["type"] == "session_meta" {
+				return nil, fail("approval_evidence", "승인 member 중복 header")
 			}
 		}
 		if first {
