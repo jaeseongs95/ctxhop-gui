@@ -144,6 +144,14 @@ func (s *storeAcquisition) finalizePrivate(private string, hook func(string) err
 	if e := s.checkPrivateRoot(); e != nil {
 		return e
 	}
+	for _, slot := range s.Stores {
+		if slot.Present {
+			entries, e := os.ReadDir(slot.Data.Private)
+			if e != nil || len(entries) != 0 {
+				return fmt.Errorf("store set private namespace not empty before copy: %v", e)
+			}
+		}
+	}
 	// No SQLite reader becomes eligible while only a subset is finalized.
 	for _, slot := range s.Stores {
 		if slot.Present {
@@ -288,8 +296,25 @@ func (s *storeAcquisition) checkPrivateRoot() error {
 			if e := snapshotACL(slot.Data.Private, s.SID); e != nil {
 				return e
 			}
-			if _, _, e := slot.Data.checkPrivateCleanup(); e != nil {
+			// Structural preflight permits generated sidecars before registration.
+			// VerifyPrivate validates their ACL/size/identity before cleanup uses them.
+			if len(slot.Data.Dirs) == 0 {
+				return fmt.Errorf("store set private kind not held")
+			}
+			kindRoot := slot.Data.Dirs[len(slot.Data.Dirs)-1]
+			if kindRoot.File == nil || !samePath(kindRoot.File.Name(), slot.Data.Private) || !snapshotIdentity(kindRoot.Info, slot.Data.PrivateDir) {
+				return fmt.Errorf("store set private kind identity not held")
+			}
+			entries, e := os.ReadDir(slot.Data.Private)
+			if e != nil {
 				return e
+			}
+			base := filepath.Base(slot.Data.Source)
+			for _, entry := range entries {
+				name := entry.Name()
+				if entry.IsDir() || name != base && name != base+"-wal" && name != base+"-shm" {
+					return fmt.Errorf("store set private kind unknown entry")
+				}
 			}
 			expected[slot.Kind] = true
 		}
@@ -325,6 +350,11 @@ func (s *storeAcquisition) Verify() error {
 			if e := slot.Data.VerifyPrivate(); e != nil {
 				return e
 			}
+		}
+	}
+	// Register every permitted new sidecar before the whole identity preflight.
+	for _, slot := range s.Stores {
+		if slot.Present {
 			if _, _, e := slot.Data.checkPrivateCleanup(); e != nil {
 				return e
 			}

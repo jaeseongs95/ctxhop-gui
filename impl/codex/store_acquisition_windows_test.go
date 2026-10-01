@@ -387,3 +387,129 @@ func TestStoreSetMetadataIdentityAndBudget(t *testing.T) {
 	}
 	s.Source.Dirs[index] = root
 }
+
+func TestStoreSetGeneratedSidecarsBeforeCleanupIdentityGate(t *testing.T) {
+	for _, entryPoint := range []string{"Verify", "Observation"} {
+		t.Run(entryPoint, func(t *testing.T) {
+			home, targets := storeFixture(t, true)
+			for _, target := range targets {
+				if e := os.Remove(target.Path + "-wal"); e != nil {
+					t.Fatal(e)
+				}
+			}
+			s, e := acquireStoreSet(home, filepath.Join(t.TempDir(), "private"), targets, limit, nil, nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			t.Cleanup(func() {
+				if !s.Closed {
+					if e := s.Close(true); e != nil {
+						t.Error(e)
+					}
+				}
+			})
+			for _, slot := range s.Stores {
+				base := filepath.Base(slot.Data.Source)
+				for _, suffix := range []string{"-wal", "-shm"} {
+					if _, exists := slot.Data.Copies[base+suffix]; exists {
+						t.Fatal("sidecar already registered")
+					}
+					b := []byte{}
+					if suffix == "-shm" {
+						b = make([]byte, 32768)
+					}
+					if e := createFile(filepath.Join(slot.Data.Private, base+suffix), b); e != nil {
+						t.Fatal(e)
+					}
+				}
+			}
+			// No caller member.VerifyPrivate pre-registration is permitted here.
+			if entryPoint == "Verify" {
+				e = s.Verify()
+			} else {
+				_, e = s.Observation()
+			}
+			if e != nil {
+				t.Fatal("allowed aggregate-generated sidecar refused", e)
+			}
+			for _, slot := range s.Stores {
+				base := filepath.Base(slot.Data.Source)
+				if _, exists := slot.Data.Copies[base+"-wal"]; !exists {
+					t.Fatal("empty WAL identity not registered")
+				}
+				if _, exists := slot.Data.Copies[base+"-shm"]; !exists {
+					t.Fatal("SHM identity not registered")
+				}
+				if _, exists := slot.Data.Files[base+"-wal"]; exists {
+					t.Fatal("generated WAL rewrote source vector")
+				}
+			}
+			if e := s.Close(true); e != nil || !s.PrivateRemoved {
+				t.Fatal("registered whole cleanup failed", e)
+			}
+			if e := s.VerifyReleasedSources(nil); e != nil {
+				t.Fatal("source changed by generated private sidecars", e)
+			}
+		})
+	}
+	for _, variant := range []string{"unknown", "nonempty-wal", "oversize-shm", "replaced-shm", "hardlink-shm"} {
+		t.Run(variant, func(t *testing.T) {
+			home, targets := storeFixture(t, true)
+			if e := os.Remove(targets[7].Path + "-wal"); e != nil {
+				t.Fatal(e)
+			}
+			s, e := acquireStoreSet(home, filepath.Join(t.TempDir(), "private"), targets, limit, nil, nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			last := s.Stores[7].Data
+			base := filepath.Base(last.Source)
+			bad := filepath.Join(last.Private, base+"-shm")
+			switch variant {
+			case "unknown":
+				bad = filepath.Join(last.Private, "unknown")
+				e = createFile(bad, []byte{1})
+			case "nonempty-wal":
+				bad = filepath.Join(last.Private, base+"-wal")
+				e = createFile(bad, []byte{1})
+			case "oversize-shm":
+				e = createFile(bad, make([]byte, lineLimit+1))
+			case "hardlink-shm":
+				e = os.Link(filepath.Join(s.Stores[0].Data.Private, storeSpecs[0].Filename), bad)
+			case "replaced-shm":
+				if e = createFile(bad, []byte{1}); e != nil {
+					t.Fatal(e)
+				}
+				if e = s.Verify(); e != nil {
+					t.Fatal(e)
+				}
+				// Rename the old identity aside; the new same-size file must not replace it.
+				if e = os.Rename(bad, filepath.Join(t.TempDir(), "old-shm")); e != nil {
+					t.Fatal(e)
+				}
+				e = createFile(bad, []byte{1})
+			}
+			if e != nil {
+				t.Fatal(e)
+			}
+			if _, e := s.Observation(); e == nil {
+				t.Fatal("invalid generated sidecar accepted")
+			}
+			if e := s.CleanupPrivate(); e == nil {
+				t.Fatal("unregistered/replaced sidecar deleted")
+			}
+			for _, slot := range s.Stores {
+				if _, e := os.Stat(filepath.Join(slot.Data.Private, filepath.Base(slot.Data.Source))); e != nil {
+					t.Fatal("last invalid identity deleted earlier kind", e)
+				}
+				assertSnapshotWriterDenied(t, slot.Data.Source)
+			}
+			if e := s.Close(false); e != nil {
+				t.Fatal(e)
+			}
+			if _, e := os.Stat(bad); e != nil {
+				t.Fatal("attention sidecar removed", e)
+			}
+		})
+	}
+}
