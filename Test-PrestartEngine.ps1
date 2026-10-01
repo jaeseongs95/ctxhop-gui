@@ -9,6 +9,7 @@ writes or networking. Engine effects require independent complete observation.
 param(
     [ValidateSet('Prepare','SelfTest','ConnectionPlan','SchemaExport','SchemaCompare','MigrationCheck','BackendCheck','AggregateSchemaSeed','AggregateSchemaSeedChecks','Engine')][string]$Mode='SelfTest',
     [string]$OutRoot,
+    [string]$FixtureWorkspace,
     [string]$SourceArchive,
     [string]$SourceCommit,
     [string]$SchemaReceipt,
@@ -29,6 +30,10 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
 $script:FixtureChecks=0
 $script:Utf8=[Text.UTF8Encoding]::new($false)
+$script:PortableFixtureRoot=$null
+$script:FixturePathComparison=if ([IO.Path]::DirectorySeparatorChar -eq '\') { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+$script:PortableFiles=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$script:PortableDirectories=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 # Filled only in a new reviewed source commit after the coordinator reads the
 # actual CRLF artifacts/provenance and freezes the full launch manifest bytes.
 $script:ApprovedSeedManifestSha256='0a82dd4f7aeefaf9a1e043606ade5c789579d70e89b9dfae1a6d81410dad2429'
@@ -43,8 +48,10 @@ function Assert-FixtureThrows([scriptblock]$Body,[string]$Reason) {
 }
 function Assert-OwnedFixturePath([string]$Path) {
     if (-not [IO.Path]::IsPathRooted($Path)) { throw 'fixturePathNotAbsolute' }
-    $full=[IO.Path]::GetFullPath($Path).TrimEnd('\')
-    if ($full -notmatch '^D:\\Go\\codex-s4\\helper3-r45-fixture-[A-Za-z0-9_-]+(?:\\|$)') { throw 'fixturePathOutsideOwnership' }
+    $full=[IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\','/'))
+    if ($script:PortableFixtureRoot) {
+        if (-not [string]::Equals($full,$script:PortableFixtureRoot,$script:FixturePathComparison) -and -not $full.StartsWith($script:PortableFixtureRoot+[IO.Path]::DirectorySeparatorChar,$script:FixturePathComparison)) { throw 'fixturePathOutsideOwnership' }
+    } elseif ($full -notmatch '^D:\\Go\\codex-s4\\helper3-r45-fixture-[A-Za-z0-9_-]+(?:\\|$)') { throw 'fixturePathOutsideOwnership' }
     # Check every existing ancestor before creating or reading descendants.
     $scan=$full
     while ($scan) {
@@ -57,8 +64,50 @@ function Assert-OwnedFixturePath([string]$Path) {
     }
     return $full
 }
+function Initialize-FixtureWorkspace([string]$Workspace,[string]$Output) {
+    if ($Mode -cnotin @('SelfTest','Prepare','ConnectionPlan')) { throw 'fixtureWorkspaceModeUnsupported' }
+    if (-not [IO.Path]::IsPathRooted($Workspace)) { throw 'fixturePathNotAbsolute' }
+    $full=[IO.Path]::GetFullPath($Workspace).TrimEnd([char[]]@('\','/'))
+    $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]@('\','/'))
+    if (-not $temp -or [string]::Equals($temp,[IO.Path]::GetPathRoot($temp).TrimEnd([char[]]@('\','/')),$script:FixturePathComparison) -or
+        -not [string]::Equals([IO.Path]::GetDirectoryName($full),$temp,$script:FixturePathComparison) -or [IO.Path]::GetFileName($full) -cnotmatch '^ctxhop-prestart-[0-9a-f]{32}$' -or
+        $full -match '^D:\\Go\\codex-s4(?:\\|$)') { throw 'fixtureWorkspaceOutsideTemp' }
+    if ($Output -and (-not [IO.Path]::IsPathRooted($Output) -or -not [string]::Equals([IO.Path]::GetFullPath($Output).TrimEnd([char[]]@('\','/')),$full,$script:FixturePathComparison))) { throw 'fixtureWorkspaceOutputMismatch' }
+    $script:PortableFixtureRoot=$full
+    $checked=Assert-OwnedFixturePath $full
+    if (Test-Path -LiteralPath $checked) { throw 'fixtureOutputExists' }
+    return $checked
+}
+function New-FixtureDirectory([string]$Path) {
+    $full=Assert-OwnedFixturePath $Path
+    if ($script:PortableFixtureRoot -and (Test-Path -LiteralPath $full)) { throw 'fixtureUnknownDirectory' }
+    [IO.Directory]::CreateDirectory($full) | Out-Null
+    if ($script:PortableFixtureRoot) { $script:PortableDirectories.Add($full) | Out-Null }
+}
+function New-FixtureOutput([string]$Root) {
+    $path=Assert-OwnedFixturePath $Root
+    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
+    New-FixtureDirectory $path
+    if ($script:PortableFixtureRoot) {
+        if (@(Get-ChildItem -LiteralPath $path -Force).Count) { throw 'fixtureUnknownOutput' }
+        Write-FixtureJson (Join-Path $path 'fixture-owner.json') @{schemaVersion=1;workspaceId=[IO.Path]::GetFileName($path);mode=$Mode;purpose='fresh synthetic preparation only';engineExecuted=$false}
+    }
+    return $path
+}
 function Write-FixtureText([string]$Path,[string]$Text) {
     $full=Assert-OwnedFixturePath $Path
+    if ($script:PortableFixtureRoot) {
+        if (-not $script:PortableDirectories.Contains([IO.Path]::GetDirectoryName($full))) { throw 'fixtureUnknownDirectory' }
+        $fileMode=[IO.FileMode]::CreateNew
+        if (Test-Path -LiteralPath $full) {
+            if (-not $script:PortableFiles.Contains($full) -or -not [IO.File]::Exists($full)) { throw 'fixtureUnknownFile' }
+            $fileMode=[IO.FileMode]::Open
+        }
+        $stream=[IO.File]::Open($full,$fileMode,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try { $bytes=$script:Utf8.GetBytes(($Text -replace "`r`n","`n")); $stream.Write($bytes,0,$bytes.Length); $stream.SetLength($bytes.Length) } finally { $stream.Dispose() }
+        $script:PortableFiles.Add($full) | Out-Null
+        return
+    }
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($full)) | Out-Null
     [IO.File]::WriteAllText($full,($Text -replace "`r`n","`n"),$script:Utf8)
 }
@@ -73,6 +122,7 @@ function Get-FixtureTree([string]$Root) {
         $directory=$pending.Pop()
         foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'fixtureReparsePath' }
+            if ($script:PortableFixtureRoot -and (($item.PSIsContainer -and -not $script:PortableDirectories.Contains($item.FullName)) -or (-not $item.PSIsContainer -and -not $script:PortableFiles.Contains($item.FullName)))) { throw 'fixtureUnknownEntry' }
             $key=$item.FullName.Substring($rootPath.Length+1).Replace('\','/')
             if ($item.PSIsContainer) {
                 $entries[$key]=[pscustomobject]@{kind='directory';sha256=$null;length=0;writeTicks=$item.LastWriteTimeUtc.Ticks}
@@ -229,9 +279,9 @@ function New-PrestartConnectionPlan([string]$Root) {
     if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
     $provider=$null
     $providerFile=Join-Path $PSScriptRoot 'engine/provider.json'
-    if (Test-Path -LiteralPath $providerFile) { $provider=Get-Content -LiteralPath $providerFile -Raw | ConvertFrom-Json }
+    if (Test-Path -LiteralPath $providerFile) { $provider=Get-Content -LiteralPath $providerFile -Raw -Encoding UTF8 | ConvertFrom-Json }
     $plan=Get-PrestartConnectionPlan $provider
-    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $path=New-FixtureOutput $path
     Write-FixtureJson (Join-Path $path 'connection-plan.json') $plan
     return $plan
 }
@@ -1095,11 +1145,9 @@ function Invoke-BackendSequenceChecks([string]$Root,[string]$Archive,[string]$Co
 }
 
 function New-PrestartFixtures([string]$Root) {
-    $path=Assert-OwnedFixturePath $Root
-    if (Test-Path -LiteralPath $path) { throw 'fixtureOutputExists' }
-    [IO.Directory]::CreateDirectory($path) | Out-Null
+    $path=New-FixtureOutput $Root
     $fixtureHome=Join-Path $path 'home'; $cwd=Join-Path $path 'project'; $childCwd=Join-Path $path 'child-project'
-    foreach ($directory in @($fixtureHome,$cwd,$childCwd)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+    foreach ($directory in @($fixtureHome,$cwd,$childCwd)) { New-FixtureDirectory $directory }
     Write-FixtureText (Join-Path $fixtureHome 'config.toml') "# synthetic fixture; vendor policy flags remain unchanged`n"
     Write-FixtureText (Join-Path $path 'malformed-config.toml') "[unterminated`n"
     Write-FixtureText (Join-Path $path 'redirect-config.toml') ('sqlite_home = '+(ConvertTo-Json -InputObject $fixtureHome -Compress)+"`n")
@@ -1140,8 +1188,9 @@ function Invoke-PrestartRunnerChecks([string]$Root) {
     Assert-Fixture ($comparison.unchanged -and $comparison.allowedShmChanges.Count -eq 1) 'exact complete SHM exception'
     Write-FixtureText (Join-Path $manifest.home 'unapproved-shm') 'not a DB descriptor'
     Assert-Fixture (-not (Compare-FixtureTree $before (Get-FixtureTree $manifest.home) @('state_5.sqlite-shm')).unchanged) 'other SHM not exempt'
-    Assert-FixtureThrows { Assert-OwnedFixturePath 'D:\outside\home' } 'fixturePathOutsideOwnership'
-    Assert-FixtureThrows { Assert-OwnedFixturePath 'D:\Go\codex-s4\helper3-r45-fixture-test\..\outside' } 'fixturePathOutsideOwnership'
+    $outside=Join-Path ([IO.Path]::GetDirectoryName((Assert-OwnedFixturePath $Root))) 'outside'
+    Assert-FixtureThrows { Assert-OwnedFixturePath $outside } 'fixturePathOutsideOwnership'
+    Assert-FixtureThrows { Assert-OwnedFixturePath (Join-Path $Root '../outside') } 'fixturePathOutsideOwnership'
     $projection=[pscustomobject]@{requestNonce=('a'*32);processNonce='synthetic-process';snapshotId='synthetic-snapshot';generation=2;projectionDigest=('c'*64)}
     $binding=Get-PrestartBinding $projection 'cold'
     Assert-PrestartBinding $binding $binding
@@ -1174,7 +1223,9 @@ if ($Mode -ceq 'Engine') {
     [ordered]@{runnerStatus='blocked';reasonCode='engineExecutionNotApproved';engineExecuted=$false;engineAcceptance='notRun'} | ConvertTo-Json -Compress
     exit 2
 }
+if ($FixtureWorkspace) { $OutRoot=Initialize-FixtureWorkspace $FixtureWorkspace $OutRoot }
 if (-not $OutRoot) { throw 'fixtureOutputRequired' }
 $result=if ($Mode -ceq 'SelfTest') { Invoke-PrestartRunnerChecks $OutRoot } elseif ($Mode -ceq 'ConnectionPlan') { New-PrestartConnectionPlan $OutRoot } elseif ($Mode -ceq 'SchemaExport') { Invoke-SyntheticSchemaExport $OutRoot $SourceArchive $SourceCommit } elseif ($Mode -ceq 'SchemaCompare') { Invoke-SyntheticSchemaComparison $OutRoot $SchemaReceipt $StateMigrations } elseif ($Mode -ceq 'MigrationCheck') { Invoke-EngineMigrationChecks $OutRoot $SourceArchive $SourceCommit $BuilderScript $MigrationArchive $SchemaReceipt $SourceRepository } elseif ($Mode -ceq 'BackendCheck') { Invoke-BackendSequenceChecks $OutRoot $SourceArchive $SourceCommit $SourceRepository $GoArchive $GoCommit $BackendCases } elseif ($Mode -ceq 'AggregateSchemaSeed') { Invoke-AggregateSchemaSeed $OutRoot $SeedManifest $SeedManifestSha256 $SourceArchive $SourceCommit $SourceRepository $SeedSourceArchive $SeedCargoLock $BuilderScript } elseif ($Mode -ceq 'AggregateSchemaSeedChecks') { Invoke-AggregateSeedChecks $OutRoot } else { New-PrestartFixtures $OutRoot }
+if ($script:PortableFixtureRoot) { $result.fixtureWorkspace=$script:PortableFixtureRoot; $result.fixtureProfile='portable synthetic preparation'; $result.powerShellVersion=$PSVersionTable.PSVersion.ToString() }
 Write-FixtureJson (Join-Path $OutRoot 'runner-result.json') $result
 $result | ConvertTo-Json -Depth 15
