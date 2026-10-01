@@ -184,6 +184,12 @@ func (p *process) provePrepared() error {
 	return nil
 }
 func startProcess(image, dir string, env []string) (*process, error) {
+	return startProcessArgs(image, dir, env, nil)
+}
+
+// Production callers use startProcess without arguments. Checked-in fixtures
+// reuse the same suspended launch and owned Job instead of creating a broker.
+func startProcessArgs(image, dir string, env, args []string) (*process, error) {
 	if runtime.GOARCH != "amd64" {
 		return nil, fail("platform", "Windows amd64가 필요합니다")
 	}
@@ -281,7 +287,11 @@ func startProcess(image, dir string, env []string) (*process, error) {
 	if e != nil {
 		return nil, e
 	}
-	command, e := syscall.UTF16PtrFromString(syscall.EscapeArg(image))
+	commandLine := syscall.EscapeArg(image)
+	for _, arg := range args {
+		commandLine += " " + syscall.EscapeArg(arg)
+	}
+	command, e := syscall.UTF16PtrFromString(commandLine)
 	if e != nil {
 		return nil, e
 	}

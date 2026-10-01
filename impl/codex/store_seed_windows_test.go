@@ -39,11 +39,25 @@ func TestStoreCanonicalSeedPrivateProof(t *testing.T) {
 	}
 	// All source main/absence handles are acquired before byte reads. Only the
 	// new owned finalized private copies receive readonly SQLite connections.
-	s, e := acquireStoreSet(home, filepath.Join(t.TempDir(), "private"), targets, limit, nil, nil)
+	private := filepath.Join(t.TempDir(), "private")
+	if *storeSeedReader != "" {
+		if e := validateSeedHandoffOutput(*storeSeedOutput); e != nil {
+			t.Fatal(e)
+		}
+		private = filepath.Join(*storeSeedOutput, "private")
+	}
+	s, e := acquireStoreSet(home, private, targets, limit, nil, nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer s.Close(false)
+	releaseAllowed := true
+	defer func() {
+		if releaseAllowed {
+			if e := s.Close(false); e != nil {
+				t.Error("source lease release", e)
+			}
+		}
+	}()
 	for i, slot := range s.Stores {
 		if !slot.Present || slot.Data == nil {
 			t.Fatal("canonical present store missing", slot.Kind)
@@ -59,11 +73,24 @@ func TestStoreCanonicalSeedPrivateProof(t *testing.T) {
 	if e != nil || observation == nil || proof == nil || s.ReadersOpen != 0 {
 		t.Fatal("canonical8 private schema/typed proof failed", e)
 	}
+	if *storeSeedReader != "" {
+		var drained bool
+		drained, e = handoffSeedSchema(s, observation, proof)
+		releaseAllowed = drained
+		if e != nil {
+			t.Fatal("Rust handoff failed; private copies preserved", e)
+		}
+	}
 	if e := s.Close(true); e != nil {
 		t.Fatal("whole reader drain and owned cleanup", e)
 	}
 	if e := s.VerifyReleasedSources(nil); e != nil {
 		t.Fatal("fresh source vector after cleanup/release", e)
+	}
+	if *storeSeedReader != "" {
+		if e := createFile(filepath.Join(*storeSeedOutput, "go-release-receipt.json"), append(encoded(object{"schemaVersion": int64(2), "ownerSessionId": seedAcquisitionOwner, "acquisitionId": s.ID, "wholePrivateVerified": true, "privateRemoved": s.PrivateRemoved, "sourceLeasesReleased": s.Closed, "releasedSourcesFresh": true, "originalSQLiteOpens": int64(0), "productionAdmission": "notRun"}), '\n')); e != nil {
+			t.Fatal("release/freshness receipt", e)
+		}
 	}
 	t.Log("canonical seed51 actual8 bytes -> fresh private readonly schema/typed proof; all reader drains and whole cleanup/freshness passed; original SQLite opens=0, protected engine executions=0; synthetic M-R-Q only, no production admission/approval")
 }
