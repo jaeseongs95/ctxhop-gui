@@ -551,7 +551,11 @@ func storeSourceParent(raw string) (string, error) {
 		if !ok {
 			return "", fail("engine_db_unknown", "SessionSource string 구조 불명")
 		}
-		raw = s
+		switch s {
+		case "cli", "vscode", "exec", "mcp":
+			return stateSourceParent(s)
+		}
+		return "", fail("engine_db_unknown", "SessionSource quoted variant 불명")
 	}
 	if strings.HasPrefix(raw, "{") {
 		v, e := parseJSON([]byte(raw))

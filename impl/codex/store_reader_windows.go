@@ -88,7 +88,18 @@ func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot store
 		defer close(done)
 		select {
 		case <-ctx.Done():
-			dll.MustFindProc("sqlite3_interrupt").Call(db)
+			// sqlite3_interrupt while idle does not cancel a later statement. Keep
+			// interrupting until drain, including cancellation between schema queries.
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for {
+				dll.MustFindProc("sqlite3_interrupt").Call(db)
+				select {
+				case <-stop:
+					return
+				case <-ticker.C:
+				}
+			}
 		case <-stop:
 		}
 	}()
@@ -137,6 +148,9 @@ func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot store
 	}
 	remaining, buffered := storeKeyRowLimit, 0
 	scan := func(table string, cols []storeKeyColumn) ([][]any, error) {
+		if e := ctx.Err(); e != nil {
+			return nil, e
+		}
 		// Only the fixed source reader supplies these identifiers; validate even that boundary.
 		validIdentifier := func(s string) bool {
 			if s == "" {

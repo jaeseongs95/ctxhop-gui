@@ -196,6 +196,16 @@ func TestStoreTypedKeysUnknownAndBounds(t *testing.T) {
 }
 
 func TestStoreApprovedMappingAndNoProductionSchemaFallback(t *testing.T) {
+	for _, raw := range []string{`"cli"`, `{"custom":""}`, `{"subagent":{"other":""}}`} {
+		if parent, e := storeSourceParent(raw); e != nil || parent != "" {
+			t.Fatal("canonical source", raw, parent, e)
+		}
+	}
+	for _, raw := range []string{`"{\"custom\":\"desktop\"}"`, `{"subagent":{"thread_spawn":{"parent_thread_id":"` + rootID + `","depth":1,"agent_path":"not-an-AgentPath"}}}`, `{"subagent":{"thread_spawn":{"parent_thread_id":"` + rootID + `","depth":1,"agent_type":"role"}}}`} {
+		if _, e := storeSourceParent(raw); e == nil {
+			t.Fatal("noncanonical source accepted", raw)
+		}
+	}
 	for _, tc := range []struct {
 		name    string
 		members []storeApprovedMember
