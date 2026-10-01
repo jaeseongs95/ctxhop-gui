@@ -31,7 +31,7 @@ $script:FixtureChecks=0
 $script:Utf8=[Text.UTF8Encoding]::new($false)
 # Filled only in a new reviewed source commit after the coordinator reads the
 # actual CRLF artifacts/provenance and freezes the full launch manifest bytes.
-$script:ApprovedSeedManifestSha256=$null
+$script:ApprovedSeedManifestSha256='0a82dd4f7aeefaf9a1e043606ade5c789579d70e89b9dfae1a6d81410dad2429'
 function Assert-Fixture([bool]$Value,[string]$Message) {
     $script:FixtureChecks++
     if (-not $Value) { throw "fixtureAssertion:$Message" }
