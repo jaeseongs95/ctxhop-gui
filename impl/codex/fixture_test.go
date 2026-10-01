@@ -63,7 +63,11 @@ func fixtureMember(id string, parent *string, mode string) member {
 }
 func fixtureFamily(mode string) *family {
 	p := rootID
-	return &family{Members: []member{fixtureMember(rootID, nil, mode), fixtureMember(childID, &p, mode)}, Edges: []any{object{"parent_thread_id": rootID, "child_thread_id": childID, "status": "open"}}, EngineVersion: "0.158.0-alpha.2.1"}
+	f := &family{Members: []member{fixtureMember(rootID, nil, mode), fixtureMember(childID, &p, mode)}, Edges: []any{object{"parent_thread_id": rootID, "child_thread_id": childID, "status": "open"}}, EngineVersion: "0.158.0-alpha.2.1", ArchiveFormat: 2}
+	for i := range f.Members {
+		f.Members[i].ArchiveEntry = fmt.Sprintf("rollouts/%04d.jsonl", i)
+	}
+	return f
 }
 func archiveBytes(f *family, format int, mutate func(object, map[string][]byte)) []byte {
 	files := map[string][]byte{}
@@ -373,7 +377,19 @@ func projection(o options, op string, ms []member, complete bool) object {
 	if acquired {
 		acquisitionID = strings.Repeat("a", 32)
 	}
-	return object{"contractVersion": num(2), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "proofTargets": clone(targets), "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "acquisitionId": acquisitionID, "storeObservationDigest": nil, "storeProof": nil, "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false, "privateSqliteSidecarsMayChange": acquired}}
+	p := object{"contractVersion": num(2), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "proofTargets": clone(targets), "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "acquisitionId": acquisitionID, "storeObservationDigest": nil, "storeProof": nil, "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false, "privateSqliteSidecarsMayChange": acquired}, "mappingProfile": approvalProfile, "approvalEvidenceDigest": nil, "approvedMappingDigest": nil}
+	if acquired && o.ApprovalEvidence != nil {
+		l, e := pinApproval(o, ms)
+		if e != nil {
+			panic(e)
+		}
+		p["approvalEvidenceDigest"] = o.ApprovalEvidence.ManifestSHA256
+		p["approvedMappingDigest"] = l.MappingDigest
+		if e = l.Close(); e != nil {
+			panic(e)
+		}
+	}
+	return p
 }
 func TestProjectionAndToken(t *testing.T) {
 	old := loaderContractID
@@ -382,6 +398,7 @@ func TestProjectionAndToken(t *testing.T) {
 	o := options{Home: t.TempDir(), Cwd: t.TempDir()}
 	f := fixtureFamily("legacy")
 	support(f, o.Home)
+	o = fixtureApproval(t, o, f)
 	p := projection(o, "import", f.Members, true)
 	observation := mockStoreObservation(text(p["stateDb"]), strings.Repeat("a", 64), nil)
 	mockStoreCompleted(t, p, observation, f.Members)

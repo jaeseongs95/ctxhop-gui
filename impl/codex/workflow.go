@@ -30,13 +30,13 @@ func summary(f *family) object {
 }
 func stableProjection(p object) object {
 	r := object{}
-	for _, k := range []string{"contractVersion", "engineVersion", "loaderContractId", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "authResolution", "policyResolution", "validity"} {
+	for _, k := range []string{"contractVersion", "engineVersion", "loaderContractId", "mappingProfile", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "authResolution", "policyResolution", "validity"} {
 		r[k] = p[k]
 	}
 	return r
 }
 func tokenFor(o options, f *family, p object) string {
-	return digest(encoded(object{"archive": f.ArchiveSHA, "home": o.Home, "cwd": o.Cwd, "members": f.Members, "route": "go", "impl": implementation, "engineSha256": engineSHA256, "normalEngineSha256": normalEngineSHA256, "normalEnginePath": o.NormalEngine, "loader": stableProjection(p)}))
+	return digest(encoded(object{"archive": f.ArchiveSHA, "archiveFormat": f.ArchiveFormat, "home": o.Home, "cwd": o.Cwd, "members": approvalSummaries(familyApprovalMembers(f, "")), "mappingProfile": approvalProfile, "route": "go", "impl": implementation, "engineSha256": engineSHA256, "normalEngineSha256": normalEngineSHA256, "normalEnginePath": o.NormalEngine, "loader": stableProjection(p)}))
 }
 func plan(o options) (object, error) {
 	f, e := readArchive(o.Archive)
@@ -117,7 +117,7 @@ func importArchive(o options) (result object, retErr error) {
 	if e = os.Mkdir(run, 0700); e != nil {
 		return nil, fail("run_exists", "작업 ID를 재사용할 수 없습니다")
 	}
-	j := &journal{Version: 3, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
+	j := &journal{Version: 4, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
 	if e = saveJournal(run, j, true); e != nil {
 		return object{"pending": []string{o.Run}}, e
 	}
@@ -137,7 +137,7 @@ func importArchive(o options) (result object, retErr error) {
 			j.LastError = reason(retErr)
 			if phases[j.Phase] < phases["placing"] && active == nil && checkGuard(nil) == nil {
 				if s, e := scanHome(o.Home, j.Members, false); e == nil && !hasFiles(s) {
-					if e = cleanup(run); e == nil {
+					if e = cleanupJournal(run, j, "rolled_back"); e == nil {
 						j.Status = "rolled_back"
 					}
 				}
@@ -154,6 +154,14 @@ func importArchive(o options) (result object, retErr error) {
 		}
 	}()
 	staged := make([]member, len(f.Members))
+	j.ApprovalEvidence, j.ApprovalOwnership, e = createApproval(o, f)
+	if e != nil {
+		return nil, e
+	}
+	o.ApprovalEvidence = j.ApprovalEvidence
+	if e = saveJournal(run, j, false); e != nil {
+		return nil, e
+	}
 	copy(staged, f.Members)
 	for i, m := range f.Members {
 		p := filepath.Join(run, "stage", fmt.Sprintf("%04d.jsonl", i))
@@ -284,7 +292,7 @@ func importArchive(o options) (result object, retErr error) {
 		return nil, e
 	}
 	active = nil
-	reference, e := referenceHistory(o, f, run)
+	reference, e := referenceHistory(o, f, run, j)
 	if e != nil {
 		return nil, e
 	}
@@ -331,7 +339,7 @@ func importArchive(o options) (result object, retErr error) {
 	if _, e = readState(o.Home, filepath.Join(o.Home, "state_5.sqlite"), j.Members, false); e != nil {
 		return nil, e
 	}
-	if e = cleanup(run); e != nil {
+	if e = cleanupJournal(run, j, "complete"); e != nil {
 		return nil, e
 	}
 	j.Status = "complete"
@@ -427,7 +435,9 @@ func bootstrapIfNeeded(o options) error {
 	if e = checkGuard(nil); e != nil {
 		return e
 	}
-	sesh, e := prepareEngine(o, "bootstrap", nil)
+	bootstrap := o
+	bootstrap.ApprovalEvidence = nil
+	sesh, e := prepareEngine(bootstrap, "bootstrap", nil)
 	if e != nil {
 		return e
 	}
@@ -545,7 +555,7 @@ func histories(s *session, f *family) (object, error) {
 	}
 	return r, nil
 }
-func referenceHistory(o options, f *family, run string) (object, error) {
+func referenceHistory(o options, f *family, run string, j *journal) (object, error) {
 	home := filepath.Join(run, "ref")
 	if e := os.Mkdir(home, 0700); e != nil {
 		return nil, e
@@ -556,6 +566,17 @@ func referenceHistory(o options, f *family, run string) (object, error) {
 	}
 	ref := o
 	ref.Home = home
+	ref.ApprovalEvidence = nil
+	d, ownership, e := createApproval(ref, f)
+	if e != nil {
+		return nil, e
+	}
+	ref.ApprovalEvidence = d
+	j.ReferenceApprovalEvidence = d
+	j.ReferenceApprovalOwnership = ownership
+	if e = saveJournal(run, j, false); e != nil {
+		return nil, e
+	}
 	if e := bootstrapIfNeeded(ref); e != nil {
 		return nil, e
 	}
@@ -678,7 +699,7 @@ func rollback(o options) (result object, retErr error) {
 		return object{"status": "needs_attention", "pending": []string{o.Run}}, e
 	}
 	if phase < phases["placing"] && !hasFiles(scan) {
-		if e = cleanup(run); e != nil {
+		if e = cleanupJournal(run, j, "rolled_back"); e != nil {
 			return nil, e
 		}
 		j.Status = "rolled_back"
@@ -690,7 +711,14 @@ func rollback(o options) (result object, retErr error) {
 	if j.EngineSHA256 != engineSHA256 || j.NormalEngineSHA256 != normalEngineSHA256 || j.LoaderContractID != loaderContractID {
 		return nil, fail("engine_untrusted", "복구 기록의 protected engine pin이 바뀌었습니다")
 	}
+	if j.Version == 3 {
+		return object{"status": "needs_attention", "pending": []string{o.Run}}, fail("approval_evidence", "v3 복구의 승인 source/profile 재확보가 필요합니다")
+	}
+	if j.CleanupStatus != "" {
+		return object{"status": "needs_attention", "pending": []string{o.Run}}, fail("approval_cleanup", "미완료 evidence 정리를 수동 확인하세요")
+	}
 	o.Cwd = j.Cwd
+	o.ApprovalEvidence = j.ApprovalEvidence
 	ms := currentMembers(o.Home, j)
 	s, e := prepareEngine(o, "rollback", ms)
 	if e != nil {
@@ -837,7 +865,7 @@ func rollback(o options) (result object, retErr error) {
 	if !bytes.Equal(encoded(finalDB.IDs), encoded(after.IDs)) || !bytes.Equal(encoded(finalDB.Edges), encoded(after.Edges)) {
 		return nil, fail("delete_scope", "마지막 API 검사 중 DB 대상/연결 변경")
 	}
-	if e = cleanup(run); e != nil {
+	if e = cleanupJournal(run, j, "rolled_back"); e != nil {
 		return nil, e
 	}
 	j.Status = "rolled_back"
@@ -854,6 +882,7 @@ func rolloutID(path string) string {
 	return m[1]
 }
 func verifyAbsentAPI(o options, j *journal) error {
+	o.ApprovalEvidence = j.ApprovalEvidence
 	if e := checkGuard(nil); e != nil {
 		return e
 	}

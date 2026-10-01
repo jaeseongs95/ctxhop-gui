@@ -34,21 +34,26 @@ func mustObject(b []byte) object {
 }
 
 type member struct {
-	ID      string   `json:"id"`
-	Parent  *string  `json:"parent"`
-	Path    string   `json:"path"`
-	Size    int64    `json:"size"`
-	SHA256  string   `json:"sha256"`
-	Data    object   `json:"-"`
-	Raw     []byte   `json:"-"`
-	Header  object   `json:"-"`
-	Records []object `json:"-"`
+	ID                  string   `json:"id"`
+	Parent              *string  `json:"parent"`
+	Path                string   `json:"path"`
+	Size                int64    `json:"size"`
+	SHA256              string   `json:"sha256"`
+	ImmutableRolloutIDs []string `json:"immutableRolloutIds,omitempty"`
+	SessionID           string   `json:"sessionId,omitempty"`
+	ArchiveEntry        string   `json:"archiveEntry,omitempty"`
+	OriginBasename      string   `json:"originBasename,omitempty"`
+	Data                object   `json:"-"`
+	Raw                 []byte   `json:"-"`
+	Header              object   `json:"-"`
+	Records             []object `json:"-"`
 }
 type family struct {
 	Members                   []member
 	Edges                     []any
 	ArchiveSHA, EngineVersion string
 	Archived                  bool
+	ArchiveFormat             int64
 }
 
 func rowValidate(v any, table string) error {
@@ -211,7 +216,7 @@ func readArchive(path string) (*family, error) {
 		return nil, e
 	}
 	data := obj(dv)
-	f := &family{ArchiveSHA: digest(raw), EngineVersion: ver}
+	f := &family{ArchiveSHA: digest(raw), EngineVersion: ver, ArchiveFormat: format}
 	var datas []any
 	var names []string
 	if format == 1 {
@@ -259,7 +264,7 @@ func readArchive(path string) (*family, error) {
 		if !ok {
 			return nil, fail("archive_manifest", "롤아웃 누락")
 		}
-		f.Members = append(f.Members, member{ID: id, Raw: b, Size: int64(len(b)), SHA256: digest(b), Data: m})
+		f.Members = append(f.Members, member{ID: id, Raw: b, Size: int64(len(b)), SHA256: digest(b), Data: m, ArchiveEntry: names[i]})
 	}
 	root := f.Members[0].ID
 	for _, v := range f.Edges {
@@ -300,6 +305,11 @@ func readArchive(path string) (*family, error) {
 		}
 		m.Records = rs
 		m.Header = obj(rs[0]["payload"])
+		m.SessionID, e = canonicalRolloutSessionID(m.Header)
+		if e != nil {
+			return nil, e
+		}
+		m.OriginBasename = filepath.Base(text(row["rollout_path"]))
 		if !filepath.IsAbs(text(row["cwd"])) || !samePath(text(m.Header["cwd"]), text(row["cwd"])) || len(text(m.Header["cli_version"])) == 0 || len(text(m.Header["cli_version"])) > 200 {
 			return nil, fail("archive_member", "헤더 경로/버전 오류")
 		}
@@ -404,6 +414,13 @@ func support(f *family, home string) error {
 		}
 		if match[2] != "" {
 			return fail("revert_rollout", "되돌린 롤아웃")
+		}
+		m.ImmutableRolloutIDs = []string{match[1]}
+		m.OriginBasename = filepath.Base(orig)
+		var e error
+		m.SessionID, e = canonicalRolloutSessionID(m.Header)
+		if e != nil {
+			return e
 		}
 		settings := m.Header
 		ownSettings := false

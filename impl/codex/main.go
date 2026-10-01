@@ -185,7 +185,10 @@ func within(root, p string) bool {
 	return e == nil && r != ".." && !strings.HasPrefix(r, ".."+string(os.PathSeparator)) && !filepath.IsAbs(r)
 }
 
-type options struct{ Home, Archive, Cwd, Token, Run, Engine, NormalEngine string }
+type options struct {
+	Home, Archive, Cwd, Token, Run, Engine, NormalEngine string
+	ApprovalEvidence                                     *approvalDescriptor
+}
 
 func cli(args []string) (object, error) {
 	if len(args) == 0 {

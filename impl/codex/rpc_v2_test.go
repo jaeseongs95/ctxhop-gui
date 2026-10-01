@@ -64,6 +64,7 @@ func TestRPCV2ProjectionObservationAndTargets(t *testing.T) {
 		t.Fatal(e)
 	}
 	partial := projection(o, "import", nil, false)
+	o = fixtureApproval(t, o, f)
 	if e := validateProjection(partial, "nonce", "import", o, nil, 123, nil); e != nil {
 		t.Fatal("partial with explicit nulls", e)
 	}
@@ -144,6 +145,7 @@ func TestRPCV2CompleteAndActivationBindings(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
+			o = s.Options
 			defer s.Close()
 			obs := mockStoreObservation(text(s.Projection["stateDb"]), strings.Repeat("a", 64), nil)
 			completed := projection(o, "import", f.Members, true)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,7 @@ type session struct {
 	Options     options
 	Operation   string
 	Acquisition *dbAcquisition
+	Evidence    *approvalLease
 	Call        func(string, object) (object, error)
 	Notify      func(string, object) error
 	Close       func() error
@@ -97,6 +99,9 @@ func processEnv(home string) ([]string, error) {
 	env := []string{}
 	for _, s := range os.Environ() {
 		k, _, _ := strings.Cut(s, "=")
+		if strings.HasPrefix(strings.ToUpper(k), "CTXHOP_") {
+			continue
+		}
 		switch strings.ToUpper(k) {
 		case "CODEX_SQLITE_HOME":
 			return nil, fail("engine_db_unknown", "CODEX_SQLITE_HOME 재지정은 지원하지 않습니다")
@@ -147,14 +152,36 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	if e != nil {
 		return nil, e
 	}
+	var evidence *approvalLease
+	if len(members) > 0 {
+		evidence, e = pinApproval(o, members)
+		if e != nil {
+			return nil, e
+		}
+	} else if o.ApprovalEvidence != nil {
+		return nil, fail("approval_evidence", "무구성원 prepare의 승인 descriptor는 null이어야 합니다")
+	}
+	keepEvidence := false
+	defer func() {
+		if !keepEvidence && evidence != nil {
+			evidence.Close()
+		}
+	}()
 	p, e := startProcess(image, o.Cwd, env)
 	if e != nil {
 		return nil, e
 	}
 	p.ImageLocks = locks
 	keepLocks = true
-	s := &session{P: p}
-	s.Close = p.close
+	s := &session{P: p, Evidence: evidence}
+	s.Close = func() error {
+		e := p.close()
+		if e == nil && s.Evidence != nil {
+			e = s.Evidence.Close()
+			s.Evidence = nil
+		}
+		return e
+	}
 	reader := bufio.NewReader(p.Out)
 	id := int64(0)
 	var mu sync.Mutex
@@ -163,15 +190,23 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	s.Notify = func(method string, params object) error {
 		mu.Lock()
 		defer mu.Unlock()
-		_, e := p.In.Write(append(encoded(object{"method": method, "params": params}), '\n'))
-		return e
+		frame, e := rpcFrame(object{"method": method, "params": params})
+		if e != nil {
+			return e
+		}
+		return writeRPCFrame(p, frame, time.Now().Add(30*time.Second))
 	}
 	s.Call = func(method string, params object) (object, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		id++
+		deadline := time.Now().Add(30 * time.Second)
 		request := object{"id": id, "method": method, "params": params}
-		if _, e := p.In.Write(append(encoded(request), '\n')); e != nil {
+		frame, e := rpcFrame(request)
+		if e != nil {
+			return nil, e
+		}
+		if e := writeRPCFrame(p, frame, deadline); e != nil {
 			return nil, fail("rpc_io", "RPC 전송 실패")
 		}
 		type result struct {
@@ -218,7 +253,8 @@ func openEngine(o options, operation string, members []member) (*session, error)
 						return
 					}
 					code, ok := integer(obj(er)["code"])
-					if !ok {
+					_, messageOK := obj(er)["message"].(string)
+					if !ok || !messageOK || !exact(obj(er), "code", "message") && !exact(obj(er), "code", "message", "data") {
 						ch <- result{e: fail("rpc_schema", "RPC 오류 code 오류")}
 						return
 					}
@@ -236,9 +272,12 @@ func openEngine(o options, operation string, members []member) (*session, error)
 		}()
 		select {
 		case r := <-ch:
+			if !time.Now().Before(deadline) {
+				return nil, fail("rpc_timeout", "RPC 응답 시간 초과")
+			}
 			return r.m, r.e
-		case <-time.After(30 * time.Second):
-			p.In.Close()
+		case <-time.After(time.Until(deadline)):
+			p.close()
 			return nil, fail("rpc_timeout", "RPC 응답 시간 초과")
 		}
 	}
@@ -260,7 +299,12 @@ func openEngine(o options, operation string, members []member) (*session, error)
 		}
 		descriptors = append(descriptors, object{"id": m.ID, "parentId": m.Parent, "role": role, "rolloutPath": path, "rolloutSha256": sha})
 	}
-	r, e := s.Call("ctxhop/prepare", object{"contractVersion": 2, "requestNonce": requestNonce, "operation": operation, "home": o.Home, "cwd": o.Cwd, "offline": true, "members": descriptors})
+	params, e := prepareRequest(o, operation, requestNonce, descriptors)
+	if e != nil {
+		p.close()
+		return nil, e
+	}
+	r, e := s.Call("ctxhop/prepare", params)
 	if e != nil {
 		p.close()
 		var re *rpcError
@@ -287,6 +331,7 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	s.Projection = r
 	s.bind()
 	p.prepared = true
+	keepEvidence = true
 	return s, nil
 }
 func (s *session) bind() {
@@ -428,7 +473,7 @@ func validateObservation(raw object, state string) error {
 	return nil
 }
 func validateProjection(r object, n, operation string, o options, members []member, pid int64, observation object) error {
-	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "storeObservationDigest", "storeProof", "effects") {
+	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "storeObservationDigest", "storeProof", "effects", "mappingProfile", "approvalEvidenceDigest", "approvedMappingDigest") {
 		return fail("prestart_schema", "알 수 없는 prepare projection 구조")
 	}
 	version, ok := integer(r["contractVersion"])
@@ -450,6 +495,9 @@ func validateProjection(r object, n, operation string, o options, members []memb
 	writes, wok := integer(effects["applicationWrites"])
 	network, nok := integer(effects["networkRequests"])
 	acquired := r["inputComplete"] == true && operation != "plan" && operation != "bootstrap"
+	if e := validateApprovalProjection(r, o, members, acquired); e != nil {
+		return e
+	}
 	if !exact(effects, "applicationWrites", "networkRequests", "sqliteShmMayChange", "privateSqliteSidecarsMayChange") || !wok || !nok || writes != 0 || network != 0 || effects["sqliteShmMayChange"] != false || effects["privateSqliteSidecarsMayChange"] != acquired || acquired && !opRE.MatchString(text(r["acquisitionId"])) || !acquired && r["acquisitionId"] != nil {
 		return fail("prestart_effects", "준비 단계 효과0 조건 실패")
 	}
@@ -561,6 +609,18 @@ func validateProjection(r object, n, operation string, o options, members []memb
 	return nil
 }
 func (s *session) revalidateHandoff() error {
+	if len(s.Members) > 0 {
+		l, e := pinApproval(s.Options, s.Members)
+		if e != nil {
+			return e
+		}
+		if s.Evidence != nil && !bytes.Equal(encoded(l.Ownership), encoded(s.Evidence.Ownership)) {
+			return errors.Join(fail("approval_evidence", "준비 후 승인 identity 변경"), l.Close())
+		}
+		if e = l.Close(); e != nil {
+			return e
+		}
+	}
 	if e := checkGuard(s.P); e != nil {
 		return e
 	}

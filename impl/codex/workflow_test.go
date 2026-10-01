@@ -27,8 +27,9 @@ type mockEngine struct {
 func installMock(t *testing.T, f *family) *mockEngine {
 	t.Helper()
 	oldPrepare, oldGuard, oldState, oldPreparedState := prepareEngine, checkGuard, readState, readPreparedState
-	oldPin, oldLoader := engineSHA256, loaderContractID
+	oldPin, oldNormal, oldLoader := engineSHA256, normalEngineSHA256, loaderContractID
 	engineSHA256 = strings.Repeat("a", 64)
+	normalEngineSHA256 = strings.Repeat("b", 64)
 	loaderContractID = "ctxhop-prestart-v2:fixture"
 	m := &mockEngine{T: t, Homes: map[string]*mockHome{}, Family: f}
 	prepareEngine = m.prepare
@@ -79,6 +80,7 @@ func installMock(t *testing.T, f *family) *mockEngine {
 		readState = oldState
 		readPreparedState = oldPreparedState
 		engineSHA256 = oldPin
+		normalEngineSHA256 = oldNormal
 		loaderContractID = oldLoader
 	})
 	return m
@@ -140,6 +142,9 @@ func (m *mockEngine) home(home string) *mockHome {
 	return h
 }
 func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error) {
+	if len(ms) > 0 && o.ApprovalEvidence == nil {
+		o = fixtureApproval(m.T, o, m.Family)
+	}
 	if m.Active {
 		return nil, fail("mock_order", "start while active")
 	}

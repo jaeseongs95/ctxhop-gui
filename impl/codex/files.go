@@ -197,25 +197,45 @@ func createFile(path string, b []byte) error {
 }
 
 type journal struct {
-	Version            int      `json:"version"`
-	Impl               string   `json:"impl"`
-	Status             string   `json:"status"`
-	Phase              string   `json:"phase"`
-	Home               string   `json:"home"`
-	ID                 string   `json:"id"`
-	Cwd                string   `json:"cwd"`
-	ArchiveSHA256      string   `json:"archiveSha256"`
-	Archived           bool     `json:"archived"`
-	Members            []member `json:"members"`
-	EngineVersion      string   `json:"engineVersion"`
-	EngineSHA256       string   `json:"engineSha256"`
-	NormalEngineSHA256 string   `json:"normalEngineSha256"`
-	LoaderContractID   string   `json:"loaderContractId"`
-	LastError          string   `json:"lastError,omitempty"`
+	Version                    int                 `json:"version"`
+	Impl                       string              `json:"impl"`
+	Status                     string              `json:"status"`
+	Phase                      string              `json:"phase"`
+	Home                       string              `json:"home"`
+	ID                         string              `json:"id"`
+	Cwd                        string              `json:"cwd"`
+	ArchiveSHA256              string              `json:"archiveSha256"`
+	Archived                   bool                `json:"archived"`
+	Members                    []member            `json:"members"`
+	EngineVersion              string              `json:"engineVersion"`
+	EngineSHA256               string              `json:"engineSha256"`
+	NormalEngineSHA256         string              `json:"normalEngineSha256"`
+	LoaderContractID           string              `json:"loaderContractId"`
+	LastError                  string              `json:"lastError,omitempty"`
+	ApprovalEvidence           *approvalDescriptor `json:"approvalEvidence,omitempty"`
+	ApprovalOwnership          *approvalOwnership  `json:"approvalOwnership,omitempty"`
+	ReferenceApprovalEvidence  *approvalDescriptor `json:"referenceApprovalEvidence,omitempty"`
+	ReferenceApprovalOwnership *approvalOwnership  `json:"referenceApprovalOwnership,omitempty"`
+	CleanupStatus              string              `json:"cleanupStatus,omitempty"`
 }
 
 func runPath(home, run string) string { return filepath.Join(home, ".ctxhop-desktop-recovery", run) }
 func saveJournal(run string, j *journal, initial bool) error {
+	value := any(j)
+	if j.Version == 3 {
+		v, _ := parseJSON(encoded(j))
+		r := obj(v)
+		ms := []any{}
+		for _, m := range j.Members {
+			ms = append(ms, object{"id": m.ID, "parent": m.Parent, "path": m.Path, "size": m.Size, "sha256": m.SHA256})
+		}
+		r["members"] = ms
+		value = r
+	}
+	data := append(encoded(value), '\n')
+	if len(data) > 4<<20 {
+		return fail("resourceLimit", "복구 기록 크기 한도 초과")
+	}
 	if e := noReparse(run); e != nil {
 		return e
 	}
@@ -228,7 +248,7 @@ func saveJournal(run string, j *journal, initial bool) error {
 			return e
 		}
 	}
-	if e := createFile(tmp, append(encoded(j), '\n')); e != nil {
+	if e := createFile(tmp, data); e != nil {
 		return e
 	}
 	return moveFile(tmp, filepath.Join(run, "journal.json"), !initial)
@@ -239,7 +259,11 @@ func loadJournal(home, run string) (*journal, error) {
 	if e != nil {
 		return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다")
 	}
-	return decodeJournal(home, b)
+	j, e := decodeJournal(home, b)
+	if e == nil && j.ApprovalEvidence != nil && !samePath(j.ApprovalEvidence.ManifestPath, approvalPath(options{Home: home, Run: run})) {
+		return nil, fail("unsupported_record", "복구 기록의 승인 operation 경로 오류")
+	}
+	return j, e
 }
 func decodeJournal(home string, b []byte) (*journal, error) {
 	var e error
@@ -252,7 +276,7 @@ func decodeJournal(home string, b []byte) (*journal, error) {
 	if e = d.Decode(&j); e != nil {
 		return nil, fail("unreadable", "복구 기록 구조 오류")
 	}
-	if j.Version != 3 || j.Impl != "ctxhop-codex" || !samePath(j.Home, home) || !uuidRE.MatchString(j.ID) || len(j.Members) == 0 || j.ID != j.Members[0].ID || !hashRE.MatchString(j.ArchiveSHA256) {
+	if (j.Version != 3 && j.Version != 4) || j.Impl != "ctxhop-codex" || !samePath(j.Home, home) || !uuidRE.MatchString(j.ID) || len(j.Members) == 0 || j.ID != j.Members[0].ID || !hashRE.MatchString(j.ArchiveSHA256) {
 		return nil, fail("unsupported_record", "복구 기록 계약 오류")
 	}
 	if _, ok := phases[j.Phase]; !ok || (j.Status != "pending" && j.Status != "complete" && j.Status != "rolled_back") || len(j.Members) > 2000 {
@@ -271,6 +295,9 @@ func decodeJournal(home string, b []byte) (*journal, error) {
 	}
 	if !filepath.IsAbs(j.Cwd) {
 		return nil, fail("unsupported_record", "복구 cwd 오류")
+	}
+	if e := validateJournalApproval(&j, b); e != nil {
+		return nil, e
 	}
 	return &j, nil
 }
@@ -497,16 +524,26 @@ func readRecoveryRecord(path string, contents bool) (b []byte, retErr error) {
 func streamLine(r *bufio.Reader) ([]byte, error) {
 	var b []byte
 	for {
-		part, more, e := r.ReadLine()
-		if e != nil {
-			return nil, e
+		part, e := r.ReadSlice('\n')
+		complete := e == nil
+		if complete {
+			part = part[:len(part)-1]
+		}
+		if len(part) > lineLimit-len(b) {
+			return nil, fail("rpc_limit", "RPC 줄 한도 초과")
 		}
 		b = append(b, part...)
 		if len(b) > lineLimit {
 			return nil, fail("rpc_limit", "RPC 줄 한도 초과")
 		}
-		if !more {
+		if complete {
 			return b, nil
+		}
+		if e != bufio.ErrBufferFull {
+			if e == io.EOF && len(b) > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, e
 		}
 	}
 }
