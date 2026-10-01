@@ -154,11 +154,15 @@ try {
         }
         $receipt=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
         $records=@(Get-Content -LiteralPath $rawPath | ForEach-Object { $_ | ConvertFrom-Json -AsHashtable })
-        if (!$completed -or $exitCode -ne 0 -or !$receipt.lifecycleSupported -or $receipt.runId -cne $recipe.runId -or
+        if (!$completed -or $exitCode -ne 0 -or $receipt.schemaVersion -ne 1 -or
+            $receipt.capabilityScope -ne 'ownedSyntheticDebugLifecycle' -or $receipt.engineAcceptance -ne 'notRun' -or
+            !$receipt.lifecycleSupported -or !$receipt.createProcessResult -or $receipt.runId -cne $recipe.runId -or
             $receipt.manifestSha256 -cne $ApprovedLaunchManifestSha256 -or $receipt.observerPid -ne $pidValue -or
             $receipt.observerBirth -ne $observerBirth -or
             $receipt.observerSha256 -cne $observerDescriptor[0].sha256 -or $receipt.helperSha256 -cne $helperDescriptor[0].sha256 -or
             $receipt.events -ne $records.Count -or $receipt.continued -ne $records.Count -or $records.Count -gt 512 -or
+            $receipt.waitCalls -ne $receipt.events+$receipt.waitTimeouts -or $receipt.elapsedMs -gt 15000 -or
+            $receipt.rawBytes -ne (Get-Item -LiteralPath $rawPath).Length -or
             $receipt.activeProcesses -ne 0 -or $receipt.totalProcesses -ne 2 -or $receipt.failure -ne 0 -or
             $receipt.cleanupError -ne 0 -or $receipt.evidenceIncomplete -or !$receipt.ledgerClosed -or
             !$receipt.assignedBeforeContinue -or !$receipt.killOnExit -or

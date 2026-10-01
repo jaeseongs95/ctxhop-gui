@@ -111,6 +111,7 @@ int wmain(int argc, wchar_t **argv)
     Life life[2] = {{0}};
     DWORD osThread = GetCurrentThreadId(), active = 0xffffffff, total = 0, writeCount;
     DWORD imageLength, error, status, slot;
+    DWORD waitCalls=0, waitTimeouts=0;
     ULONGLONG start, deadline, cleanupDeadline = 0, exitSequence[2] = {0};
     BOOL bound = FALSE, launched = FALSE, success = FALSE, killOnExit = FALSE;
     BOOL assigned = FALSE, ownParentClosed = FALSE;
@@ -202,9 +203,11 @@ int wmain(int argc, wchar_t **argv)
         waitTime=(DWORD)((cleanup ? cleanupDeadline : deadline)-now);
         if (waitTime>250) waitTime=250;
         ZeroMemory(&event,sizeof(event));
+        ++waitCalls;
         if (!WaitForDebugEvent(&event,waitTime)) {
             error=GetLastError();
-            if (error!=ERROR_SEM_TIMEOUT && error!=ERROR_TIMEOUT) fail(16,error);
+            if (error==ERROR_SEM_TIMEOUT || error==ERROR_TIMEOUT) ++waitTimeouts;
+            else fail(16,error);
             continue;
         }
         ++events; status=DBG_CONTINUE;
@@ -327,7 +330,7 @@ int wmain(int argc, wchar_t **argv)
         "\"observerFileId\":{\"volume\":%lu,\"high\":%lu,\"low\":%lu},"
         "\"parent\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s},"
         "\"child\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s},"
-        "\"assignedBeforeContinue\":%s,\"killOnExit\":%s,\"events\":%lu,\"continued\":%lu,\"rawBytes\":%lu,"
+        "\"createProcessResult\":%s,\"assignedBeforeContinue\":%s,\"killOnExit\":%s,\"waitCalls\":%lu,\"waitTimeouts\":%lu,\"events\":%lu,\"continued\":%lu,\"rawBytes\":%lu,"
         "\"activeProcesses\":%lu,\"totalProcesses\":%lu,\"ledgerClosed\":%s,\"cleanup\":%s,\"cleanupError\":%lu,"
         "\"evidenceIncomplete\":%s,\"failure\":%lu,\"error\":%lu,\"elapsedMs\":%llu,"
         "\"fileEffects\":\"NOT_OBSERVABLE\",\"networkEffects\":\"NOT_OBSERVABLE\",\"engineAcceptance\":\"notRun\"}\n",
@@ -338,7 +341,7 @@ int wmain(int argc, wchar_t **argv)
         life[0].signaled?"true":"false",life[0].referenceClosed?"true":"false",
         life[1].pid,life[1].birth,life[1].member?"true":"false",life[1].exitCode,life[1].exitContinued?"true":"false",
         life[1].signaled?"true":"false",life[1].referenceClosed?"true":"false",
-        assigned?"true":"false",killOnExit?"true":"false",events,continued,bytes,active,total,
+        launched?"true":"false",assigned?"true":"false",killOnExit?"true":"false",waitCalls,waitTimeouts,events,continued,bytes,active,total,
         ledgerClosed?"true":"false",cleanup?"true":"false",cleanupError,incomplete?"true":"false",
         failure,failureError,GetTickCount64()-start);
     receiptHandle=CreateFileW(receiptPath,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);
