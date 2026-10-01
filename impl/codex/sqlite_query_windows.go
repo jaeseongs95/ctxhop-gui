@@ -10,11 +10,11 @@ import (
 	"unsafe"
 )
 
-func sqliteTypedQuery(dll *syscall.DLL, db uintptr, sql string) (rows [][]any, retErr error) {
+func sqliteTypedQuery(dll *syscall.DLL, db uintptr, sql string, params ...int64) (rows [][]any, retErr error) {
 	b := append([]byte(sql), 0)
 	var stmt uintptr
 	r, _, _ := dll.MustFindProc("sqlite3_prepare_v2").Call(db, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)-1), uintptr(unsafe.Pointer(&stmt)), 0)
-	if r != 0 {
+	if stmt == 0 {
 		return nil, fmt.Errorf("schema SELECT prepare: %d", r)
 	}
 	defer func() {
@@ -23,6 +23,15 @@ func sqliteTypedQuery(dll *syscall.DLL, db uintptr, sql string) (rows [][]any, r
 			retErr = errors.Join(retErr, fmt.Errorf("schema stmt drain: %d", rc))
 		}
 	}()
+	if r != 0 {
+		return nil, fmt.Errorf("schema SELECT prepare: %d", r)
+	}
+	for i, value := range params {
+		r, _, _ := dll.MustFindProc("sqlite3_bind_int64").Call(stmt, uintptr(i+1), uintptr(value))
+		if r != 0 {
+			return nil, fmt.Errorf("schema SELECT bind: %d", r)
+		}
+	}
 	var bytesRead int
 	for {
 		r, _, _ = dll.MustFindProc("sqlite3_step").Call(stmt)
