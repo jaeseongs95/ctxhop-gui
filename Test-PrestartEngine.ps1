@@ -766,7 +766,7 @@ function Get-SeedNamespaceVector([object]$Manifest,[string]$Stage,[Collections.G
         $info=[CtxhopSeedNativeV2]::Read($handle)
         if (-not ($info.Attributes -band 0x10) -or ($info.Attributes -band 0x400) -or -not $ids.Add($info.Identity) -or -not [string]::Equals($info.Path,$directory,[StringComparison]::OrdinalIgnoreCase)) { throw 'seedDirectoryIdentity' }
     }
-    $expectedRoot=@('sqlite','receipts','seed-owner.json'); $expectedReceipts=if ($Stage -ceq 'state') { @('state-seed.json') } else { @('state-seed.json','board-seed.json') }
+    $expectedRoot=@('sqlite','receipts','seed-owner.json'); $expectedReceipts=@(if ($Stage -ceq 'state') { 'state-seed.json' } else { 'state-seed.json','board-seed.json' })
     foreach ($pair in @(@($root,$expectedRoot),@((Join-Path $root 'receipts'),$expectedReceipts))) {
         $entries=@(Get-ChildItem -LiteralPath $pair[0] -Force)
         if ($entries.Count -ne $pair[1].Count) { throw 'seedUnknownNamespace' }
