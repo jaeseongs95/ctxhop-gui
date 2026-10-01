@@ -37,6 +37,7 @@ type storeAcquisition struct {
 	Pinned, PrivateCreated, PrivatePrepared, Finalized bool
 	Draining, releasing, Closed, PrivateRemoved        bool
 	CloseErr                                           error
+	ReadersOpen                                        int // nonzero/unknown close forbids completed proof and cleanup
 }
 
 func pinStoreSources(root string, targets []storeTarget, max int64) (s *storeAcquisition, retErr error) {
@@ -336,7 +337,7 @@ func (s *storeAcquisition) checkPrivateRoot() error {
 }
 
 func (s *storeAcquisition) Verify() error {
-	if !s.Finalized || s.Closed || s.Draining {
+	if !s.Finalized || s.Closed || s.Draining || s.ReadersOpen != 0 {
 		return fmt.Errorf("store set copies not finalized or draining")
 	}
 	if e := s.verifySourceMetadata(); e != nil {
@@ -385,6 +386,9 @@ func (s *storeAcquisition) Observation() (object, error) {
 }
 
 func (s *storeAcquisition) CleanupPrivate() error {
+	if s.ReadersOpen != 0 {
+		return fmt.Errorf("store set private reader drain not confirmed")
+	}
 	if s.Closed {
 		return fmt.Errorf("store set cleanup after source release")
 	}

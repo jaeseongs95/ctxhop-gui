@@ -18,7 +18,7 @@ import (
 // production complete/admission. Key facts still need canonical state metadata,
 // strict file uncertainty and operation policy before they can authorize anything.
 func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *storeProofKeys) (facts []storeKeyEvidence, retErr error) {
-	if ctx == nil || s == nil || targets == nil || !s.Finalized || s.Draining || s.Closed {
+	if ctx == nil || s == nil || targets == nil || !s.Finalized || s.Draining || s.Closed || s.ReadersOpen != 0 {
 		return nil, fail("engine_db_unknown", "finalized aggregate store reader 결속 누락")
 	}
 	if e := s.Verify(); e != nil {
@@ -68,7 +68,7 @@ func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *
 }
 
 func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot storeSlot, targets *storeProofKeys) (proof storeKeyEvidence, retErr error) {
-	if slot.Data == nil || !slot.Present || !slot.Data.privateCopyReady() || slot.Data.Aggregate == nil || slot.Kind != "state" {
+	if parent == nil || dll == nil || targets == nil || slot.Data == nil || !slot.Present || !slot.Data.privateCopyReady() || slot.Data.Aggregate == nil || slot.Data.Aggregate.ReadersOpen != 0 || slot.Kind != "state" {
 		return proof, fail("engine_db_unknown", "private store reader/schema gate 결속 오류")
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
@@ -81,6 +81,7 @@ func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot store
 	if db == 0 {
 		return proof, fail("engine_db_unknown", "private store readonly 열기 실패")
 	}
+	slot.Data.Aggregate.ReadersOpen++
 	// Join the interrupt goroutine before close: it must never touch a recycled handle.
 	stop, done := make(chan struct{}), make(chan struct{})
 	go func() {
@@ -97,6 +98,8 @@ func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot store
 		r, _, _ := dll.MustFindProc("sqlite3_close").Call(db)
 		if r != 0 {
 			retErr = errors.Join(retErr, fail("engine_db_unknown", "store reader close 실패"))
+		} else {
+			slot.Data.Aggregate.ReadersOpen--
 		}
 		retErr = errors.Join(retErr, ctx.Err())
 		if retErr != nil {

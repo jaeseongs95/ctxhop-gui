@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -54,6 +55,7 @@ func TestStoreTypedEightReadersAndEndpointDomains(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	facts := []storeKeyEvidence{}
 	for _, raw := range array(catalog["stores"]) {
 		spec := obj(raw)
 		kind := text(spec["kind"])
@@ -62,6 +64,7 @@ func TestStoreTypedEightReadersAndEndpointDomains(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
+			facts = append(facts, proof)
 			classes := map[string]bool{}
 			scopes := map[string]int{}
 			for _, r := range proof.Relations {
@@ -89,6 +92,40 @@ func TestStoreTypedEightReadersAndEndpointDomains(t *testing.T) {
 				}
 			}
 		})
+	}
+	proof, e := projectStoreKeyProof(facts, keys, []bool{true, true, true, true, true, true, true, true}, strings.Repeat("a", 64))
+	if e != nil {
+		t.Fatal(e)
+	}
+	counts := func(memberIndex int, kind, class, scope string) int64 {
+		for _, raw := range array(obj(array(proof["members"])[memberIndex])["relations"]) {
+			r := obj(raw)
+			if r["kind"] == kind && r["relationClass"] == class {
+				return obj(r["counts"])[scope].(int64)
+			}
+		}
+		t.Fatal("missing class")
+		return -1
+	}
+	if counts(0, "state", "sessionSource", "internal") != 1 || counts(1, "state", "sessionSource", "internal") != 1 || counts(0, "memories", "globalJob", "sharedGlobal") != 1 || counts(1, "memories", "globalJob", "sharedGlobal") != 1 || counts(0, "threadHistory", "turn", "active") != 1 || counts(1, "threadHistory", "turn", "active") != 0 || counts(0, "agentMessageBoard", "post", "internal") != 1 || counts(1, "agentMessageBoard", "post", "internal") != 1 {
+		t.Fatal("endpoint union/R owner/sharedGlobal attribution", proof)
+	}
+	if _, e := projectStoreKeyProof(facts, keys, []bool{true, true, true, true, true, true, true, false}, strings.Repeat("a", 64)); e == nil {
+		t.Fatal("absent nonzero facts accepted")
+	}
+	self := make([]storeKeyEvidence, len(storeSpecs))
+	for i, spec := range storeSpecs {
+		self[i].Kind = spec.Kind
+	}
+	key := threadStoreKey(rootID)
+	self[0].Relations = []storeRelation{{"sessionSource", "internal", key, &key}}
+	selfProof, e := projectStoreKeyProof(self, keys, []bool{true, false, false, false, false, false, false, false}, strings.Repeat("a", 64))
+	if e != nil {
+		t.Fatal(e)
+	}
+	proof = selfProof
+	if counts(0, "state", "sessionSource", "internal") != 1 {
+		t.Fatal("same endpoint counted twice")
 	}
 }
 
@@ -225,13 +262,13 @@ func TestStoreNativePrivateReaderDrainAndAuxSealGate(t *testing.T) {
 			if variant == "cancelled" {
 				cancel()
 			}
-			facts, e := inspectPrivateStoreKeys(ctx, s, relationTargets(t))
+			observation, summary, e := inspectPrivateStoreProof(ctx, s, relationTargets(t))
 			if variant == "success" {
-				if e != nil || len(facts) != 8 || len(facts[0].Relations) != 1 {
-					t.Fatal("private reader", facts, e)
+				if e != nil || len(array(observation["stores"])) != 8 || len(array(summary["members"])) != 2 {
+					t.Fatal("private reader", observation, summary, e)
 				}
-			} else if e == nil || facts != nil {
-				t.Fatal("partial proof escaped failed reader", facts, e)
+			} else if e == nil || observation != nil || summary != nil {
+				t.Fatal("partial proof escaped failed reader", observation, summary, e)
 			}
 			if e := s.Close(true); e != nil {
 				t.Fatal("all reader drains/cleanup", e)
@@ -253,5 +290,28 @@ func TestStoreNativePrivateReaderDrainAndAuxSealGate(t *testing.T) {
 	}
 	if e := s.Close(true); e != nil {
 		t.Fatal(e)
+	}
+	// Inject only the internal unknown-close state; no SQLite handle is left open.
+	home, targets = storeFixture(t, false)
+	s, e = acquireStoreSet(home, filepath.Join(t.TempDir(), "private"), targets, limit, nil, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close(false)
+	s.ReadersOpen = 1
+	if e := s.Verify(); e == nil {
+		t.Fatal("proof while reader drain unknown")
+	}
+	if e := s.CleanupPrivate(); e == nil {
+		t.Fatal("cleanup while reader drain unknown")
+	}
+	if _, e := os.Stat(filepath.Join(s.PrivateRoot, "state", storeSpecs[0].Filename)); e != nil {
+		t.Fatal("private removed before whole reader drain", e)
+	}
+	if e := s.Close(true); e == nil || s.PrivateRemoved {
+		t.Fatal("unknown close became success", e)
+	}
+	if e := s.VerifyReleasedSources(nil); e == nil {
+		t.Fatal("freshness accepted failed reader close")
 	}
 }
