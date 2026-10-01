@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "kind": "ctxhop-s4-source-handoff",
+  "sourceHeads": {
+    "ctxhopBase": "b4dfb268bb5a82f056efb2edc62205ed9cc85f95",
+    "codex": "d8338a5cc55db06d2255986c33b9ce06841fe0d3"
+  },
+  "files": [
+    {
+      "path": "handoff/codex-prestart-r45.bundle",
+      "bytes": 264684,
+      "sha256": "19e679ceeab964ee5629054a491fd0df4438c32367c2fcf6dbc38bbaa7f5ba91"
+    },
+    {
+      "path": "handoff/contracts/s4-approval-evidence-v1.md",
+      "bytes": 13363,
+      "sha256": "2132eabcc4d398c02839fefa2d8a12aab68024763892f74912001cd1d53df571"
+    },
+    {
+      "path": "handoff/contracts/s4-prestart-contract-v1.md",
+      "bytes": 17425,
+      "sha256": "34d4809dfe72890750a73fa373a6542962bf839df71b46368dd95e397b87e3c6"
+    },
+    {
+      "path": "handoff/contracts/s4-prestart-store-set-v2.md",
+      "bytes": 26227,
+      "sha256": "6c4b86df0553f3fad03531d140e2609ec43c5deae24528fdd2da76e09571f161"
+    },
+    {
+      "path": "handoff/contracts/s4-recovery-evidence-v1.md",
+      "bytes": 21587,
+      "sha256": "72290ee61d0fbccaff4f245e280c2306b6ccaec01847e68e57dfb14bcbd8bcfe"
+    },
+    {
+      "path": "handoff/panel/case-brief.md",
+      "bytes": 4496,
+      "sha256": "41ebf797c7186450e8da096bcb675c966ac724208757752c57133b2cd901d4ec"
+    },
+    {
+      "path": "handoff/panel/report-canonical.md",
+      "bytes": 22436,
+      "sha256": "3659cfafc2c6e5a38ebc8fed1e3a9b1e6e4371aeefe0a66566f0a0992ece3a00"
+    },
+    {
+      "path": "handoff/panel/report-consumers.md",
+      "bytes": 19076,
+      "sha256": "495572720a882f341280eb375cecfb805636c6563dbf4150d2003fac12ddb3c7"
+    },
+    {
+      "path": "handoff/panel/report-safety.md",
+      "bytes": 21634,
+      "sha256": "b21c6b4dc8f917187d176d4344cfb6d19e08309365a88299069f3d6cfc20fb2a"
+    },
+    {
+      "path": "handoff/README.ko.md",
+      "bytes": 12281,
+      "sha256": "51aba7fc8d05b239779caa3016e4e9478a26feb2a5a37f9a0bbcd67e3307bf2f"
+    },
+    {
+      "path": "handoff/source-snapshot.json",
+      "bytes": 3618,
+      "sha256": "7668f4145cc5168841d75ab61681934ad79ca968f035234896accd3e05d6e8f1"
+    },
+    {
+      "path": "handoff/test-summary.json",
+      "bytes": 1048,
+      "sha256": "f7660351b2bef4ccb93a4a49aec27808dc188348526c9d36256cfc541a58bedd"
+    }
+  ]
+}

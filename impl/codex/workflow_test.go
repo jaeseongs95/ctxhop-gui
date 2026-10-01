@@ -165,6 +165,11 @@ func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error
 			return nil, fail("injected", "fixture phase failure")
 		}
 		switch method {
+		case "ctxhop/recovery-plan":
+			plan := object{"schemaVersion": num(1), "profile": recoveryPlanProfile, "operationId": o.Run, "home": o.Home, "approvalManifestSha256": o.ApprovalEvidence.ManifestSHA256, "rollouts": []any{}}
+			response := object{"phase": "recoveryPlan", "inputComplete": false, "binding": clone(s.Binding), "plan": plan}
+			canonical, e := storeCanonicalJSON(response); if e != nil { return nil, e }; plan["planDigest"] = digest(canonical)
+			return response, nil
 		case "ctxhop/complete":
 			if !exact(p, "contractVersion", "requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest", "operation", "storeObservation") {
 				return nil, fail("mock_rpc", "v2 complete exact8 fields")

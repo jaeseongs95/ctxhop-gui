@@ -604,6 +604,11 @@ function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]
     $auto=$VendorState -in @('absent','rolled_back','none') -and $Mode -in @('restore','rollback')
     $user=$VendorState -in @('pending','resolved') -and $Mode -eq 'rollback'
     if (-not ($auto -or $user)) { return 'waiting' }
+    if ($VendorState -ceq 'pending' -and $Marker.agent -ceq 'codex-desktop') {
+        try { $cap=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $Marker)} }
+        catch { return (Set-MarkerAttention $Marker (T 'WkRecoveryActionUnavailable')) }
+        if ($cap.canRollback -ne $true) { return (Set-MarkerAttention $Marker (T 'WkRecoveryActionUnavailable')) }
+    }
     # 프로젝트 파일을 처음 되돌리기 전에 엔진이 모두 닫혔는지 본다(R38-02). 닫혀 있지 않거나 확인하지 못하면 아무것도 바꾸지 않는다.
     $guard=Test-MarkerEngineClosed $Marker
     if ($guard) { return (Set-MarkerAttention $Marker $guard) }
@@ -640,7 +645,7 @@ function Get-ProjectRecordRows([hashtable]$Referenced) {
     foreach ($folder in [IO.Directory]::GetDirectories($root)) {
         $name=[IO.Path]::GetFileName($folder)
         if ($Referenced.ContainsKey($name) -or $Referenced.ContainsKey($folder.ToLowerInvariant()) -or (Test-ProjectRecordResolved $folder)) { continue }
-        $row=[ordered]@{kind='project';operationId=$null;recordRef=$folder;agent='';nativeId='';state='';error='';canRollback=$false;sha256=(Get-ProjectRecordSha $folder);files=@();path=$folder}
+        $row=[ordered]@{kind='project';operationId=$null;recordRef=$folder;agent='';nativeId='';state='';error='';canRollback=$false;canResolve=[bool](Get-ProjectRecordSha $folder);canFinalizeLocal=$false;blocksImport=$true;reasonCode='';sha256=(Get-ProjectRecordSha $folder);files=@();path=$folder}
         if ([IO.File]::Exists((Join-Path $folder 'restore-plan.json'))) {
             if ($name -cmatch '^[0-9a-f]{32}$' -and [IO.File]::Exists((Join-Path (Get-JournalDir) "done\$name.json"))) { continue }
             try { $row.files=@(Get-ProjectUndoView @((Read-ProjectPlan $folder).files)); $row.state='pending'; $row.canRollback=$true } catch { $row.state='unreadable' }
@@ -660,7 +665,7 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
     # 공통 표지, 두 벤더의 recover list, 표지 없는 프로젝트 기록을 합친다(S3 명세 4.3절). $Auto면 결정표의 자동 정리만 한다.
     $rows=[Collections.Generic.List[object]]::new(); $failed=[Collections.Generic.List[string]]::new(); $byRef=@{}; $referenced=@{}
     foreach ($entry in @(Read-Markers)) {
-        if (-not $entry.marker) { $rows.Add([pscustomobject]@{kind='marker';operationId=$entry.name;recordRef=$null;agent='';nativeId='';state='unreadable';error=(T 'WkJournalMarkerUnreadable');canRollback=$false;sha256='';files=@();path=$entry.path}); continue }
+        if (-not $entry.marker) { $rows.Add([pscustomobject]@{kind='marker';operationId=$entry.name;recordRef=$null;agent='';nativeId='';state='unreadable';error=(T 'WkJournalMarkerUnreadable');canRollback=$false;canResolve=$false;canFinalizeLocal=$false;blocksImport=$true;reasonCode='unreadable_marker';sha256='';files=@();path=$entry.path}); continue }
         $marker=$entry.marker
         if ($marker.projectRecovery) { $referenced[[IO.Path]::GetFileName([string]$marker.projectRecovery)]=$true; $referenced[([string]$marker.projectRecovery).ToLowerInvariant()]=$true }
         if ($marker.recordRef) { $referenced[([string]$marker.recordRef).ToLowerInvariant()]=$true }
@@ -672,7 +677,7 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
         }
         $files=@(); $canRollback=$state -in @('absent','rolled_back','pending','resolved','none') -and ($marker.recordKind -ne 'project' -or [IO.File]::Exists((Join-Path $marker.recordRef 'restore-plan.json')))
         try { $plan=Read-ProjectPlan ([string]$marker.projectRecovery); if ($plan) { $files=@(Get-ProjectUndoView @($plan.files)) } } catch { $canRollback=$false }
-        $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
+        $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;canResolve=($state -cnotin @('busy','failed'));canFinalizeLocal=$false;blocksImport=$true;reasonCode='';sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
         $rows.Add($row); $byRef["$($marker.agent)/$(Get-MarkerRef $marker)"]=$row
     }
     $map=Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -682,12 +687,38 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
         foreach ($record in $records) {
             $row=$byRef["$agent/$($record.recordId)"]
             # 표지가 있는 기록은 표지 행에 벤더 파일 목록과 해시를 붙인다. 없는 기록은 따로 보인다.
-            if ($row) { $row.sha256=[string]$record.sha256; $row.files=@($row.files)+@($record.files | Where-Object { $_ }); continue }
-            $rows.Add([pscustomobject]@{kind='vendor';operationId=$record.operationId;recordRef=[string]$record.recordId;agent=$agent;nativeId=[string]$record.nativeId;state=[string]$record.state;error='';canRollback=[bool]$record.canRollback;sha256=[string]$record.sha256;files=@($record.files | Where-Object { $_ });path=[string]$record.path})
+            if ($row) {
+                $row.sha256=[string]$record.sha256; $row.files=@($row.files)+@($record.files | Where-Object { $_ })
+                if ($null -ne $record.canResolve) {
+                    $row.canResolve=$record.canResolve -and $row.state -cne 'busy'; $row.canFinalizeLocal=$record.canFinalizeLocal -and $row.state -cne 'busy'
+                    $row.canRollback=$row.canRollback -and $record.canRollback; $row.blocksImport=$record.blocksImport; $row.reasonCode=[string]$record.reasonCode
+                    if ($row.state -cne 'busy') { $row.state=[string]$record.state }
+                    if (-not $row.path) { $row.path=[string]$record.path }
+                }
+                continue
+            }
+            $rows.Add([pscustomobject]@{kind='vendor';operationId=$record.operationId;recordRef=$record.recordId;agent=$agent;nativeId=$record.nativeId;state=[string]$record.state;error='';canRollback=[bool]$record.canRollback;canResolve=$(if ($null -ne $record.canResolve) {[bool]$record.canResolve} else {[bool]$record.sha256});canFinalizeLocal=[bool]$record.canFinalizeLocal;blocksImport=$(if ($null -ne $record.blocksImport) {[bool]$record.blocksImport} else {$true});reasonCode=[string]$record.reasonCode;sha256=[string]$record.sha256;files=@($record.files | Where-Object { $_ });path=[string]$record.path})
         }
     }
     foreach ($row in @(Get-ProjectRecordRows $referenced)) { $rows.Add($row) }
     return [pscustomobject]@{rows=$rows.ToArray();failed=$failed.ToArray()}
+}
+function Invoke-JournalFinalize([object]$Job) {
+    # Local vendor cleanup only. Do not create a marker or undo project files here.
+    $agent=[string]$Job.agent; $home=[string]$Job.home; $recordId=[string]$Job.recordId
+    if ($Job.operationId) {
+        $null=Assert-OperationId $Job.operationId
+        $entry=@(Read-Markers | Where-Object { $_.name -ceq [string]$Job.operationId })
+        if ($entry.Count -ne 1 -or -not $entry[0].marker) { throw (T 'WkJournalMissing' $Job.operationId) }
+        $marker=$entry[0].marker
+        if ($marker.recordKind -ceq 'project' -or (Test-WorkerWritersGone $marker) -cne 'gone') { throw (T 'WkRecoveryActionUnavailable') }
+        $agent=[string]$marker.agent; $home=[string]$marker.home; $recordId=Get-MarkerRef $marker
+    }
+    if ($agent -cne 'codex-desktop') { throw (T 'WkRecoveryActionUnavailable') }
+    $null=Assert-OperationId $recordId
+    $report=Invoke-Vendor ([pscustomobject]@{agent=$agent;home=$home}) 'recover' @{mode='finalize';recordId=$recordId}
+    if ($report.effect -cne 'finalized' -or $report.terminalStatus -cnotin @('complete','rolled_back')) { throw (T 'WkRecoveryActionUnavailable') }
+    return @{outcome='finalized';terminalStatus=$report.terminalStatus;message=(T 'WkRecoveryFinalized')}
 }
 function Assert-JournalClear([object]$Job) {
     # 미해결 항목이 있거나 조회가 실패하면 복원·백업·열기를 모두 막는다(S3 명세 4.3절). 목록·미리보기와 되돌리기·닫기는 막지 않는다.
@@ -739,6 +770,10 @@ function Invoke-JournalClose([object]$Job) {
         $folder=[string]$marker.recordRef; $sha=Get-ProjectRecordSha $folder
         if (-not $sha -or $sha -cne [string]$Job.sha256) { throw (T 'WkRecordChanged') }
     } elseif ($state -in @('pending','unreadable')) {
+        if ($marker.agent -ceq 'codex-desktop') {
+            $cap=Invoke-Vendor (Get-MarkerJob $marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $marker)}
+            if ($cap.canResolve -ne $true) { throw (T 'WkRecoveryActionUnavailable') }
+        }
         $null=Invoke-Vendor (Get-MarkerJob $marker) 'recover' @{mode='resolve';recordId=(Get-MarkerRef $marker);sha256=[string]$Job.sha256}
         $state='resolved'
     }
@@ -913,6 +948,7 @@ function Invoke-ConversationJob([object]$Job) {
         Journal { return (Get-JournalRows $Job -Auto) }
         Rollback { return (Invoke-JournalRollback $Job) }
         CloseJournal { return (Invoke-JournalClose $Job) }
+        FinalizeJournal { return (Invoke-JournalFinalize $Job) }
         Open { Assert-JournalClear $Job; return @{message=[string](Invoke-Vendor $Job 'open' $ids).message} }
     }
 }
@@ -1051,7 +1087,7 @@ function Test-WorkerWritersGone([object]$Marker,[int]$KillSec=30) {
 }
 function Invoke-JobCore([object]$Job) {
     # 쓰기 작업(복원·되돌리기·닫기)은 Job 객체 안에서만 한다. 끝나기 전에 자손이 모두 끝나기를 기다려, mutex를 풀 때 writer가 남지 않게 한다.
-    if ($Job.action -cin @('Restore','Rollback','CloseJournal')) {
+    if ($Job.action -cin @('Restore','Rollback','CloseJournal','FinalizeJournal')) {
         Assert-WorkerJob
         try { return (Invoke-ConversationJob $Job) } finally { $null=Wait-WorkerJobAlone }
     }

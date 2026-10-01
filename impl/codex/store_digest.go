@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -26,7 +27,9 @@ func storeCanonicalJSON(value any) ([]byte, error) {
 		case json.Number:
 			n, e := v.Int64()
 			if e != nil {
-				return nil, fmt.Errorf("store digest exact i64 required: %w", e)
+				u, unsignedError := strconv.ParseUint(v.String(), 10, 64)
+				if unsignedError != nil { return nil, fmt.Errorf("digest exact integer required: %w", e) }
+				return u, nil
 			}
 			return n, nil
 		case object:

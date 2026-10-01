@@ -418,7 +418,7 @@ func validateJournalApproval(j *journal, raw []byte) error {
 	v, _ := parseJSON(raw)
 	record := obj(v)
 	if j.Version == 3 {
-		if j.ApprovalEvidence != nil || j.ApprovalOwnership != nil || j.ReferenceApprovalEvidence != nil || j.ReferenceApprovalOwnership != nil || j.CleanupStatus != "" {
+		if j.ApprovalEvidence != nil || j.ApprovalOwnership != nil || j.ReferenceApprovalEvidence != nil || j.ReferenceApprovalOwnership != nil || j.CleanupStatus != "" || j.RecoveryEvidence != nil || j.LocalFinalization != nil {
 			return fail("unsupported_record", "v3 승인 자동 승격 금지")
 		}
 		for _, v := range array(record["members"]) {
@@ -435,7 +435,7 @@ func validateJournalApproval(j *journal, raw []byte) error {
 		return fail("unsupported_record", "승인 reference/정리 결속 오류")
 	}
 	if j.ApprovalEvidence == nil || j.ApprovalOwnership == nil {
-		if j.Phase == "created" && j.Status == "pending" && j.ApprovalEvidence == nil && j.ApprovalOwnership == nil {
+		if j.Phase == "created" && (j.Status == "pending" || j.LocalFinalization != nil && j.LocalFinalization.TerminalStatus == "rolled_back") && j.ApprovalEvidence == nil && j.ApprovalOwnership == nil {
 			return nil
 		}
 		return fail("unsupported_record", "v4 승인 근거 누락")
@@ -477,23 +477,38 @@ func prepareRequest(o options, operation, n string, descriptors []any) (object, 
 			return nil, fail("approval_evidence", "구성원 prepare에는 원승인 descriptor가 필요합니다")
 		}
 		evidence = d
-	} else if o.ApprovalEvidence != nil || operation != "plan" && operation != "bootstrap" {
+	} else if o.ApprovalEvidence != nil || o.RecoveryEvidence != nil || operation != "plan" && operation != "bootstrap" {
 		return nil, fail("approval_evidence", "무구성원 prepare scope 오류")
 	}
-	return object{"contractVersion": 2, "requestNonce": n, "operation": operation, "home": o.Home, "cwd": o.Cwd, "offline": true, "members": descriptors, "approvalEvidence": evidence}, nil
+	var recovery any
+	if o.RecoveryEvidence != nil {
+		if !recoveryDescriptorValid(o.RecoveryEvidence, o) {
+			return nil, fail("recovery_evidence", "복구 prepare descriptor 오류")
+		}
+		recovery = o.RecoveryEvidence
+	}
+	return object{"contractVersion": 2, "requestNonce": n, "operation": operation, "home": o.Home, "cwd": o.Cwd, "offline": true, "members": descriptors, "approvalEvidence": evidence, "recoveryEvidence": recovery}, nil
 }
 func validateApprovalProjection(r object, o options, ms []member, acquired bool) error {
 	if r["mappingProfile"] != approvalProfile {
 		return fail("approval_evidence", "승인 mapping profile 불일치")
 	}
 	if !acquired {
-		if r["approvalEvidenceDigest"] != nil || r["approvedMappingDigest"] != nil {
+		if r["approvalEvidenceDigest"] != nil || r["approvedMappingDigest"] != nil || r["recoveryEvidenceDigest"] != nil {
 			return fail("approval_evidence", "미완료 승인 digest는 null이어야 합니다")
 		}
 		return nil
 	}
 	if o.ApprovalEvidence == nil || r["approvalEvidenceDigest"] != o.ApprovalEvidence.ManifestSHA256 || !hashRE.MatchString(text(r["approvedMappingDigest"])) {
 		return fail("approval_evidence", "완료 승인 digest 결속 오류")
+	}
+	if o.RecoveryEvidence == nil {
+		if r["recoveryEvidenceDigest"] != nil { return fail("recovery_evidence", "복구 descriptor 없는 digest") }
+	} else {
+		if r["recoveryEvidenceDigest"] != o.RecoveryEvidence.ManifestSHA256 { return fail("recovery_evidence", "완료 복구 digest 결속 오류") }
+		recovery, e := pinRecovery(o, ms)
+		if e != nil { return e }
+		if e = recovery.Close(); e != nil { return e }
 	}
 	l, e := pinApproval(o, ms)
 	if e != nil {
@@ -630,6 +645,12 @@ func cleanupJournal(run string, j *journal, target string) error {
 	if j.Version == 3 {
 		return cleanup(run)
 	}
+	return beginFinalization(run, j, target)
+}
+
+// Retained for compatibility review of development v4 cleanup states. New
+// cleanup never resumes this path or grants it source-less authority.
+func legacyCleanupJournalV4(run string, j *journal, target string) error {
 	j.CleanupStatus = target
 	if e := saveJournal(run, j, false); e != nil {
 		return e

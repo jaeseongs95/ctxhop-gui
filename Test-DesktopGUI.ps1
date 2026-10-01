@@ -348,13 +348,15 @@ try {
     # 중단된 복원 창(S3 명세 4.4절): 버튼은 고른 행에 맞춰 켜고, 고른 할 일은 확인을 한 번 더 받은 뒤 작업으로 보낸다.
     $unknownFile=[pscustomobject]@{index=1;target='D:\합성\b.txt';class='unknown';current=('b'*64)}
     $journal=[pscustomobject]@{failed=@('claude-code');rows=@(
-        [pscustomobject]@{kind='marker';operationId=('1'*32);recordRef=$null;agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$true;sha256='AB';path='D:\기록';targets=@('D:\합성');files=@([pscustomobject]@{index=0;target='D:\합성\a.txt';class='owned';current=('a'*64)},$unknownFile)},
-        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('2'*32);agent='claude-code';nativeId=$id;state='unreadable';error='';canRollback=$false;sha256='CD';path='';files=@()},
-        [pscustomobject]@{kind='project';operationId=$null;recordRef='D:\예전 기록';agent='';nativeId='';state='failed';error='';canRollback=$false;sha256='EF';path='D:\예전 기록';files=@()})}
+        [pscustomobject]@{kind='marker';operationId=('1'*32);recordRef=$null;agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$true;canResolve=$true;canFinalizeLocal=$false;sha256='AB';path='D:\기록';targets=@('D:\합성');files=@([pscustomobject]@{index=0;target='D:\합성\a.txt';class='owned';current=('a'*64)},$unknownFile)},
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('2'*32);agent='claude-code';nativeId=$id;state='unreadable';error='';canRollback=$false;canResolve=$true;canFinalizeLocal=$false;sha256='CD';path='';files=@()},
+        [pscustomobject]@{kind='project';operationId=$null;recordRef='D:\예전 기록';agent='';nativeId='';state='failed';error='';canRollback=$false;canResolve=$true;canFinalizeLocal=$false;sha256='EF';path='D:\예전 기록';files=@()},
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=$null;agent='codex-desktop';nativeId=$null;state='unreadable';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$false;sha256=$null;path='';reasonCode='invalid_name';files=@()},
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('4'*32);agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$true;sha256=('a'*64);path='D:\임시 기록';files=@()})}
     $ui=New-JournalDialog $journal
     try {
         $null=$ui.dialog.Handle; $null=$ui.list.Handle   # 창을 띄우지 않고도 선택 이벤트가 오게 한다
-        Assert ($ui.list.Items.Count -eq 3 -and $ui.dialog.Controls[0].Text -match 'claude-code') 'the window lists every record and names the tool it could not check'
+        Assert ($ui.list.Items.Count -eq 5 -and $ui.dialog.Controls[0].Text -match 'claude-code') 'the window lists every record and names the tool it could not check'
         Assert ($ui.list.Items[0].SubItems[3].Text -eq '원래대로 0 / 이 복원이 씀 1 / 알 수 없음 1 / 되돌리지 못함 0') "the file counts are shown: $($ui.list.Items[0].SubItems[3].Text)"
         Assert (-not @($ui.buttons.Values | Where-Object Enabled).Count) 'no action is available before a row is picked'
         $ui.list.Items[0].Selected=$true; [Windows.Forms.Application]::DoEvents()
@@ -364,12 +366,19 @@ try {
         # 보이지 않는 창의 버튼은 PerformClick이 무시하므로 클릭 처리기를 직접 부른다.
         $ui.buttons.resolve.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'NonPublic,Instance').Invoke($ui.buttons.resolve,@([EventArgs]::Empty))
         Assert ($ui.dialog.Tag.action -eq 'resolve' -and $ui.dialog.Tag.row.recordRef -eq ('2'*32)) 'a button returns its action and the picked row'
+        $ui.list.Items[1].Selected=$false; $ui.list.Items[3].Selected=$true; [Windows.Forms.Application]::DoEvents()
+        Assert (-not @($ui.buttons.Values | Where-Object Enabled).Count) 'an unsafe diagnostic has no mutation action'
+        $ui.list.Items[3].Selected=$false; $ui.list.Items[4].Selected=$true; [Windows.Forms.Application]::DoEvents()
+        Assert ($ui.buttons.rollback.Enabled -and $ui.buttons.rollback.Text -eq '임시 파일 정리' -and -not $ui.buttons.unknown.Enabled -and -not $ui.buttons.resolve.Enabled) 'cleanup pending offers only the local cleanup mutation'
+        $ui.buttons.rollback.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'NonPublic,Instance').Invoke($ui.buttons.rollback,@([EventArgs]::Empty))
+        Assert ($ui.dialog.Tag.action -ceq 'finalize') 'the cleanup button cannot dispatch rollback'
     } finally { $ui.dialog.Dispose() }
     $realShowDialog=${function:Show-Dialog}; $realConfirm=${function:Confirm}
     function Show-Dialog([object]$Dialog) { $Dialog.Tag=$script:JournalChoice; return 'OK' }
     function Confirm([string]$Message) { $script:Asked=$Message; return $script:ConfirmAnswer }
     try {
         $cases=@(
+            @{choice=@{action='finalize';row=$journal.rows[4]};check={ param($j) $j.action -eq 'FinalizeJournal' -and $j.recordId -eq ('4'*32) -and -not $j.confirmedUnknown };ask='임시 파일'},
             @{choice=@{action='rollback';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and $j.operationId -eq ('1'*32) -and -not $j.confirmedUnknown };ask='복원 전 상태로'},
             @{choice=@{action='unknown';row=$journal.rows[0]};check={ param($j) $j.action -eq 'Rollback' -and @($j.confirmedUnknown).Count -eq 1 -and $j.confirmedUnknown[0].target -eq 'D:\합성\b.txt' -and $j.confirmedUnknown[0].current -eq ('b'*64) };ask='D:\합성\b.txt'},
             @{choice=@{action='resolve';row=$journal.rows[1]};check={ param($j) $j.action -eq 'CloseJournal' -and $j.recordId -eq ('2'*32) -and $j.agent -eq 'claude-code' -and $j.sha256 -eq 'CD' };ask='다시 되돌릴 수 없습니다'},

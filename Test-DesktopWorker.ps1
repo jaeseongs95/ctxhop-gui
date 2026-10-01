@@ -1,4 +1,5 @@
 ﻿#requires -Version 5.1
+param([string]$RecoveryHelperPath,[string]$RecoveryHelperSHA256)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
@@ -88,7 +89,16 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
 }
 # Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
 $script:GoState='exists'; $script:GoFail=$false; $script:GoRetainedKinds=$null
+# Recovery classification/rename use the frozen native helper against only synthetic runs.
+if (-not $RecoveryHelperPath) { $RecoveryHelperPath=Join-Path $PSScriptRoot 'bin\ctxhop-codex.exe'; $RecoveryHelperSHA256=$script:DesktopGoSHA256 }
+if ($RecoveryHelperSHA256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Supply the fixed recovery helper path and SHA256 for this test.' }
+Assert-FrozenFile $RecoveryHelperPath $RecoveryHelperSHA256
+$script:RecoveryFixtureExe=$RecoveryHelperPath; $script:RecoveryCalls=0
 function Invoke-DesktopGo([string[]]$Arguments) {
+    if ($Arguments[0] -cin @('recovery-list','recovery-status','recovery-resolve','finalize')) {
+        $script:RecoveryCalls++
+        return (Invoke-JsonNative $script:RecoveryFixtureExe $Arguments)
+    }
     $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
     switch ($Arguments[0]) {
         plan {
@@ -268,15 +278,17 @@ try {
     Write-RunJournal $ops.both (Get-RunJson 'pending'); Write-RunJournal $ops.both (Get-RunJson 'pending') 'journal.resolved.json'
     Write-RunJournal $ops.broken '{not json'; Write-RunJournal $ops.foreign (Get-RunJson 'pending' 'D:\other-home')
     $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot 'not-a-record') -Force
-    $expected=@{absent='absent';empty='absent';pending='pending';complete='complete';rolled='rolled_back';resolved='resolved';both='unreadable';broken='unreadable';foreign='unreadable'}
+    $expected=@{absent='absent';empty='unreadable';pending='pending';complete='complete';rolled='rolled_back';resolved='resolved';both='unreadable';broken='unreadable';foreign='unreadable'}
     foreach ($name in $expected.Keys) { Assert ((Get-CodexState $ops[$name]) -ceq $expected[$name]) "Codex record $name is $($expected[$name])" }
     $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId='../x'} } catch { $failure=$_ }
     Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed') 'a record name that is not an operation ID is refused'
     $listed=@((Invoke-Vendor $recoverJob 'recover' @{mode='list'}).records)
-    Assert ((@($listed | ForEach-Object recordId | Sort-Object) -join ',') -eq (@($ops.pending,$ops.both,$ops.broken,$ops.foreign | Sort-Object) -join ',')) 'list shows pending and unreadable records only'
+    Assert (@($listed | Where-Object { $null -eq $_.recordId -and $_.reasonCode -and $_.blocksImport -and -not $_.canResolve -and -not $_.canRollback -and -not $_.canFinalizeLocal }).Count -eq 1) 'an invalid namespace name remains a visible non-actionable diagnostic'
+    Assert ((@($listed | Where-Object { $null -ne $_.recordId } | ForEach-Object recordId | Sort-Object) -join ',') -eq (@($ops.empty,$ops.pending,$ops.both,$ops.broken,$ops.foreign | Sort-Object) -join ',')) 'list shows pending, empty and unreadable records'
     $pendingRow=@($listed | Where-Object recordId -eq $ops.pending)[0]
     Assert ($pendingRow.canRollback -and $pendingRow.nativeId -eq $script:Id -and $pendingRow.sha256 -eq (Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.pending)\journal.json") -Algorithm SHA256).Hash) 'a pending row can be rolled back and carries its record hash'
     Assert (-not @($listed | Where-Object { $_.recordId -ne $ops.pending -and $_.canRollback }).Count) 'unreadable rows cannot be rolled back'
+    Assert (-not (Get-DesktopRecord $desktopRoot $ops.empty).canResolve -and -not (Get-DesktopRecord $desktopRoot $ops.both).canResolve -and (Get-DesktopRecord $desktopRoot $ops.broken).canResolve) 'only a single safe raw record can be closed'
     # 되돌리기: pending만 백엔드 recover로 되돌린다. 백엔드가 멈추면 기록은 그대로다.
     $script:RecoverStatus='busy'
     $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='rollback';recordId=$ops.pending} } catch { $failure=$_ }
@@ -1138,7 +1150,7 @@ Start-Sleep 120
     }
     Assert-ProjectTargetsSeparate @($overlap,(Join-Path $testDirectory 'overlap-2')) $desktopRoot
     Remove-Item -LiteralPath $script:RecoveryRootForCases -Recurse -Force
-    Write-Output "PASS: $script:Checks isolated desktop worker assertions. All native backend and bundle calls mocked."
+    Write-Output "PASS: $script:Checks isolated desktop worker assertions; $script:RecoveryCalls real native recovery calls. Engine and bundle calls mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal; $env:CODEX_HOME=$oldCodexHome
     $resolved=[IO.Path]::GetFullPath($testDirectory); $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'

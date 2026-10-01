@@ -31,6 +31,8 @@ type session struct {
 	Operation   string
 	Acquisition *dbAcquisition
 	Evidence    *approvalLease
+	Recovery    *recoveryLease
+	DiscoveryIssued bool
 	Call        func(string, object) (object, error)
 	Notify      func(string, object) error
 	Close       func() error
@@ -158,11 +160,14 @@ func openEngine(o options, operation string, members []member) (*session, error)
 		if e != nil {
 			return nil, e
 		}
-	} else if o.ApprovalEvidence != nil {
+	} else if o.ApprovalEvidence != nil || o.RecoveryEvidence != nil {
 		return nil, fail("approval_evidence", "무구성원 prepare의 승인 descriptor는 null이어야 합니다")
 	}
 	keepEvidence := false
+	recovery, e := pinRecovery(o, members)
+	if e != nil { return nil, e }
 	defer func() {
+		if !keepEvidence && recovery != nil { recovery.Close() }
 		if !keepEvidence && evidence != nil {
 			evidence.Close()
 		}
@@ -173,9 +178,10 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	}
 	p.ImageLocks = locks
 	keepLocks = true
-	s := &session{P: p, Evidence: evidence}
+	s := &session{P: p, Evidence: evidence, Recovery: recovery}
 	s.Close = func() error {
 		e := p.close()
+		if e == nil && s.Recovery != nil { e = s.Recovery.Close(); s.Recovery = nil }
 		if e == nil && s.Evidence != nil {
 			e = s.Evidence.Close()
 			s.Evidence = nil
@@ -342,6 +348,7 @@ func (s *session) bind() {
 	s.Binding["operation"] = s.Operation
 }
 func (s *session) complete(observed dbView) error {
+	if s.DiscoveryIssued { return fail("recovery_plan", "discovery 프로세스 complete 금지") }
 	if observed.Acquisition != nil && observed.Acquisition.Aggregate != nil {
 		return fail("engine_db_unknown", "실제8 schema·metadata·strict inventory 검증 전 운영 complete 금지")
 	}
@@ -473,7 +480,7 @@ func validateObservation(raw object, state string) error {
 	return nil
 }
 func validateProjection(r object, n, operation string, o options, members []member, pid int64, observation object) error {
-	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "storeObservationDigest", "storeProof", "effects", "mappingProfile", "approvalEvidenceDigest", "approvedMappingDigest") {
+	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "storeObservationDigest", "storeProof", "effects", "mappingProfile", "approvalEvidenceDigest", "approvedMappingDigest", "recoveryEvidenceDigest") {
 		return fail("prestart_schema", "알 수 없는 prepare projection 구조")
 	}
 	version, ok := integer(r["contractVersion"])
@@ -700,6 +707,7 @@ func checkOtherStoreAbsence(projection object) error {
 	return nil
 }
 func (s *session) activate() error {
+	if s.DiscoveryIssued { return fail("recovery_plan", "discovery 프로세스 activate 금지") }
 	if s.Projection["inputComplete"] != true {
 		return fail("prestart_incomplete", "complete 전 activate 금지")
 	}

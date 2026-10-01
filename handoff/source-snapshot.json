@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "purpose": "S4 WIP handoff; no implementation acceptance",
+  "ctxhopBaseHead": "b4dfb268bb5a82f056efb2edc62205ed9cc85f95",
+  "ctxhopBranch": "handoff/s4-20261001",
+  "codexUpstreamRepository": "https://github.com/openai/codex.git",
+  "codexUpstreamTag": "rust-v0.159.2",
+  "codexUpstreamBase": "ff6aec96948b70d94983af2641a6b67c94faeff5",
+  "codexBranch": "feat/ctxhop-prestart",
+  "codexHead": "d8338a5cc55db06d2255986c33b9ce06841fe0d3",
+  "codexBundleSha256": "19e679ceeab964ee5629054a491fd0df4438c32367c2fcf6dbc38bbaa7f5ba91",
+  "preexistingDirtyTracked": 15,
+  "preexistingUntracked": 3,
+  "sourceFiles": [
+    {
+      "path": "CodexDesktop.ps1",
+      "bytes": 25279,
+      "sha256": "10fc422c43485ecfd88c2a4bdfca2edc401f22fea80c99badcd0a4cf6123a037"
+    },
+    {
+      "path": "GUI.ps1",
+      "bytes": 63214,
+      "sha256": "2cc1db5414c8a3cd74f31a50d589f746ae073a073c08795d64b55b7ccbf1df2d"
+    },
+    {
+      "path": "Strings.ps1",
+      "bytes": 70155,
+      "sha256": "fb384949744c77b4e6017baff2a8000e996626d35f2f1b9e878cd639ce10a9c2"
+    },
+    {
+      "path": "Test-DesktopGUI.ps1",
+      "bytes": 47193,
+      "sha256": "73ed8dc0c895be0eaed9ae921ffb7073ec26766dc43557bb029b61eab872c0ea"
+    },
+    {
+      "path": "Test-DesktopWorker.ps1",
+      "bytes": 127265,
+      "sha256": "257573ba22bde14ea6acfc451b00ef229e02ff77924b16a037aa703b1650420d"
+    },
+    {
+      "path": "Worker.ps1",
+      "bytes": 92131,
+      "sha256": "773ee1a5121bbaa757ff2dfe4e4b286112c2961382d1ffe1cc5e0b08e1702916"
+    },
+    {
+      "path": "impl/codex/approval_windows.go",
+      "bytes": 25772,
+      "sha256": "c49017bce9839a64d7ab9886e9ad1d3124713e5bc3db9d22985bb9bfcf658a3c"
+    },
+    {
+      "path": "impl/codex/approval_windows_test.go",
+      "bytes": 15370,
+      "sha256": "3062a587fbff67be5ab960114a8cee501e0518a72f5b3f7987ee5f283b8ed3a5"
+    },
+    {
+      "path": "impl/codex/files.go",
+      "bytes": 16682,
+      "sha256": "72b0f64bc45f5e15f6430bd67f31dedd826ca12d947b9542e4a96a6907b65f99"
+    },
+    {
+      "path": "impl/codex/fixture_test.go",
+      "bytes": 20264,
+      "sha256": "75f34c943fd3f56f11b927afcc6a28e868dbd90468a61f5b1816cee57dd96524"
+    },
+    {
+      "path": "impl/codex/local_finalization_windows.go",
+      "bytes": 17479,
+      "sha256": "cb651bbc3a98d23fb96267b6565572a5afc508bed508ef727edb9b463272d160"
+    },
+    {
+      "path": "impl/codex/main.go",
+      "bytes": 8227,
+      "sha256": "bfb86945220e496c7dabc7fd56e42802552b5141291836000b466f85b9709e00"
+    },
+    {
+      "path": "impl/codex/recovery_evidence_windows.go",
+      "bytes": 14693,
+      "sha256": "b4e8a4bfaae5e8cee140fe1db7244f59bc88659a28260fab3a3f07cf54ec8a61"
+    },
+    {
+      "path": "impl/codex/recovery_records_windows.go",
+      "bytes": 10003,
+      "sha256": "da8ccd471848cbde3bf215bd0c9cac0e14d2102f09d4da0e0a745a36ccf6c9c6"
+    },
+    {
+      "path": "impl/codex/rpc.go",
+      "bytes": 28426,
+      "sha256": "dd6f74c758ec41fb48f4cf238fd4524548c3a3e08732b261656fea5adba4cdc8"
+    },
+    {
+      "path": "impl/codex/store_digest.go",
+      "bytes": 2563,
+      "sha256": "9ee5d866791fcd9746c1bf1b9e2885c4116525aabc616dac69f6dc3682019059"
+    },
+    {
+      "path": "impl/codex/workflow.go",
+      "bytes": 27886,
+      "sha256": "0c71b6d5e3758b5d2e2d19e3655a991abf5195850095bca82cf75141beb8e3e9"
+    },
+    {
+      "path": "impl/codex/workflow_test.go",
+      "bytes": 17217,
+      "sha256": "2beb77b0a60267ecba8846ff2bc9c12cb1e6f97837d65e287325c706ed71fab7"
+    }
+  ],
+  "newProjectTests": 0,
+  "newEngineExecutions": 0,
+  "newSessions": 0,
+  "originalSourcesPreserved": true
+}

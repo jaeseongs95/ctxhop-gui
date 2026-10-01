@@ -117,8 +117,13 @@ func importArchive(o options) (result object, retErr error) {
 	if e = os.Mkdir(run, 0700); e != nil {
 		return nil, fail("run_exists", "작업 ID를 재사용할 수 없습니다")
 	}
+	createdRun, e := snapshotOpen(run, true)
+	if e != nil { return object{"pending": []string{o.Run}}, e }
+	createdRunID := snapshotFileID(createdRun.Info)
+	if e = createdRun.File.Close(); e != nil { return object{"pending": []string{o.Run}}, e }
 	j := &journal{Version: 4, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
 	if e = saveJournal(run, j, true); e != nil {
+		if removeNewEmptyRun(run, createdRunID) == nil { return object{"pending": []string{}}, e }
 		return object{"pending": []string{o.Run}}, e
 	}
 	var active *session
@@ -257,6 +262,7 @@ func importArchive(o options) (result object, retErr error) {
 			return nil, e
 		}
 	}
+	j.TerminalProof = obj(cloneJSON(active.Projection))
 	if e = active.Close(); e != nil {
 		return nil, e
 	}
@@ -288,6 +294,7 @@ func importArchive(o options) (result object, retErr error) {
 	if _, e = verifyOwned(o.Home, j, true); e != nil {
 		return nil, e
 	}
+	j.TerminalProof = obj(cloneJSON(active.Projection))
 	if e = active.Close(); e != nil {
 		return nil, e
 	}
@@ -328,7 +335,8 @@ func importArchive(o options) (result object, retErr error) {
 		if _, e = verifyOwned(o.Home, j, true); e != nil {
 			return nil, e
 		}
-		if e = active.Close(); e != nil {
+		j.TerminalProof = obj(cloneJSON(active.Projection))
+	if e = active.Close(); e != nil {
 			return nil, e
 		}
 		active = nil
@@ -437,6 +445,7 @@ func bootstrapIfNeeded(o options) error {
 	}
 	bootstrap := o
 	bootstrap.ApprovalEvidence = nil
+	bootstrap.RecoveryEvidence = nil
 	sesh, e := prepareEngine(bootstrap, "bootstrap", nil)
 	if e != nil {
 		return e
@@ -676,13 +685,12 @@ func referenceHistory(o options, f *family, run string, j *journal) (object, err
 	return r, nil
 }
 func rollback(o options) (result object, retErr error) {
-	if e := checkGuard(nil); e != nil {
-		return nil, e
-	}
 	j, e := loadJournal(o.Home, o.Run)
 	if e != nil {
 		return nil, e
 	}
+	if j.LocalFinalization != nil { return finalizeLocal(o.Home, o.Run) }
+	if e := checkGuard(nil); e != nil { return nil, e }
 	if j.Status == "rolled_back" {
 		return object{"status": "rolled_back", "run": o.Run, "pending": []string{}}, nil
 	}
@@ -719,8 +727,10 @@ func rollback(o options) (result object, retErr error) {
 	}
 	o.Cwd = j.Cwd
 	o.ApprovalEvidence = j.ApprovalEvidence
+	o.RecoveryEvidence = j.RecoveryEvidence
 	ms := currentMembers(o.Home, j)
-	s, e := prepareEngine(o, "rollback", ms)
+	s, recovered, e := prepareRecoveryEngine(o, j, ms)
+	o = recovered
 	if e != nil {
 		return object{"status": "needs_attention", "pending": []string{o.Run}}, e
 	}
@@ -913,6 +923,7 @@ func verifyAbsentAPI(o options, j *journal) error {
 	if e = s.Close(); e != nil {
 		return e
 	}
+	j.TerminalProof = obj(cloneJSON(s.Projection))
 	if e = checkGuard(nil); e != nil {
 		return e
 	}

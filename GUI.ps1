@@ -179,7 +179,7 @@ function Start-Job([hashtable]$Job) {
     foreach ($button in $script:Buttons) { $button.Enabled=$false }
     # 복원은 중간에 끊으면 복구 기록이 남고, 열기는 사용자가 대화를 끝내야 하므로 취소하지 않는다.
     # 저장소 옮기기도 복사 도중 멈추면 새 폴더에 일부 파일만 남으므로 취소하지 않는다.
-    $cancelButton.Enabled=($Job.action -notin @('Restore','Open','MoveStore','Rollback','CloseJournal'))
+    $cancelButton.Enabled=($Job.action -notin @('Restore','Open','MoveStore','Rollback','CloseJournal','FinalizeJournal'))
     $agent.Enabled=$false; $project.ReadOnly=$true; $identity.ReadOnly=$true
     $projectPicker.Enabled=$false; $desktopHome.ReadOnly=$true
     $progress.Style='Marquee'
@@ -299,7 +299,7 @@ function New-JournalDialog([object]$Journal) {
     foreach ($row in $rows) {
         $counts=Get-JournalCounts $row
         $item=[Windows.Forms.ListViewItem]::new($(if ($row.nativeId) {"$($row.agent) $($row.nativeId)"} else {T 'GuiJournalProjectRecord'}))
-        $state=[string]$row.state; if ($row.error) { $state+=" - $($row.error)" }
+        $state=[string]$row.state; if ($row.error) { $state+=" - $($row.error)" } elseif ($row.reasonCode) { $state+=' - '+(T 'GuiJournalNeedsReview') }
         foreach ($value in @((@($row.targets | Where-Object { $_ }) -join '; '),$state,(T 'GuiJournalCounts' $counts.original $counts.owned $counts.unknown $counts.unrestorable),[string]$row.path)) { $null=$item.SubItems.Add([string]$value) }
         # 닫힌 스크립트 블록은 이 스크립트의 함수를 찾지 못하므로 버튼 조건에 쓸 값을 미리 계산해 둔다.
         $item.Tag=[pscustomobject]@{row=$row;unknown=$counts.unknown}; $null=$list.Items.Add($item)
@@ -309,18 +309,20 @@ function New-JournalDialog([object]$Journal) {
     foreach ($spec in @(@('rollback',(T 'GuiJournalRollback'),170),@('unknown',(T 'GuiJournalRollbackUnknown'),250),@('open',(T 'GuiJournalOpenFolder'),140),@('resolve',(T 'GuiJournalResolve'),150))) {
         $button=New-Control Button $x 382 $spec[2] 38 $spec[1] $dialog; $button.Anchor='Bottom,Left'; $button.Enabled=$false
         $action=$spec[0]
-        $button.Add_Click({ $dialog.Tag=@{action=$action;row=$list.SelectedItems[0].Tag.row}; $dialog.DialogResult='OK' }.GetNewClosure())
+        $button.Add_Click({ $chosen=$list.SelectedItems[0].Tag.row; $picked=if ($action -ceq 'rollback' -and $chosen.canFinalizeLocal) {'finalize'} else {$action}; $dialog.Tag=@{action=$picked;row=$chosen}; $dialog.DialogResult='OK' }.GetNewClosure())
         $buttons[$action]=$button; $x+=$spec[2]+12
     }
     $close=New-Control Button 834 382 150 38 (T 'GuiJournalCloseWindow') $dialog; $close.DialogResult='Cancel'; $close.Anchor='Bottom,Right'
     $dialog.CancelButton=$close
-    # 버튼은 고른 행에 맞춰 켠다: 되돌리기는 canRollback, 알 수 없는 파일은 그런 파일이 있을 때, 해결했음은 항상.
+    # Select only actions supplied by the validated record classifier.
+    $rollbackLabel=T 'GuiJournalRollback'; $finalizeLabel=T 'GuiJournalFinalize'
     $list.Add_SelectedIndexChanged({
         $tag=if ($list.SelectedItems.Count) { $list.SelectedItems[0].Tag } else { $null }
-        $buttons.rollback.Enabled=$tag -and $tag.row.canRollback
+        $buttons.rollback.Enabled=$tag -and ($tag.row.canRollback -or $tag.row.canFinalizeLocal)
+        $buttons.rollback.Text=if ($tag -and $tag.row.canFinalizeLocal) {$finalizeLabel} else {$rollbackLabel}
         $buttons.unknown.Enabled=$tag -and $tag.row.canRollback -and $tag.unknown -gt 0
         $buttons.open.Enabled=$tag -and [bool]$tag.row.path
-        $buttons.resolve.Enabled=[bool]$tag
+        $buttons.resolve.Enabled=$tag -and [bool]$tag.row.canResolve
     }.GetNewClosure())
     return @{dialog=$dialog;list=$list;buttons=$buttons}
 }
@@ -343,6 +345,7 @@ function Show-JournalDialog([object]$Journal) {
             if (-not (Confirm ((T 'GuiJournalUnknownConfirm' $unknown.Count)+"`r`n`r`n"+$lines))) { return }
             $job.confirmedUnknown=@($unknown | ForEach-Object { @{target=[string]$_.target;current=[string]$_.current} })
         }
+        finalize { if (-not (Confirm (T 'GuiJournalFinalizeConfirm'))) { return }; $job.action='FinalizeJournal' }
         resolve {
             $remaining=@($row.files | Where-Object { $_ -and $_.class -ne 'original' }).Count
             if (-not (Confirm (T 'GuiJournalResolveConfirm' $remaining))) { return }
@@ -397,6 +400,7 @@ function Finish-Job {
             Journal { if (@($result.data.rows | Where-Object { $_ }).Count -or @($result.data.failed | Where-Object { $_ }).Count) { Show-JournalDialog $result.data } else { $status.Text=(T 'GuiJournalEmpty') } }
             Rollback { Start-Job (Base-Job 'Journal') }
             CloseJournal { Start-Job (Base-Job 'Journal') }
+            FinalizeJournal { Start-Job (Base-Job 'Journal') }
             Unbind { Load-Bindings }
             Status { $log.AppendText("$(T 'GuiStatusLog' $result.data.device $result.data.store $result.data.syncConfig)`r`n") }
             Backup {
@@ -762,7 +766,7 @@ function Stop-ProcessTree([int]$Id) {
 }
 $cancelButton=New-Button 900 591 148 (T 'GuiCancelJob') $form {
     $pending=$script:Pending
-    if (-not $pending -or $pending.job.action -in @('Restore','Open','MoveStore','Rollback','CloseJournal')) { return }
+    if (-not $pending -or $pending.job.action -in @('Restore','Open','MoveStore','Rollback','CloseJournal','FinalizeJournal')) { return }
     # 전체 백업은 처음 누르면 지금 대화를 마친 뒤 멈추고, 한 번 더 누르면 아래처럼 작업 창을 바로 끝낸다.
     if ($script:Bulk -and -not $script:Bulk.stop) { $script:Bulk.stop=$true; $status.Text=(T 'GuiBulkStopping'); return }
     if ($pending.job.action -ne 'List' -and -not (Confirm (T 'GuiCancelConfirm' $pending.job.action))) { return }

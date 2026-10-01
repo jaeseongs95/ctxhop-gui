@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "projectAcceptance": "NOT_COMPLETE",
+  "RustStage35": {
+    "head": "d8338a5cc55db06d2255986c33b9ce06841fe0d3",
+    "exitCode": 1,
+    "selected": 14,
+    "passed": 13,
+    "failed": 1,
+    "skipped": 1099,
+    "failedTest": "source_matches_canonical_fork_and_legacy_ghost_rules_without_promoting_copied_owner",
+    "failure": "source canonical record invalid",
+    "historyCoverage": "PASS",
+    "nativeInventory": "NOT_SELECTED",
+    "strictIndex": "NOT_SELECTED",
+    "rawLogSha256": "8ffd1f9c3e633421fce3e2db94b1a1d0f2424ccf396fa57196635129b515222c"
+  },
+  "GoRecoveryDraft": {
+    "compile": 0,
+    "test": 0,
+    "vet": 0,
+    "build": 0
+  },
+  "PowerShellDirty6": {
+    "PS7_AST_errors": 0,
+    "PS51_AST": "NOT_RUN",
+    "behavior": "NOT_RUN"
+  },
+  "DebugGuard": {
+    "reportedBuilds": 2,
+    "reportedPureCases": 48,
+    "reportedPrepareCases": 12,
+    "actualTargetExecutions": 0,
+    "freshIndependentRecheck": "PENDING"
+  },
+  "NormalCompatibilityProducer": "NOT_RUN",
+  "FinalIndependentAudit": "NOT_RUN"
+}

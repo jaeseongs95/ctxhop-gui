@@ -188,6 +188,8 @@ func within(root, p string) bool {
 type options struct {
 	Home, Archive, Cwd, Token, Run, Engine, NormalEngine string
 	ApprovalEvidence                                     *approvalDescriptor
+	RecoveryEvidence                                     *recoveryDescriptor
+	RecordSHA256                                         string
 }
 
 func cli(args []string) (object, error) {
@@ -204,10 +206,25 @@ func cli(args []string) (object, error) {
 	f.StringVar(&o.Run, "run", "", "")
 	f.StringVar(&o.Engine, "engine", "", "")
 	f.StringVar(&o.NormalEngine, "normal-engine", "", "")
+	f.StringVar(&o.RecordSHA256, "sha256", "", "")
 	if e := f.Parse(args[1:]); e != nil || f.NArg() != 0 {
 		return nil, fail("arguments", "잘못된 명령 인자")
 	}
 	var e error
+	if args[0] == "recovery-list" || args[0] == "recovery-status" || args[0] == "recovery-resolve" || args[0] == "finalize" {
+		allowed := map[string]bool{"home": true}
+		if args[0] != "recovery-list" { allowed["run"] = true }
+		if args[0] == "recovery-resolve" { allowed["sha256"] = true }
+		bad := false; f.Visit(func(v *flag.Flag) { if !allowed[v.Name] { bad = true } })
+		if bad || !filepath.IsAbs(o.Home) || args[0] != "recovery-list" && !opRE.MatchString(o.Run) || args[0] == "recovery-resolve" && !hashRE.MatchString(o.RecordSHA256) { return nil, fail("arguments", "복구 명령 인자 오류") }
+		o.Home = filepath.Clean(o.Home)
+		switch args[0] {
+		case "recovery-list": rows, e := recoveryRecords(o.Home); return object{"records": rows}, e
+		case "recovery-status": row, e := classifyRecoveryRecord(o.Home, o.Run); return object{"record": row}, e
+		case "recovery-resolve": row, e := recoveryResolve(o.Home, o.Run, o.RecordSHA256); return object{"record": row}, e
+		case "finalize": if _, e := finalizeLocal(o.Home, o.Run); e != nil { return nil, e }; row, e := classifyRecoveryRecord(o.Home, o.Run); return object{"record": row}, e
+		}
+	}
 	o.Home, e = absolute(o.Home)
 	if e != nil {
 		return nil, e

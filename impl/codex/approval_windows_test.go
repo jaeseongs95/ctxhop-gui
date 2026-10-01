@@ -217,8 +217,8 @@ func TestApprovalWireAndFrameBounds(t *testing.T) {
 	o, f, _ := approvalFixture(t)
 	descriptors := []any{object{"id": rootID, "parentId": nil, "role": "root", "rolloutPath": nil, "rolloutSha256": nil}}
 	r, e := prepareRequest(o, "rollback", "n", descriptors)
-	if e != nil || len(r) != 8 {
-		t.Fatal("prepare exact8", e)
+	if e != nil || len(r) != 9 {
+		t.Fatal("prepare exact9", e)
 	}
 	missing := o
 	missing.ApprovalEvidence = nil

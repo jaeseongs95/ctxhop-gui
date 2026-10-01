@@ -217,6 +217,9 @@ type journal struct {
 	ReferenceApprovalEvidence  *approvalDescriptor `json:"referenceApprovalEvidence,omitempty"`
 	ReferenceApprovalOwnership *approvalOwnership  `json:"referenceApprovalOwnership,omitempty"`
 	CleanupStatus              string              `json:"cleanupStatus,omitempty"`
+	RecoveryEvidence           *recoveryDescriptor `json:"recoveryEvidence"`
+	LocalFinalization          *localFinalization  `json:"localFinalization"`
+	TerminalProof              object              `json:"-"`
 }
 
 func runPath(home, run string) string { return filepath.Join(home, ".ctxhop-desktop-recovery", run) }
@@ -225,6 +228,8 @@ func saveJournal(run string, j *journal, initial bool) error {
 	if j.Version == 3 {
 		v, _ := parseJSON(encoded(j))
 		r := obj(v)
+		delete(r, "recoveryEvidence")
+		delete(r, "localFinalization")
 		ms := []any{}
 		for _, m := range j.Members {
 			ms = append(ms, object{"id": m.ID, "parent": m.Parent, "path": m.Path, "size": m.Size, "sha256": m.SHA256})
@@ -254,15 +259,18 @@ func saveJournal(run string, j *journal, initial bool) error {
 	return moveFile(tmp, filepath.Join(run, "journal.json"), !initial)
 }
 func loadJournal(home, run string) (*journal, error) {
-	p := runPath(home, run)
-	b, e := readBounded(filepath.Join(p, "journal.json"), 4<<20)
-	if e != nil {
+	row, lease, e := pinRecoveryRecord(home, run, false)
+	if lease == nil { return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다") }
+	b := append([]byte(nil), lease.Bytes...)
+	e = errors.Join(e, lease.Close())
+	if e != nil || row.NativeID == nil || filepath.Base(row.Path) != "journal.json" {
 		return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다")
 	}
 	j, e := decodeJournal(home, b)
 	if e == nil && j.ApprovalEvidence != nil && !samePath(j.ApprovalEvidence.ManifestPath, approvalPath(options{Home: home, Run: run})) {
 		return nil, fail("unsupported_record", "복구 기록의 승인 operation 경로 오류")
 	}
+	if e == nil && j.RecoveryEvidence != nil && !samePath(j.RecoveryEvidence.ManifestPath, recoveryPath(options{Home: home, Run: run})) { return nil, fail("unsupported_record", "복구 evidence operation 경로 오류") }
 	return j, e
 }
 func decodeJournal(home string, b []byte) (*journal, error) {
@@ -298,6 +306,14 @@ func decodeJournal(home string, b []byte) (*journal, error) {
 	}
 	if e := validateJournalApproval(&j, b); e != nil {
 		return nil, e
+	}
+	v, _ := parseJSON(b)
+	r := obj(v)
+	if j.RecoveryEvidence != nil {
+		if j.Version != 4 || !exact(obj(r["recoveryEvidence"]), "profile", "manifestPath", "manifestSha256") || !recoveryDescriptorValid(j.RecoveryEvidence, options{Home: home, Run: filepath.Base(filepath.Dir(filepath.Dir(j.RecoveryEvidence.ManifestPath)))}) { return nil, fail("unsupported_record", "복구 descriptor 계약 오류") }
+	}
+	if j.LocalFinalization != nil {
+		if j.Version != 4 || !exact(obj(r["localFinalization"]), "state", "receiptPath", "receiptSha256", "receiptDigest", "terminalStatus", "terminalProof", "absenceKind", "retainedKinds") { return nil, fail("unsupported_record", "최종 정리 journal 키 오류") }
 	}
 	return &j, nil
 }
@@ -429,77 +445,16 @@ func verifyOwned(home string, j *journal, first bool) (homeScan, error) {
 	return s, nil
 }
 func pendingRuns(home string) ([]string, error) {
-	root := filepath.Join(home, ".ctxhop-desktop-recovery")
-	if e := checkTree(root); e != nil {
-		return nil, e
-	}
-	entries, e := os.ReadDir(root)
-	if os.IsNotExist(e) {
-		return []string{}, nil
-	}
-	if e != nil {
-		return nil, e
-	}
-	out := []string{}
-	for _, d := range entries {
-		if !d.IsDir() {
-			continue
-		}
-		if !opRE.MatchString(d.Name()) {
-			return nil, fail("pending_record", "복구 작업 폴더 이름 불명")
-		}
-		run := filepath.Join(root, d.Name())
-		live, resolved := filepath.Join(run, "journal.json"), filepath.Join(run, "journal.resolved.json")
-		present := []string{}
-		for _, path := range []string{live, resolved} {
-			if _, e := os.Lstat(path); e == nil {
-				present = append(present, path)
-			} else if !os.IsNotExist(e) {
-				return nil, fail("pending_record", "복구 기록 이름 확인 실패")
-			}
-		}
-		if len(present) != 1 {
-			return nil, fail("pending_record", "단일 복구 기록 누락/중복")
-		}
-		closed := present[0] == resolved
-		b, e := readRecoveryRecord(present[0], !closed)
-		if e != nil {
-			return nil, fail("pending_record", "읽을 수 없는 복구 기록")
-		}
-		if closed {
-			// GUI resolve is an explicit user closure, including corrupt JSON.
-			// Preserve its bounded regular file; its contents grant no authority.
-			continue
-		}
-		v, e := parseJSON(b)
-		if e != nil {
-			return nil, fail("pending_record", "복구 기록 JSON 오류")
-		}
-		record := obj(v)
-		if !samePath(text(record["home"]), home) || !uuidRE.MatchString(text(record["id"])) {
-			return nil, fail("pending_record", "복구 기록 home/id 결속 오류")
-		}
-		if record["impl"] == "ctxhop-codex" {
-			if _, e := decodeJournal(home, b); e != nil {
-				return nil, fail("pending_record", "Go 복구 기록 계약 오류")
-			}
-		} else if record["impl"] != nil {
-			return nil, fail("pending_record", "알 수 없는 복구 구현")
-		} else if record["version"] != nil {
-			version, ok := integer(record["version"])
-			if !ok || version != 2 || len(array(record["members"])) == 0 {
-				return nil, fail("pending_record", "기존 복구 기록 형식 불명")
-			}
-		}
-		switch record["status"] {
-		case "pending":
-			out = append(out, d.Name())
-		case "complete", "rolled_back":
-		default:
-			return nil, fail("pending_record", "복구 기록 상태 불명")
-		}
-	}
-	return out, nil
+ rows, e := recoveryRecords(home)
+ if e != nil { return nil, e }
+ out := []string{}
+ for _, row := range rows {
+  if !row.BlocksImport { continue }
+  if row.State != "pending" && row.State != "cleanup_pending" { return nil, fail("pending_record", "복구 기록을 안전하게 분류할 수 없습니다") }
+  if row.RecordID == nil { return nil, fail("pending_record", "복구 ID 불명") }
+  out = append(out, *row.RecordID)
+ }
+ return out, nil
 }
 
 func readRecoveryRecord(path string, contents bool) (b []byte, retErr error) {
