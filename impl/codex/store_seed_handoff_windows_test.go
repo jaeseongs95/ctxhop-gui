@@ -24,6 +24,11 @@ var storeSeedOutput = flag.String("ctxhop-store-seed-output", "", "new runner-ow
 var storeSeedReader = flag.String("ctxhop-store-seed-reader", "", "pinned Rust libtest executable; fixture only")
 var storeSeedReaderSHA = flag.String("ctxhop-store-seed-reader-sha256", "", "reviewed Rust executable SHA256")
 var storeSeedReaderCwd = flag.String("ctxhop-store-seed-reader-cwd", "", "reviewed Rust libtest working directory")
+var storeSeedCancelPoint = flag.String("ctxhop-store-seed-cancel-point", "", "fixture-only expected reader cancellation point")
+
+func validSeedCancelPoint(point string) bool {
+	return point == "afterReaders" || point == "duringDrain" || point == "beforeReceipt"
+}
 
 func validateSeedHandoffOutput(path string) error {
 	base := `D:\Go\codex-s4`
@@ -50,7 +55,7 @@ func runSeedJob(image, dir string, env, args []string, timeout time.Duration) (r
 	if e != nil {
 		return nil, true, e // the suspended-launch helper has drained its failed launch
 	}
-	receipt = object{"pid": int64(p.PID), "creationTime": fmt.Sprint(p.Created), "image": p.Image, "jobActiveProcesses": nil, "exitCode": nil, "handlesClosed": false}
+	receipt = object{"pid": int64(p.PID), "creationTime": fmt.Sprint(p.Created), "image": p.Image, "jobActiveProcesses": nil, "exitCode": nil, "handlesClosed": false, "transportVerified": false}
 	defer func() {
 		// KILL_ON_JOB_CLOSE is a cancellation attempt, never proof of drain.
 		if !p.closed {
@@ -95,9 +100,6 @@ func runSeedJob(image, dir string, env, args []string, timeout time.Duration) (r
 		if active == 0 && exit != 259 {
 			drained = true
 			receipt["jobActiveProcesses"], receipt["exitCode"] = int64(active), int64(exit)
-			if exit != 0 {
-				retErr = errors.Join(retErr, fmt.Errorf("reader exit %d", exit))
-			}
 			if collected == 2 {
 				break
 			}
@@ -119,11 +121,20 @@ func runSeedJob(image, dir string, env, args []string, timeout time.Duration) (r
 	closeErr := errors.Join(p.Out.Close(), p.Err.Close(), syscall.CloseHandle(p.handle), syscall.CloseHandle(p.job))
 	p.closed = true
 	receipt["handlesClosed"] = closeErr == nil
-	return receipt, drained, errors.Join(retErr, closeErr)
+	receipt["transportVerified"] = retErr == nil && closeErr == nil
+	var exitErr error
+	if exit, ok := receipt["exitCode"].(int64); !ok || exit != 0 {
+		exitErr = fmt.Errorf("reader exit %v", receipt["exitCode"])
+	}
+	return receipt, drained, errors.Join(retErr, closeErr, exitErr)
 }
 
 func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained bool, retErr error) {
 	drained = true // no external process exists until the direct owned launch below
+	point := *storeSeedCancelPoint
+	if point != "" && !validSeedCancelPoint(point) {
+		return drained, fmt.Errorf("unknown fixture cancellation point")
+	}
 	if !filepath.IsAbs(*storeSeedReader) || !strings.HasPrefix(strings.ToLower(filepath.Clean(*storeSeedReader)), `d:\go\codex-s4\`) || !hashRE.MatchString(*storeSeedReaderSHA) {
 		return drained, fmt.Errorf("fixture reader path/hash pin required")
 	}
@@ -154,6 +165,7 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 		return drained, e
 	}
 	ownership := object{"schemaVersion": int64(2), "ownerSessionId": seedAcquisitionOwner, "runNonce": nonce(), "acquisitionId": s.ID, "storeObservationDigest": observationDigest, "handoffSha256": digest(manifestBytes), "readerSha256": actual, "storeObservation": observation, "storeProof": proof, "mappingAuthority": "syntheticFixtureOnly", "sourceLeasesHeld": true}
+	ownership["expectedCancellationPoint"] = point
 	if e := createFile(filepath.Join(*storeSeedOutput, "go-ownership-receipt.json"), append(encoded(ownership), '\n')); e != nil {
 		return drained, e
 	}
@@ -165,6 +177,9 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 		}
 	}
 	env = append(env, "CTXHOP_S4_SCHEMA_HANDOFF_PATH="+manifestPath, "CTXHOP_S4_SCHEMA_HANDOFF_SHA256="+digest(manifestBytes), "RUST_TEST_THREADS=1")
+	if point != "" {
+		env = append(env, "CTXHOP_S4_SCHEMA_CANCEL_POINT="+point)
+	}
 	cwd := *storeSeedReaderCwd
 	if !filepath.IsAbs(cwd) || !strings.HasPrefix(strings.ToLower(filepath.Clean(cwd)), `d:\go\codex-s4\`) {
 		return drained, fmt.Errorf("reviewed Rust fixture working directory required")
@@ -174,8 +189,31 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 		jobReceipt["workingDirectory"] = cwd
 	}
 	writeErr := createFile(filepath.Join(*storeSeedOutput, "go-reader-job-receipt.json"), append(encoded(jobReceipt), '\n'))
-	if runErr != nil || writeErr != nil || !drained {
+	if writeErr != nil || !drained || jobReceipt["transportVerified"] != true {
 		return drained, errors.Join(runErr, writeErr, fmt.Errorf("whole reader Job must drain before source release"))
+	}
+	if point != "" {
+		if runErr == nil || jobReceipt["exitCode"] == int64(0) {
+			return drained, fmt.Errorf("expected cancellation must fail the reader process")
+		}
+		if e := snapshotAbsent(filepath.Join(*storeSeedOutput, "rust-schema-receipt.json")); e != nil {
+			return drained, fmt.Errorf("canceled reader emitted a success receipt: %w", e)
+		}
+		b, e := readBounded(filepath.Join(*storeSeedOutput, "rust-schema-negative-receipt.json"), 1<<20)
+		if e != nil {
+			return drained, e
+		}
+		v, e := parseJSON(b)
+		if e != nil {
+			return drained, e
+		}
+		if e := validateSeedCancelReceipt(obj(v), s.ID, observationDigest, digest(manifestBytes), point); e != nil {
+			return drained, e
+		}
+		return drained, s.Verify()
+	}
+	if runErr != nil {
+		return drained, runErr
 	}
 	b, e := readBounded(filepath.Join(*storeSeedOutput, "rust-schema-receipt.json"), 1<<20)
 	if e != nil {
@@ -207,6 +245,19 @@ func validateSeedSchemaReceipt(receipt object, acquisitionID, observationDigest,
 		}
 	}
 	return nil
+}
+
+func validateSeedCancelReceipt(receipt object, acquisitionID, observationDigest, handoffDigest, point string) error {
+	if !validSeedCancelPoint(point) || !exact(receipt, "schemaVersion", "schemaSha256", "acquisitionId", "observationDigest", "verifiedKinds", "readersDrained", "sidecarVerified", "nativeClosed", "originalSQLiteOpens", "ownerSessionId", "readerSessionId", "handoffSha256", "outcome", "cancelPoint", "reason", "completedProof") || receipt["outcome"] != "canceled" || receipt["cancelPoint"] != point || receipt["reason"] != "storeReadCancelled" || receipt["completedProof"] != false {
+		return fmt.Errorf("expected cancellation receipt mismatch")
+	}
+	common := object{}
+	for key, value := range receipt {
+		if key != "outcome" && key != "cancelPoint" && key != "reason" && key != "completedProof" {
+			common[key] = value
+		}
+	}
+	return validateSeedSchemaReceipt(common, acquisitionID, observationDigest, handoffDigest)
 }
 
 func TestStoreSeedReaderJobChild(t *testing.T) {
@@ -247,6 +298,9 @@ func TestStoreSeedReaderJob(t *testing.T) {
 			if !drained || receipt["jobActiveProcesses"] != int64(0) || receipt["handlesClosed"] != true || (e == nil) != (mode == "success") {
 				t.Fatal("Job drain/result mismatch", mode, drained, e)
 			}
+			if receipt["transportVerified"] != (mode == "success" || mode == "failure") {
+				t.Fatal("reader nonzero exit must be distinct from monitor cancellation/overflow")
+			}
 			if mode == "descendant" && (receipt["exitCode"] != int64(0) || !strings.Contains(text(receipt["stdout"]), "owned descendant started")) {
 				t.Fatal("parent must exit successfully while its owned descendant still requires Job cancellation")
 			}
@@ -254,20 +308,25 @@ func TestStoreSeedReaderJob(t *testing.T) {
 	}
 }
 
-func TestStoreSeedSchemaReceipt(t *testing.T) {
+func seedSchemaReceiptFixture(t *testing.T) object {
+	t.Helper()
 	kinds := []any{}
 	for _, spec := range storeSpecs {
 		kinds = append(kinds, spec.Kind)
 	}
 	valid := object{"schemaVersion": int64(2), "schemaSha256": seedSchemaSHA, "acquisitionId": "owned-acquisition", "observationDigest": strings.Repeat("a", 64), "verifiedKinds": kinds, "readersDrained": true, "sidecarVerified": true, "nativeClosed": true, "originalSQLiteOpens": int64(0), "ownerSessionId": seedAcquisitionOwner, "readerSessionId": "01a0f1ed-e575-7123-9c78-be9aa4802005", "handoffSha256": strings.Repeat("b", 64)}
-	check := func(receipt object) error {
-		return validateSeedSchemaReceipt(receipt, "owned-acquisition", strings.Repeat("a", 64), strings.Repeat("b", 64))
-	}
 	wire, e := parseJSON(encoded(valid))
 	if e != nil {
 		t.Fatal(e)
 	}
-	valid = obj(wire) // validate the same exact JSON integer representation as the reader response
+	return obj(wire) // same exact JSON integer representation as the reader response
+}
+
+func TestStoreSeedSchemaReceipt(t *testing.T) {
+	valid := seedSchemaReceiptFixture(t)
+	check := func(receipt object) error {
+		return validateSeedSchemaReceipt(receipt, "owned-acquisition", strings.Repeat("a", 64), strings.Repeat("b", 64))
+	}
 	if e := check(valid); e != nil {
 		t.Fatal(e)
 	}
@@ -283,5 +342,34 @@ func TestStoreSeedSchemaReceipt(t *testing.T) {
 				t.Fatal("uncertain or unbound reader receipt accepted")
 			}
 		})
+	}
+}
+
+func TestStoreSeedCancelReceipt(t *testing.T) {
+	for _, point := range []string{"afterReaders", "duringDrain", "beforeReceipt"} {
+		t.Run(point, func(t *testing.T) {
+			valid := seedSchemaReceiptFixture(t)
+			valid["outcome"], valid["cancelPoint"], valid["reason"], valid["completedProof"] = "canceled", point, "storeReadCancelled", false
+			check := func(receipt object) error {
+				return validateSeedCancelReceipt(receipt, "owned-acquisition", strings.Repeat("a", 64), strings.Repeat("b", 64), point)
+			}
+			if e := check(valid); e != nil {
+				t.Fatal(e)
+			}
+			for _, field := range []string{"outcome", "cancelPoint", "reason", "completedProof", "readersDrained", "nativeClosed", "verifiedKinds", "handoffSha256"} {
+				changed := obj(clone(valid))
+				changed[field] = nil
+				if e := check(changed); e == nil {
+					t.Fatal("cancellation receipt with missing binding/drain accepted", field)
+				}
+			}
+			valid["completedProof"] = true
+			if e := check(valid); e == nil {
+				t.Fatal("cancellation must not certify a completed proof")
+			}
+		})
+	}
+	if e := validateSeedCancelReceipt(seedSchemaReceiptFixture(t), "owned-acquisition", strings.Repeat("a", 64), strings.Repeat("b", 64), "unknown"); e == nil {
+		t.Fatal("unknown cancellation point accepted")
 	}
 }

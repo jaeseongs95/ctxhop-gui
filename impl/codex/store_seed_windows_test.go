@@ -88,9 +88,13 @@ func TestStoreCanonicalSeedPrivateProof(t *testing.T) {
 		t.Fatal("fresh source vector after cleanup/release", e)
 	}
 	if *storeSeedReader != "" {
-		if e := createFile(filepath.Join(*storeSeedOutput, "go-release-receipt.json"), append(encoded(object{"schemaVersion": int64(2), "ownerSessionId": seedAcquisitionOwner, "acquisitionId": s.ID, "wholePrivateVerified": true, "privateRemoved": s.PrivateRemoved, "sourceLeasesReleased": s.Closed, "releasedSourcesFresh": true, "originalSQLiteOpens": int64(0), "productionAdmission": "notRun"}), '\n')); e != nil {
+		if e := createFile(filepath.Join(*storeSeedOutput, "go-release-receipt.json"), append(encoded(object{"schemaVersion": int64(2), "ownerSessionId": seedAcquisitionOwner, "acquisitionId": s.ID, "wholePrivateVerified": true, "privateRemoved": s.PrivateRemoved, "sourceLeasesReleased": s.Closed, "releasedSourcesFresh": true, "expectedCancellationPoint": *storeSeedCancelPoint, "completedProof": false, "originalSQLiteOpens": int64(0), "productionAdmission": "notRun"}), '\n')); e != nil {
 			t.Fatal("release/freshness receipt", e)
 		}
 	}
-	t.Log("canonical seed51 actual8 bytes -> fresh private readonly schema/typed proof; all reader drains and whole cleanup/freshness passed; original SQLite opens=0, protected engine executions=0; synthetic M-R-Q only, no production admission/approval")
+	if *storeSeedCancelPoint != "" {
+		t.Log("fixture token cancellation", *storeSeedCancelPoint, "; Rust success proof absent; whole Job/reader drain and owned cleanup/release freshness passed; original SQLite opens=0; no production callerDrop/OS cancellation/admission claim")
+	} else {
+		t.Log("canonical seed51 actual8 bytes -> fresh private readonly schema/typed proof; all reader drains and whole cleanup/freshness passed; original SQLite opens=0, protected engine executions=0; synthetic M-R-Q only, no production admission/approval")
+	}
 }
