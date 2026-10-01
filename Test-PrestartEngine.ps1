@@ -759,9 +759,9 @@ function Assert-SeedOwner([object]$Owner,[object]$Manifest,[string]$Hash) {
     if ($Owner.schemaVersion -ne 2 -or $Owner.seedId -cne $Manifest.seedId -or $Owner.manifestSha256 -cne $Hash) { throw 'seedOwnerBinding' }
 }
 function Get-SeedNamespaceVector([object]$Manifest,[string]$Stage,[Collections.Generic.List[object]]$DirectoryLeases) {
-    $root=Assert-SeedReadPath $Manifest.seedRoot; $home=Assert-SeedReadPath $Manifest.sqliteHome
+    $root=Assert-SeedReadPath $Manifest.seedRoot; $sqliteDirectory=Assert-SeedReadPath $Manifest.sqliteHome
     $ids=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($directory in @($root,$home,(Join-Path $root 'receipts'))) {
+    foreach ($directory in @($root,$sqliteDirectory,(Join-Path $root 'receipts'))) {
         $handle=[CtxhopSeedNativeV2]::OpenDirectory($directory); $DirectoryLeases.Add($handle)
         $info=[CtxhopSeedNativeV2]::Read($handle)
         if (-not ($info.Attributes -band 0x10) -or ($info.Attributes -band 0x400) -or -not $ids.Add($info.Identity) -or -not [string]::Equals($info.Path,$directory,[StringComparison]::OrdinalIgnoreCase)) { throw 'seedDirectoryIdentity' }
