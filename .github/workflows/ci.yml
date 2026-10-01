@@ -56,4 +56,6 @@ jobs:
           } finally { Pop-Location }
       - name: Preparation runner self-checks (no vendor engine)
         shell: pwsh
-        run: .\Test-PrestartEngine.ps1 -Mode SelfTest -OutRoot 'D:\Go\codex-s4\helper3-r45-fixture-ci-selftest'
+        run: |
+          $workspace = Join-Path ([IO.Path]::GetTempPath()) ('ctxhop-prestart-' + [guid]::NewGuid().ToString('N'))
+          .\Test-PrestartEngine.ps1 -Mode SelfTest -FixtureWorkspace $workspace
