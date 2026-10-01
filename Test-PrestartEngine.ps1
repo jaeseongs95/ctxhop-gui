@@ -31,7 +31,7 @@ $script:FixtureChecks=0
 $script:Utf8=[Text.UTF8Encoding]::new($false)
 # Filled only in a new reviewed source commit after the coordinator reads the
 # actual CRLF artifacts/provenance and freezes the full launch manifest bytes.
-$script:ApprovedSeedManifestSha256='ac4e0b763c5ad54bf83b8e4519751acbf05912eb8f38fec9ef046ea2e1084da6'
+$script:ApprovedSeedManifestSha256=$null
 function Assert-Fixture([bool]$Value,[string]$Message) {
     $script:FixtureChecks++
     if (-not $Value) { throw "fixtureAssertion:$Message" }
@@ -537,7 +537,7 @@ function Assert-SeedManifest([object]$Manifest) {
     Assert-SeedKeys $Manifest @('schemaVersion','seedId','seedRoot','sqliteHome','stateReceipt','boardReceipt','build','artifacts','expectedMigrations')
     Assert-SeedInteger $Manifest.schemaVersion
     Assert-SeedHex $Manifest.seedId 32
-    if ($Manifest.schemaVersion -ne 2 -or $Manifest.seedId -cne 'd3d102401ab44b1ea0e382a38196ae24') { throw 'seedNamespaceBinding' }
+    if ($Manifest.schemaVersion -ne 2 -or $Manifest.seedId -cne '51c980db2f43438eb1a8ca838045fae2') { throw 'seedNamespaceBinding' }
     $root='D:\Go\codex-s4\schema-seeds\'+$Manifest.seedId
     foreach ($pair in @(@('seedRoot',$root),@('sqliteHome',($root+'\sqlite')),@('stateReceipt',($root+'\receipts\state-seed.json')),@('boardReceipt',($root+'\receipts\board-seed.json')))) {
         if (-not [string]::Equals((Assert-SeedReadPath $Manifest[$pair[0]]),$pair[1],[StringComparison]::OrdinalIgnoreCase)) { throw 'seedNamespaceBinding' }
@@ -887,11 +887,11 @@ function Invoke-AggregateSeedChecks([string]$Root) {
     [IO.Directory]::CreateDirectory($path) | Out-Null
     # Synthetic JSON only: these format-valid hashes/inventories are never seed
     # provenance, actual SQLite schema, or eligible executable launch pins.
-    $seedRoot='D:\Go\codex-s4\schema-seeds\d3d102401ab44b1ea0e382a38196ae24'
+    $seedRoot='D:\Go\codex-s4\schema-seeds\51c980db2f43438eb1a8ca838045fae2'
     $kinds=@('state','logs','goals','memories','memoriesV2','queue','threadHistory'); $counts=@(58,2,2,2,2,2,7)
     $expected=@()
     for ($i=0;$i -lt 7;$i++) { $versions=@(); for ($j=1;$j -le $counts[$i];$j++) { $versions+=@{version=$j;checksumHex=('1'*96)} }; $expected+=@{kind=$kinds[$i];versions=$versions} }
-    $manifest=@{schemaVersion=2;seedId='d3d102401ab44b1ea0e382a38196ae24';seedRoot=$seedRoot;sqliteHome=($seedRoot+'\sqlite');stateReceipt=($seedRoot+'\receipts\state-seed.json');boardReceipt=($seedRoot+'\receipts\board-seed.json');expectedMigrations=$expected
+    $manifest=@{schemaVersion=2;seedId='51c980db2f43438eb1a8ca838045fae2';seedRoot=$seedRoot;sqliteHome=($seedRoot+'\sqlite');stateReceipt=($seedRoot+'\receipts\state-seed.json');boardReceipt=($seedRoot+'\receipts\board-seed.json');expectedMigrations=$expected
         build=@{sourceCommit=('a'*40);lfSourceArchiveSha256=('a'*64);migrationLineEndings='CRLF';migrationInventorySha256=('b'*64);cargoLockSha256=('c'*64);builderSha256='2e3ef406f69088ea70fff5ebd3a7c374eff46568ce052cc7e6f95e8a50586ab8';normalEngineSha256='cbafb6422bca005b94c12d105b1a16a0474219e24ea4893f85846409c464f5a1';rustVersion='1.95.0';target='x86_64-pc-windows-msvc'}
         artifacts=@{state=@{path='D:\Go\codex-s4\synthetic-contract-artifacts\state.exe';sha256=('a'*64);receiptPath='D:\Go\codex-s4\synthetic-contract-artifacts\state.json';receiptSha256=('b'*64)};agentMessageBoard=@{path='D:\Go\codex-s4\synthetic-contract-artifacts\board.exe';sha256=('c'*64);receiptPath='D:\Go\codex-s4\synthetic-contract-artifacts\board.json';receiptSha256=('d'*64)}}}
     Assert-SeedManifest (ConvertFrom-SeedJson (ConvertTo-Json $manifest -Depth 30 -Compress))
