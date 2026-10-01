@@ -375,9 +375,13 @@ func (s *storeAcquisition) Observation() (object, error) {
 		}
 		stores = append(stores, object{"kind": slot.Kind, "dbPath": slot.Data.Source, "present": slot.Present, "acquisition": acquisition})
 	}
-	return object{"schemaVersion": 2, "acquisitionId": s.ID,
+	observation := object{"schemaVersion": 2, "acquisitionId": s.ID,
 		"sourceRoot":  object{"directory": s.SourceRoot, "directoryIdentity": snapshotFileID(s.SourceDir)},
-		"privateRoot": object{"directory": s.PrivateRoot, "directoryIdentity": snapshotFileID(s.PrivateDir)}, "stores": stores}, nil
+		"privateRoot": object{"directory": s.PrivateRoot, "directoryIdentity": snapshotFileID(s.PrivateDir)}, "stores": stores}
+	if _, e := validateStoreObservationV2(observation, s.SourceRoot, s.targets); e != nil {
+		return nil, e
+	}
+	return observation, nil
 }
 
 func (s *storeAcquisition) CleanupPrivate() error {
