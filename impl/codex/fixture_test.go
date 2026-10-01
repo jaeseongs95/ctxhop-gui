@@ -112,6 +112,52 @@ func assertCode(t *testing.T, e error, code string) {
 	}
 }
 
+func TestArchiveCanonicalSessionID(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		present bool
+		value   any
+		valid   bool
+	}{
+		{"legacy-missing", false, nil, true},
+		{"explicit-self", true, childID, true},
+		{"explicit-parent", true, rootID, true},
+		{"null", true, nil, false},
+		{"empty", true, "", false},
+		{"integer", true, num(1), false},
+		{"bool", true, false, false},
+		{"object", true, object{}, false},
+		{"malformed", true, "not-a-session", false},
+		{"foreign-root", true, otherID, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := fixtureFamily("legacy")
+			m := &f.Members[1]
+			if test.present {
+				m.Header["session_id"] = test.value
+			} else {
+				delete(m.Header, "session_id")
+			}
+			m.Raw = nil
+			for _, record := range m.Records {
+				m.Raw = append(m.Raw, append(encoded(record), '\n')...)
+			}
+			m.Size, m.SHA256 = int64(len(m.Raw)), digest(m.Raw)
+			loaded, e := readArchive(writeArchiveFixture(t, f, 2, nil))
+			if !test.valid {
+				assertCode(t, e, "archive_rollout")
+				return
+			}
+			if e != nil || !bytes.Equal(loaded.Members[1].Raw, m.Raw) || loaded.Members[1].SHA256 != m.SHA256 {
+				t.Fatal("canonical fallback must preserve original bytes/hash", e)
+			}
+			if _, exists := loaded.Members[1].Header["session_id"]; exists != test.present {
+				t.Fatal("canonical root decoding must not rewrite archive metadata")
+			}
+		})
+	}
+}
+
 func TestArchiveAndSupport(t *testing.T) {
 	for _, format := range []int{1, 2} {
 		t.Run(fmt.Sprint(format), func(t *testing.T) {

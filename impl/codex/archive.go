@@ -113,8 +113,11 @@ func records(raw []byte, id string, parents []string) ([]object, error) {
 	if text(result[0]["type"]) != "session_meta" || text(h["id"]) != id {
 		return nil, fail("archive_rollout", "세션 헤더 ID 오류")
 	}
-	session := text(h["session_id"])
-	if session != "" && session != id {
+	session, e := canonicalRolloutSessionID(h)
+	if e != nil {
+		return nil, e
+	}
+	if session != id {
 		found := false
 		for _, p := range parents {
 			found = found || session == p
@@ -124,6 +127,20 @@ func records(raw []byte, id string, parents []string) ([]object, error) {
 		}
 	}
 	return result, nil
+}
+
+// SessionMetaLine's canonical decoder supplies id only when session_id is
+// absent. Keep original archive bytes/header intact; null/empty are not absent.
+func canonicalRolloutSessionID(header object) (string, error) {
+	value, exists := header["session_id"]
+	if !exists {
+		value = header["id"]
+	}
+	id, ok := value.(string)
+	if !ok || !uuidRE.MatchString(id) {
+		return "", fail("archive_rollout", "세션 헤더 root SessionId 형식 오류")
+	}
+	return id, nil
 }
 func readArchive(path string) (*family, error) {
 	raw, e := readBounded(path, limit)
