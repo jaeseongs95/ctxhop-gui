@@ -10,14 +10,11 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 	"testing"
 	"unsafe"
 )
-
-const canonicalSyntheticSource = `D:\Go\codex-s4\run-helper2-v2-63fc48d2e59e48ef88ea7ef193662432\source-v2\state_5.sqlite`
 
 var schemaExportOutput = flag.String("ctxhop-schema-export-output", "", "새 owned schema receipt 디렉터리")
 
@@ -108,13 +105,29 @@ func exportDLLVersion(path string) (string, error) {
 	return fmt.Sprintf("%d.%d.%d.%d", fixed[2]>>16, fixed[2]&0xffff, fixed[3]>>16, fixed[3]&0xffff), nil
 }
 func TestExportCanonicalSyntheticSchema(t *testing.T) {
+	if *schemaExportOutput == "" {
+		t.Skip("requires explicit new owned export metadata")
+	}
+	metadata, e := loadFixtureMetadata()
+	if e != nil {
+		t.Fatal(e)
+	}
+	canonicalSyntheticSource, e := fixtureSettingPath(metadata, "schemaOriginSource", false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	originRaw, e := fixturePinnedFile(metadata, "schemaOriginReport", "schemaOriginReportSha256", lineLimit)
+	if e != nil {
+		t.Fatal(e)
+	}
+	originValue, e := parseJSON(originRaw)
+	origin := obj(originValue)
+	if e != nil || !samePath(text(origin["source"]), canonicalSyntheticSource) {
+		t.Fatal("source origin receipt binding", e)
+	}
 	output := filepath.Clean(*schemaExportOutput)
-	prefix := `D:\Go\codex-s4\`
-	name := filepath.Base(output)
-	helper2Output := strings.HasPrefix(name, "run-helper2-schema-") && opRE.MatchString(strings.TrimPrefix(name, "run-helper2-schema-")) && samePath(filepath.Dir(output), strings.TrimSuffix(prefix, `\`))
-	helper3Output := name == "schema-export" && regexp.MustCompile(`^helper3-r45-fixture-[A-Za-z0-9_-]{1,80}$`).MatchString(filepath.Base(filepath.Dir(output))) && samePath(filepath.Dir(filepath.Dir(output)), strings.TrimSuffix(prefix, `\`))
-	if !filepath.IsAbs(output) || len(output) <= len(prefix) || !strings.EqualFold(output[:len(prefix)], prefix) || (!helper2Output && !helper3Output) {
-		t.Fatal("explicit fresh owned export output flag is required")
+	if e := fixturePath(metadata, output, true); e != nil {
+		t.Fatal(e)
 	}
 	outputLocks := &dbAcquisition{Files: map[string]snapshotEntry{}}
 	defer func() {
@@ -160,6 +173,17 @@ func TestExportCanonicalSyntheticSchema(t *testing.T) {
 			}
 		}
 	}()
+	originFiles := obj(origin["sourceFiles"])
+	if len(originFiles) != len(s.Files) {
+		t.Fatal("source origin file vector")
+	}
+	for name, entry := range s.Files {
+		file := obj(originFiles[name])
+		size, ok := integer(file["size"])
+		if !ok || size != snapshotSize(entry.Info) || file["sha256"] != entry.Hash {
+			t.Fatal("source origin actual size/hash", name)
+		}
+	}
 	system, e := systemDirectory()
 	if e != nil {
 		t.Fatal(e)

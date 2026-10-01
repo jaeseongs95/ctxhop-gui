@@ -10,10 +10,23 @@ import (
 )
 
 var canonicalStoreSeedHandoff = flag.String("ctxhop-store-seed-handoff", "", "frozen seed51 raw receipt; never opened with SQLite")
+var canonicalStoreSeedHandoffSHA = flag.String("ctxhop-store-seed-handoff-sha256", "", "caller-reviewed frozen raw receipt SHA256")
+
+const historicalStoreSeedHandoffSHA = "712ac77321f1706b9892ba4b682f8950c2a9e77a2fc2666c7cfe3fac0b2259bc"
 
 func TestStoreCanonicalSeedPrivateProof(t *testing.T) {
+	if *canonicalStoreSeedHandoff == "" {
+		t.Skip("requires explicit immutable synthetic source metadata")
+	}
+	metadata, e := loadFixtureMetadata()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = fixturePath(metadata, *canonicalStoreSeedHandoff, false); e != nil {
+		t.Fatal(e)
+	}
 	b, e := readBounded(*canonicalStoreSeedHandoff, lineLimit)
-	if e != nil || digest(b) != "712ac77321f1706b9892ba4b682f8950c2a9e77a2fc2666c7cfe3fac0b2259bc" {
+	if e != nil || !hashRE.MatchString(*canonicalStoreSeedHandoffSHA) || digest(b) != *canonicalStoreSeedHandoffSHA {
 		t.Fatal("canonical seed handoff missing/changed", e)
 	}
 	v, e := parseJSON(b)
@@ -22,11 +35,12 @@ func TestStoreCanonicalSeedPrivateProof(t *testing.T) {
 	}
 	handoff := obj(v)
 	slots := array(handoff["stores"])
-	if len(slots) != 8 || handoff["seedId"] != "51c980db2f43438eb1a8ca838045fae2" {
+	if len(slots) != 8 || !opRE.MatchString(text(handoff["seedId"])) || *canonicalStoreSeedHandoffSHA == historicalStoreSeedHandoffSHA && handoff["seedId"] != "51c980db2f43438eb1a8ca838045fae2" {
 		t.Fatal("unbound canonical8 seed")
 	}
 	home := filepath.Dir(text(obj(slots[0])["path"]))
-	if !samePath(home, `D:\Go\codex-s4\schema-seeds\51c980db2f43438eb1a8ca838045fae2\sqlite`) {
+	parent, e := fixtureSettingPath(metadata, "seedNamespaceParent", false)
+	if e != nil || !samePath(home, filepath.Join(parent, text(handoff["seedId"]), "sqlite")) || fixturePath(metadata, home, false) != nil {
 		t.Fatal("unexpected immutable seed namespace")
 	}
 	targets := []storeTarget{}

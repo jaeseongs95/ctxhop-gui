@@ -31,8 +31,11 @@ func validSeedCancelPoint(point string) bool {
 }
 
 func validateSeedHandoffOutput(path string) error {
-	base := `D:\Go\codex-s4`
-	if !filepath.IsAbs(path) || !samePath(filepath.Dir(path), base) || !strings.HasPrefix(filepath.Base(path), "run-helper2-r45-") || !opRE.MatchString(strings.TrimPrefix(filepath.Base(path), "run-helper2-r45-")) {
+	m, e := loadFixtureMetadata()
+	if e != nil {
+		return e
+	}
+	if fixturePath(m, path, true) != nil {
 		return fmt.Errorf("handoff requires a new owned runner output")
 	}
 	entry, e := snapshotOpen(path, true)
@@ -135,7 +138,11 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 	if point != "" && !validSeedCancelPoint(point) {
 		return drained, fmt.Errorf("unknown fixture cancellation point")
 	}
-	if !filepath.IsAbs(*storeSeedReader) || !strings.HasPrefix(strings.ToLower(filepath.Clean(*storeSeedReader)), `d:\go\codex-s4\`) || !hashRE.MatchString(*storeSeedReaderSHA) {
+	metadata, e := loadFixtureMetadata()
+	if e != nil {
+		return drained, e
+	}
+	if fixturePath(metadata, *storeSeedReader, false) != nil || fixturePath(metadata, *storeSeedReaderCwd, false) != nil || !hashRE.MatchString(*storeSeedReaderSHA) {
 		return drained, fmt.Errorf("fixture reader path/hash pin required")
 	}
 	locks, e := lockImage(*storeSeedReader)
@@ -181,7 +188,7 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 		env = append(env, "CTXHOP_S4_SCHEMA_CANCEL_POINT="+point)
 	}
 	cwd := *storeSeedReaderCwd
-	if !filepath.IsAbs(cwd) || !strings.HasPrefix(strings.ToLower(filepath.Clean(cwd)), `d:\go\codex-s4\`) {
+	if fixturePath(metadata, cwd, false) != nil {
 		return drained, fmt.Errorf("reviewed Rust fixture working directory required")
 	}
 	jobReceipt, drained, runErr := runSeedJob(*storeSeedReader, cwd, env, []string{"--ignored", "--exact", seedSchemaSelector, "--nocapture"}, 60*time.Second)

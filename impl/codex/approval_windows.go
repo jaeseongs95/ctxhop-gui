@@ -191,6 +191,9 @@ func approvalHash(f *os.File, max int64, deadline time.Time) (string, int64, err
 }
 func validateApprovalManifest(raw []byte, o options, ms []member) (approvalManifest, error) {
 	var m approvalManifest
+	if len(raw) > 4<<20 {
+		return m, fail("resourceLimit", "승인 manifest 크기 한도 초과")
+	}
 	v, e := parseJSON(raw)
 	if e != nil {
 		return m, e

@@ -17,9 +17,8 @@ import (
 )
 
 // Test-only cross-backend lane. No flag or executable launch enters the CLI.
-const backendTestExe = `D:\Go\codex-s4\r45-backend-d0fa3d8\codex-app-server-libtest.exe`
-const backendTestSHA = "3494e9fe61a5756232f97066dfcfaa698dc1c0c78e2e72548bb59c310c5f19c0"
-const backendArtifactSHA = "88a56530236aa95ea879ce908a7ae72c23922b1ce3374855ea0dcf3c86c4c2ec"
+const historicalBackendTestSHA = "3494e9fe61a5756232f97066dfcfaa698dc1c0c78e2e72548bb59c310c5f19c0"
+const historicalBackendArtifactSHA = "88a56530236aa95ea879ce908a7ae72c23922b1ce3374855ea0dcf3c86c4c2ec"
 const backendSelector = "prestart_context::backend_tests::read_private_acquisition_from_fixture_manifest"
 
 var backendMode = flag.String("ctxhop-backend-case", "", "explicit owned backend sequence case")
@@ -46,6 +45,18 @@ func TestBackendSequence(t *testing.T) {
 	if !allowed[*backendMode] || !opRE.MatchString(*backendCaseID) {
 		t.Fatal("invalid explicit fixture selector/case ID")
 	}
+	metadata, e := loadFixtureMetadata()
+	if e != nil {
+		t.Fatal(e)
+	}
+	backendTestExe, e := fixtureSettingPath(metadata, "backendRustExecutable", false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	backendTestSHA, backendArtifactSHA := text(metadata["backendRustExecutableSha256"]), text(metadata["backendRustArtifactSha256"])
+	if !hashRE.MatchString(backendTestSHA) || !hashRE.MatchString(backendArtifactSHA) {
+		t.Fatal("caller fixture image/artifact pins")
+	}
 	exeLocks, e := lockImage(backendTestExe)
 	if e != nil {
 		t.Fatal(e)
@@ -61,11 +72,19 @@ func TestBackendSequence(t *testing.T) {
 	if e != nil || exeHash != backendTestSHA {
 		t.Fatal("fixed Rust test executable pin mismatch", e)
 	}
-	artifact, e := readBounded(filepath.Join(filepath.Dir(backendTestExe), "artifact.json"), lineLimit)
-	if e != nil || digest(artifact) != backendArtifactSHA {
+	artifact, e := fixturePinnedFile(metadata, "backendRustArtifact", "backendRustArtifactSha256", lineLimit)
+	if e != nil {
 		t.Fatal("fixed Rust source artifact pin mismatch", e)
 	}
-	base := `D:\Go\codex-s4\backend-fixtures`
+	artifactValue, e := parseJSON(artifact)
+	artifactRecord := obj(artifactValue)
+	if e != nil || artifactRecord["sourceCommit"] != metadata["backendRustSourceCommit"] || !fixtureCommitRE.MatchString(text(metadata["backendRustSourceCommit"])) || !strings.EqualFold(text(artifactRecord["executableSha256"]), backendTestSHA) || artifactRecord["selector"] != backendSelector {
+		t.Fatal("fixture artifact source/image/selector binding", e)
+	}
+	base, e := fixtureSettingPath(metadata, "backendNamespaceParent", true)
+	if e != nil {
+		t.Fatal(e)
+	}
 	// Go alone creates the common parent and cases; the runner only reads them.
 	namespace := &dbAcquisition{Files: map[string]snapshotEntry{}}
 	if e := namespace.lockDirs(filepath.Dir(base)); e != nil {

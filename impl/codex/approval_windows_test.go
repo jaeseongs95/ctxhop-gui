@@ -278,3 +278,62 @@ func TestApprovalWireAndFrameBounds(t *testing.T) {
 	}
 	l.Close()
 }
+
+func TestApprovalResourceAndJournalBounds(t *testing.T) {
+	o, f, ownership := approvalFixture(t)
+	root := filepath.Dir(o.ApprovalEvidence.ManifestPath)
+	m := approvalManifest{1, approvalProfile, f.ArchiveSHA, 2, o.Run, o.Home, o.Cwd, approvalPins{engineSHA256, normalEngineSHA256, loaderContractID}, familyApprovalMembers(f, root)}
+	raw := encoded(m)
+	for _, size := range []int{4 << 20, (4 << 20) + 1} {
+		padded := append(append([]byte(nil), raw...), bytes.Repeat([]byte{' '}, size-len(raw))...)
+		_, e := validateApprovalManifest(padded, o, f.Members)
+		if size == 4<<20 && e != nil || size > 4<<20 && e == nil {
+			t.Fatal("manifest UTF-8 serialized limit", size, e)
+		}
+	}
+	ms := make([]member, 2001)
+	for i := range ms {
+		ms[i] = f.Members[0]
+		if i > 0 {
+			ms[i].ID = fmt.Sprintf("%08x-1111-4111-8111-%012x", i, i)
+			ms[i].Parent = &ms[0].ID
+		}
+		ms[i].ImmutableRolloutIDs = []string{ms[i].ID}
+		ms[i].SessionID = ms[i].ID
+		ms[i].ArchiveEntry = fmt.Sprintf("rollouts/%04d.jsonl", i)
+		ms[i].OriginBasename = "rollout-2026-10-01T00-00-00-" + ms[i].ID + ".jsonl"
+	}
+	for _, count := range []int{2000, 2001} {
+		large := &family{Members: ms[:count]}
+		m.Members = familyApprovalMembers(large, root)
+		_, e := validateApprovalManifest(encoded(m), o, large.Members)
+		if count == 2000 && e != nil || count == 2001 && e == nil {
+			t.Fatal("member count bound", count, e)
+		}
+	}
+	budget := append([]member(nil), f.Members...)
+	budget[0].Size = limit / 2
+	budget[1].Size = limit/2 + 1
+	m.Members = familyApprovalMembers(&family{Members: budget}, root)
+	if _, e := validateApprovalManifest(encoded(m), o, budget); e == nil {
+		t.Fatal("aggregate original source budget accepted")
+	}
+	j := &journal{Version: 4, Impl: "ctxhop-codex", Status: "pending", Phase: "staged", Home: o.Home, Cwd: o.Cwd, ID: rootID, Members: f.Members, ArchiveSHA256: f.ArchiveSHA, ApprovalEvidence: o.ApprovalEvidence, ApprovalOwnership: ownership}
+	run := runPath(o.Home, o.Run)
+	if e := saveJournal(run, j, true); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := loadJournal(o.Home, o.Run); e != nil {
+		t.Fatal(e)
+	}
+	j.LastError = "x"
+	base := len(encoded(j))
+	j.LastError = strings.Repeat("x", (4<<20)-base)
+	if e := saveJournal(run, j, false); e != nil {
+		t.Fatal("exact journal budget", e)
+	}
+	j.LastError += "x"
+	if e := saveJournal(run, j, false); e == nil {
+		t.Fatal("oversize journal accepted")
+	}
+}
