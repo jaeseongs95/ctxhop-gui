@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -22,6 +23,7 @@ const seedAcquisitionOwner = "01a0f1f9-e123-7460-847d-1bc68f56a487"
 var storeSeedOutput = flag.String("ctxhop-store-seed-output", "", "new runner-owned handoff output")
 var storeSeedReader = flag.String("ctxhop-store-seed-reader", "", "pinned Rust libtest executable; fixture only")
 var storeSeedReaderSHA = flag.String("ctxhop-store-seed-reader-sha256", "", "reviewed Rust executable SHA256")
+var storeSeedReaderCwd = flag.String("ctxhop-store-seed-reader-cwd", "", "reviewed Rust libtest working directory")
 
 func validateSeedHandoffOutput(path string) error {
 	base := `D:\Go\codex-s4`
@@ -163,7 +165,14 @@ func handoffSeedSchema(s *storeAcquisition, observation, proof object) (drained 
 		}
 	}
 	env = append(env, "CTXHOP_S4_SCHEMA_HANDOFF_PATH="+manifestPath, "CTXHOP_S4_SCHEMA_HANDOFF_SHA256="+digest(manifestBytes), "RUST_TEST_THREADS=1")
-	jobReceipt, drained, runErr := runSeedJob(*storeSeedReader, *storeSeedOutput, env, []string{"--ignored", "--exact", seedSchemaSelector, "--nocapture"}, 60*time.Second)
+	cwd := *storeSeedReaderCwd
+	if !filepath.IsAbs(cwd) || !strings.HasPrefix(strings.ToLower(filepath.Clean(cwd)), `d:\go\codex-s4\`) {
+		return drained, fmt.Errorf("reviewed Rust fixture working directory required")
+	}
+	jobReceipt, drained, runErr := runSeedJob(*storeSeedReader, cwd, env, []string{"--ignored", "--exact", seedSchemaSelector, "--nocapture"}, 60*time.Second)
+	if jobReceipt != nil {
+		jobReceipt["workingDirectory"] = cwd
+	}
 	writeErr := createFile(filepath.Join(*storeSeedOutput, "go-reader-job-receipt.json"), append(encoded(jobReceipt), '\n'))
 	if runErr != nil || writeErr != nil || !drained {
 		return drained, errors.Join(runErr, writeErr, fmt.Errorf("whole reader Job must drain before source release"))
@@ -210,17 +219,36 @@ func TestStoreSeedReaderJobChild(t *testing.T) {
 		fmt.Print(strings.Repeat("x", (1<<20)+100))
 	case "timeout":
 		time.Sleep(time.Minute)
+	case "descendant":
+		child := exec.Command(os.Args[0], "-test.run=^TestStoreSeedReaderJobChild$")
+		child.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		for _, value := range os.Environ() {
+			key, _, _ := strings.Cut(value, "=")
+			if !strings.EqualFold(key, "CTXHOP_SEED_JOB_CHILD") {
+				child.Env = append(child.Env, value)
+			}
+		}
+		child.Env = append(child.Env, "CTXHOP_SEED_JOB_CHILD=timeout")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if e := child.Start(); e != nil {
+			t.Fatal(e)
+		}
+		fmt.Print("owned descendant started")
+		os.Exit(0) // the Job remains active; parent exit alone cannot release anything
 	default:
 		t.Skip("owned child selector only")
 	}
 }
 
 func TestStoreSeedReaderJob(t *testing.T) {
-	for _, mode := range []string{"success", "failure", "overflow", "timeout"} {
+	for _, mode := range []string{"success", "failure", "overflow", "timeout", "descendant"} {
 		t.Run(mode, func(t *testing.T) {
 			receipt, drained, e := runSeedJob(os.Args[0], t.TempDir(), append(os.Environ(), "CTXHOP_SEED_JOB_CHILD="+mode), []string{"-test.run=^TestStoreSeedReaderJobChild$"}, 250*time.Millisecond)
 			if !drained || receipt["jobActiveProcesses"] != int64(0) || receipt["handlesClosed"] != true || (e == nil) != (mode == "success") {
 				t.Fatal("Job drain/result mismatch", mode, drained, e)
+			}
+			if mode == "descendant" && (receipt["exitCode"] != int64(0) || !strings.Contains(text(receipt["stdout"]), "owned descendant started")) {
+				t.Fatal("parent must exit successfully while its owned descendant still requires Job cancellation")
 			}
 		})
 	}
@@ -235,6 +263,11 @@ func TestStoreSeedSchemaReceipt(t *testing.T) {
 	check := func(receipt object) error {
 		return validateSeedSchemaReceipt(receipt, "owned-acquisition", strings.Repeat("a", 64), strings.Repeat("b", 64))
 	}
+	wire, e := parseJSON(encoded(valid))
+	if e != nil {
+		t.Fatal(e)
+	}
+	valid = obj(wire) // validate the same exact JSON integer representation as the reader response
 	if e := check(valid); e != nil {
 		t.Fatal(e)
 	}
