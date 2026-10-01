@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <string.h>
+#include "continue-policy.h"
 
 #define NORMAL_EVENTS 448
 #define MAX_EVENTS 512
@@ -12,11 +13,13 @@ typedef struct {
     DWORD pid, threads, exitCode;
     ULONGLONG birth;
     HANDLE retained;
-    BOOL member, breakpoint, exitContinued, signaled, referenceClosed;
+    BOOL member, breakpoint, exitContinued, signaled, referenceClosed, terminationAccepted;
 } Life;
 static volatile LONG cancelled;
 static DWORD failure, failureError, cleanupError, events, continued, bytes;
 static BOOL cleanup, incomplete, ledgerClosed = TRUE;
+static BOOL createContinueBlocked;
+static DWORD blockedCreatePid, blockedCreateSlot = 2;
 static HANDLE raw = INVALID_HANDLE_VALUE;
 
 static BOOL WINAPI cancel_handler(DWORD type) {
@@ -186,6 +189,8 @@ int wmain(int argc, wchar_t **argv)
     while (launched) {
         ULONGLONG now=GetTickCount64();
         DWORD waitTime;
+        BOOL createEvent, currentMember=FALSE, createValidated=FALSE;
+        BOOL currentJobTerminationAccepted=FALSE, currentTerminationAccepted=FALSE;
         if (InterlockedCompareExchange(&cancelled,0,0)) fail(11,0);
         if (!cleanup && now>=deadline) fail(12,0);
         if (!cleanup && (events>=NORMAL_EVENTS || bytes>=NORMAL_BYTES)) fail(13,0);
@@ -224,6 +229,7 @@ int wmain(int argc, wchar_t **argv)
             continue;
         }
         ++events; status=DBG_CONTINUE;
+        createEvent=event.dwDebugEventCode==CREATE_PROCESS_DEBUG_EVENT;
         slot=event.dwProcessId==life[0].pid ? 0 : event.dwProcessId==life[1].pid ? 1 : 2;
         if (event.dwDebugEventCode==CREATE_PROCESS_DEBUG_EVENT) {
             BY_HANDLE_FILE_INFORMATION eventInfo;
@@ -248,8 +254,9 @@ int wmain(int argc, wchar_t **argv)
                 }
                 if (!IsProcessInJob(event.u.CreateProcessInfo.hProcess,job,&member))
                     fail(21,GetLastError());
-                current->member=member;
-                if (!member) fail(22,0);
+                else currentMember=member;
+                current->member=currentMember;
+                if (!currentMember) fail(22,0);
                 imageLength=MAX_PATH;
                 if (!QueryFullProcessImageNameW(event.u.CreateProcessInfo.hProcess,0,imagePath,&imageLength))
                     fail(23,GetLastError());
@@ -289,12 +296,46 @@ int wmain(int argc, wchar_t **argv)
             default: fail(29,event.dwDebugEventCode); break;
             }
         }
-        /* Even a failing CREATE must be terminated before its first Continue. */
         if (failure && !cleanup) {
             cleanup=TRUE; cleanupDeadline=GetTickCount64()+5000;
             if (cleanupDeadline>start+20000) cleanupDeadline=start+20000;
-            if (bound) { if (!TerminateJobObject(job,90)) cleanupError=GetLastError(); }
-            else if (!TerminateProcess(process.hProcess,90)) cleanupError=GetLastError();
+            /* CREATE cleanup below must cover this exact current process. */
+            if (!createEvent) {
+                if (bound) { if (!TerminateJobObject(job,90)) cleanupError=GetLastError(); }
+                else if (!TerminateProcess(process.hProcess,90)) cleanupError=GetLastError();
+            }
+        }
+        if (createEvent) {
+            createValidated=!failure && bound && killOnExit;
+            if (!createValidated) {
+                if (slot<2 && currentMember) {
+                    currentJobTerminationAccepted=TerminateJobObject(job,90);
+                    if (!currentJobTerminationAccepted) cleanupError=GetLastError();
+                }
+                if (!currentJobTerminationAccepted) {
+                    /* Only the handle supplied by this newly-created debug event. */
+                    currentTerminationAccepted=TerminateProcess(event.u.CreateProcessInfo.hProcess,90);
+                    if (!currentTerminationAccepted) cleanupError=GetLastError();
+                }
+                if (slot<2) life[slot].terminationAccepted=
+                    currentJobTerminationAccepted || currentTerminationAccepted;
+            }
+            if (!can_continue_create(slot,createValidated,currentMember,
+                currentJobTerminationAccepted,currentTerminationAccepted)) {
+                createContinueBlocked=TRUE; blockedCreatePid=event.dwProcessId; blockedCreateSlot=slot;
+                incomplete=TRUE; fail(42,cleanupError);
+                sprintf_s(row,sizeof(row),
+                    "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,"
+                    "\"continued\":false,\"continueBlocked\":true,\"currentMember\":%s,"
+                    "\"jobTerminationAccepted\":%s,\"exactTerminationAccepted\":%s,\"failure\":%lu,\"error\":%lu}\n",
+                    events,GetTickCount64()-start,osThread,event.dwDebugEventCode,event.dwProcessId,
+                    event.dwThreadId,slot,currentMember?"true":"false",currentJobTerminationAccepted?"true":"false",
+                    currentTerminationAccepted?"true":"false",failure,failureError);
+                output(row);
+                /* Do not resume an unbound/un-terminated CREATE. Debugger exit and Job close
+                   are fallback requests; completion remains unproven in this receipt. */
+                break;
+            }
         }
         if (GetCurrentThreadId()!=osThread) { fail(36,0); incomplete=TRUE; break; }
         if (!ContinueDebugEvent(event.dwProcessId,event.dwThreadId,status)) {
@@ -308,9 +349,11 @@ int wmain(int argc, wchar_t **argv)
         ++continued;
         if (slot<2 && event.dwDebugEventCode==EXIT_PROCESS_DEBUG_EVENT) life[slot].exitContinued=TRUE;
         sprintf_s(row,sizeof(row),
-            "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,\"birth\":%llu,\"continueStatus\":%lu,\"continued\":true,\"failure\":%lu,\"error\":%lu}\n",
+            "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,\"birth\":%llu,\"continueStatus\":%lu,\"continued\":true,"
+            "\"currentMember\":%s,\"jobTerminationAccepted\":%s,\"exactTerminationAccepted\":%s,\"failure\":%lu,\"error\":%lu}\n",
             events,GetTickCount64()-start,osThread,event.dwDebugEventCode,event.dwProcessId,
-            event.dwThreadId,slot,slot<2 ? life[slot].birth : 0,status,failure,failureError);
+            event.dwThreadId,slot,slot<2 ? life[slot].birth : 0,status,currentMember?"true":"false",
+            currentJobTerminationAccepted?"true":"false",currentTerminationAccepted?"true":"false",failure,failureError);
         output(row);
     }
     sample_exit(&life[0]); sample_exit(&life[1]);
@@ -341,8 +384,9 @@ int wmain(int argc, wchar_t **argv)
         "\"observerPid\":%lu,\"observerThread\":%lu,\"observerBirth\":%llu,"
         "\"helperFileId\":{\"volume\":%lu,\"high\":%lu,\"low\":%lu},"
         "\"observerFileId\":{\"volume\":%lu,\"high\":%lu,\"low\":%lu},"
-        "\"parent\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s},"
-        "\"child\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s},"
+        "\"parent\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s,\"createTerminationRequestAccepted\":%s},"
+        "\"child\":{\"pid\":%lu,\"birth\":%llu,\"member\":%s,\"exit\":%lu,\"exitContinue\":%s,\"signaled\":%s,\"referenceClosed\":%s,\"createTerminationRequestAccepted\":%s},"
+        "\"createContinueBlocked\":%s,\"blockedCreatePid\":%lu,\"blockedCreateSlot\":%lu,"
         "\"createProcessResult\":%s,\"assignedBeforeContinue\":%s,\"killOnExit\":%s,\"waitCalls\":%lu,\"waitTimeouts\":%lu,\"events\":%lu,\"continued\":%lu,\"rawBytes\":%lu,"
         "\"activeProcesses\":%lu,\"totalProcesses\":%lu,\"ledgerClosed\":%s,\"cleanup\":%s,\"cleanupError\":%lu,"
         "\"evidenceIncomplete\":%s,\"failure\":%lu,\"error\":%lu,\"elapsedMs\":%llu,"
@@ -351,9 +395,10 @@ int wmain(int argc, wchar_t **argv)
         birth_of(GetCurrentProcess()),helperInfo.dwVolumeSerialNumber,helperInfo.nFileIndexHigh,helperInfo.nFileIndexLow,
         observerInfo.dwVolumeSerialNumber,observerInfo.nFileIndexHigh,observerInfo.nFileIndexLow,
         life[0].pid,life[0].birth,life[0].member?"true":"false",life[0].exitCode,life[0].exitContinued?"true":"false",
-        life[0].signaled?"true":"false",life[0].referenceClosed?"true":"false",
+        life[0].signaled?"true":"false",life[0].referenceClosed?"true":"false",life[0].terminationAccepted?"true":"false",
         life[1].pid,life[1].birth,life[1].member?"true":"false",life[1].exitCode,life[1].exitContinued?"true":"false",
-        life[1].signaled?"true":"false",life[1].referenceClosed?"true":"false",
+        life[1].signaled?"true":"false",life[1].referenceClosed?"true":"false",life[1].terminationAccepted?"true":"false",
+        createContinueBlocked?"true":"false",blockedCreatePid,blockedCreateSlot,
         launched?"true":"false",assigned?"true":"false",killOnExit?"true":"false",waitCalls,waitTimeouts,events,continued,bytes,active,total,
         ledgerClosed?"true":"false",cleanup?"true":"false",cleanupError,incomplete?"true":"false",
         failure,failureError,GetTickCount64()-start);

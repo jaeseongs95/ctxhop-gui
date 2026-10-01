@@ -78,12 +78,12 @@ try {
     if ($manifest.schemaVersion -ne 1 -or $manifest.actualProbe -ne 0 -or
         $manifest.sourceCommit -notmatch '^[a-f0-9]{40}$' -or
         $manifest.capabilityScope -ne 'ownedSyntheticDebugLifecycle' -or $manifest.images.Count -ne 2 -or
-        $manifest.sources.Count -ne 5) { throw 'Invalid build manifest' }
+        $manifest.sources.Count -ne 7) { throw 'Invalid build manifest' }
     foreach ($limit in @{normalMs=15000;cleanupMs=5000;totalMs=20000;waitMs=250;helperWaitMs=5000;normalEvents=448;
         events=512;normalRawBytes=917504;rawBytes=1048576;receiptBytes=65536;processes=2;threadsPerProcess=64}.GetEnumerator()) {
         if ($manifest.limits[$limit.Key] -ne $limit.Value) { throw "Changed limit: $($limit.Key)" }
     }
-    $sourceNames = @('observer.c','helper.c','Build-Probe.ps1','Invoke-Probe.ps1','README.md')
+    $sourceNames = @('observer.c','helper.c','continue-policy.h','continue-policy-test.c','Build-Probe.ps1','Invoke-Probe.ps1','README.md')
     foreach ($name in $sourceNames) {
         $matches = @($manifest.sources | Where-Object { [IO.Path]::GetFileName($_.path) -eq $name })
         if ($matches.Count -ne 1 -or [IO.Path]::GetFullPath($matches[0].path) -ne (Join-Path $PSScriptRoot $name)) {

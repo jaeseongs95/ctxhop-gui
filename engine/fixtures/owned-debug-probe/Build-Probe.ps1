@@ -108,7 +108,7 @@ Assert-PlainPath $sdk
 $toolBin = "$msvc\bin\Hostx64\x64"
 $include = "$msvc\include;$sdk\Include\$sdkVersion\ucrt;$sdk\Include\$sdkVersion\shared;$sdk\Include\$sdkVersion\um"
 $lib = "$msvc\lib\x64;$sdk\Lib\$sdkVersion\ucrt\x64;$sdk\Lib\$sdkVersion\um\x64"
-$sourceFiles = @('observer.c','helper.c','Build-Probe.ps1','Invoke-Probe.ps1','README.md')
+$sourceFiles = @('observer.c','helper.c','continue-policy.h','continue-policy-test.c','Build-Probe.ps1','Invoke-Probe.ps1','README.md')
 $source = @($sourceFiles | ForEach-Object { Descriptor (Join-Path $PSScriptRoot $_) })
 $tools = @('cl.exe','link.exe','c1.dll','c2.dll','mspdb140.dll') | ForEach-Object { Descriptor "$toolBin\$_" }
 $sdkInputs = @(
