@@ -524,12 +524,14 @@ function Assert-SeedBuild([object]$Build) {
     Assert-SeedKeys $Build @('sourceCommit','lfSourceArchiveSha256','migrationLineEndings','migrationInventorySha256','cargoLockSha256','builderSha256','normalEngineSha256','rustVersion','target')
     Assert-SeedHex $Build.sourceCommit 40
     foreach ($key in @('lfSourceArchiveSha256','migrationInventorySha256','cargoLockSha256','builderSha256','normalEngineSha256')) { Assert-SeedHex $Build[$key] 64 }
+    foreach ($key in @('migrationLineEndings','rustVersion','target')) { if ($Build[$key] -isnot [string]) { throw 'seedBuildProfileMismatch' } }
     if ($Build.migrationLineEndings -cne 'CRLF' -or $Build.builderSha256 -cne '2e3ef406f69088ea70fff5ebd3a7c374eff46568ce052cc7e6f95e8a50586ab8' -or
         $Build.normalEngineSha256 -cne 'cbafb6422bca005b94c12d105b1a16a0474219e24ea4893f85846409c464f5a1' -or $Build.rustVersion -cne '1.95.0' -or $Build.target -cne 'x86_64-pc-windows-msvc') { throw 'seedBuildProfileMismatch' }
 }
 function Assert-SeedManifest([object]$Manifest) {
     Assert-SeedKeys $Manifest @('schemaVersion','seedId','seedRoot','sqliteHome','stateReceipt','boardReceipt','build','artifacts','expectedMigrations')
     Assert-SeedInteger $Manifest.schemaVersion
+    Assert-SeedHex $Manifest.seedId 32
     if ($Manifest.schemaVersion -ne 2 -or $Manifest.seedId -cne 'd3d102401ab44b1ea0e382a38196ae24') { throw 'seedNamespaceBinding' }
     $root='D:\Go\codex-s4\schema-seeds\'+$Manifest.seedId
     foreach ($pair in @(@('seedRoot',$root),@('sqliteHome',($root+'\sqlite')),@('stateReceipt',($root+'\receipts\state-seed.json')),@('boardReceipt',($root+'\receipts\board-seed.json')))) {
@@ -552,7 +554,7 @@ function Assert-SeedManifest([object]$Manifest) {
     if ($Manifest.expectedMigrations -isnot [array] -or $Manifest.expectedMigrations.Count -ne 7) { throw 'seedMigrationOrder' }
     for ($i=0;$i -lt 7;$i++) {
         $group=$Manifest.expectedMigrations[$i]; Assert-SeedKeys $group @('kind','versions')
-        if ($group.kind -cne $kinds[$i] -or $group.versions -isnot [array] -or $group.versions.Count -ne $counts[$i]) { throw 'seedMigrationOrder' }
+        if ($group.kind -isnot [string] -or $group.kind -cne $kinds[$i] -or $group.versions -isnot [array] -or $group.versions.Count -ne $counts[$i]) { throw 'seedMigrationOrder' }
         for ($j=0;$j -lt $counts[$i];$j++) {
             $row=$group.versions[$j]; Assert-SeedKeys $row @('version','checksumHex'); Assert-SeedInteger $row.version 1
             if ($row.version -ne $j+1) { throw 'seedMigrationVersion' }; Assert-SeedHex $row.checksumHex 96
@@ -585,12 +587,12 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
     $kinds=@('state','logs','goals','memories','memoriesV2','queue','threadHistory','agentMessageBoard')
     $names=@('state_5.sqlite','logs_2.sqlite','goals_1.sqlite','memories_1.sqlite','memories_v2_1.sqlite','queue_1.sqlite','thread_history_1.sqlite','agent_message_board_1.sqlite')
     Assert-SeedKeys $Store @('kind','path','objects','tables','migrations','files')
-    if ($Store.kind -cne $kinds[$Index] -or -not [string]::Equals((Assert-SeedReadPath $Store.path),(Join-Path (Assert-SeedReadPath $Manifest.sqliteHome) $names[$Index]),[StringComparison]::OrdinalIgnoreCase)) { throw 'seedStoreOrderOrPath' }
+    if ($Store.kind -isnot [string] -or $Store.kind -cne $kinds[$Index] -or -not [string]::Equals((Assert-SeedReadPath $Store.path),(Join-Path (Assert-SeedReadPath $Manifest.sqliteHome) $names[$Index]),[StringComparison]::OrdinalIgnoreCase)) { throw 'seedStoreOrderOrPath' }
     if ($Store.objects -isnot [array] -or -not $Store.objects.Count -or $Store.tables -isnot [array] -or -not $Store.tables.Count) { throw 'seedInventoryMissing' }
     $objects=@{}; $tables=@(); $previous=$null
     foreach ($o in $Store.objects) {
         Assert-SeedKeys $o @('type','name','table','sql')
-        if ($o.type -cnotin @('table','index','trigger','view') -or $o.name -isnot [string] -or -not $o.name -or $o.table -isnot [string] -or -not $o.table -or ($null -ne $o.sql -and $o.sql -isnot [string])) { throw 'seedObjectStorageType' }
+        if ($o.type -isnot [string] -or $o.type -cnotin @('table','index','trigger','view') -or $o.name -isnot [string] -or -not $o.name -or $o.table -isnot [string] -or -not $o.table -or ($null -ne $o.sql -and $o.sql -isnot [string])) { throw 'seedObjectStorageType' }
         $order=$o.type+[char]0+$o.name+[char]0+$o.table
         if ($null -ne $previous -and [StringComparer]::Ordinal.Compare($previous,$order) -ge 0) { throw 'seedObjectOrder' }; $previous=$order
         if ($objects.ContainsKey($o.name)) { throw 'seedObjectDuplicate' }; $objects[$o.name]=$o
@@ -600,14 +602,14 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
     $previous=$null; $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($table in $Store.tables) {
         Assert-SeedKeys $table @('name','xinfo','foreignKeys','indexes')
-        if ($table.name -cnotin $tables -or -not $seen.Add($table.name) -or ($null -ne $previous -and [StringComparer]::Ordinal.Compare($previous,$table.name) -ge 0)) { throw 'seedTableOrder' }; $previous=$table.name
+        if ($table.name -isnot [string] -or $table.name -cnotin $tables -or -not $seen.Add($table.name) -or ($null -ne $previous -and [StringComparer]::Ordinal.Compare($previous,$table.name) -ge 0)) { throw 'seedTableOrder' }; $previous=$table.name
         Assert-SeedPragmaRows $table.xinfo 'xinfo'; Assert-SeedPragmaRows $table.foreignKeys 'foreignKeys'
         if (-not $table.xinfo.Count -or $table.indexes -isnot [array]) { throw 'seedTableInventoryIncomplete' }
         $indexNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($index in $table.indexes) {
             Assert-SeedKeys $index @('name','listEntry','xinfo')
             Assert-SeedPragmaRows @($index.listEntry) 'listEntry'; Assert-SeedPragmaRows $index.xinfo 'indexXinfo'
-            if ($index.name -cne $index.listEntry.name -or -not $indexNames.Add($index.name) -or -not $objects.ContainsKey($index.name) -or $objects[$index.name].type -cne 'index' -or $objects[$index.name].table -cne $table.name) { throw 'seedIndexInventoryIncomplete' }
+            if ($index.name -isnot [string] -or $index.name -cne $index.listEntry.name -or -not $indexNames.Add($index.name) -or -not $objects.ContainsKey($index.name) -or $objects[$index.name].type -cne 'index' -or $objects[$index.name].table -cne $table.name) { throw 'seedIndexInventoryIncomplete' }
         }
         foreach ($o in $Store.objects) { if ($o.type -ceq 'index' -and $o.table -ceq $table.name -and -not $indexNames.Contains($o.name)) { throw 'seedIndexInventoryIncomplete' } }
     }
@@ -618,6 +620,7 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
         for ($j=0;$j -lt $Store.migrations.Count;$j++) {
             $actual=$Store.migrations[$j]; $expected=$Manifest.expectedMigrations[$Index].versions[$j]
             Assert-SeedKeys $actual @('version','success','checksumHex'); Assert-SeedInteger $actual.version 1; Assert-SeedInteger $actual.success
+            Assert-SeedHex $actual.checksumHex 96
             if ($actual.version -ne $expected.version -or $actual.success -ne 1 -or $actual.checksumHex -cne $expected.checksumHex) { throw 'seedMigrationReceiptMismatch' }
         }
     }
@@ -625,7 +628,7 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
     $fileKinds=@('main','WAL','SHM','rollbackJournal')
     for ($j=0;$j -lt 4;$j++) {
         $file=$Store.files[$j]; Assert-SeedKeys $file @('kind','present','identity','size','sha256')
-        if ($file.kind -cne $fileKinds[$j] -or $file.present -isnot [bool]) { throw 'seedFileVectorOrder' }
+        if ($file.kind -isnot [string] -or $file.kind -cne $fileKinds[$j] -or $file.present -isnot [bool]) { throw 'seedFileVectorOrder' }
         if ($file.present) { Assert-SeedHex $file.identity 24; Assert-SeedHex $file.sha256 64; Assert-SeedInteger $file.size }
         elseif ($null -ne $file.identity -or $null -ne $file.size -or $null -ne $file.sha256 -or $j -eq 0) { throw 'seedAbsentFileDescriptor' }
     }
@@ -633,6 +636,8 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
 function Assert-CanonicalSeedReceipt([object]$Receipt,[object]$Manifest,[string]$ManifestHash,[string]$Producer) {
     Assert-SeedKeys $Receipt @('schemaVersion','seedId','producer','manifestSha256','build','sqliteVersion','sqliteSourceId','allPoolsClosed','originalSQLiteOpens','engineExecutions','stores')
     Assert-SeedInteger $Receipt.schemaVersion; Assert-SeedInteger $Receipt.originalSQLiteOpens; Assert-SeedInteger $Receipt.engineExecutions
+    Assert-SeedHex $Receipt.seedId 32; Assert-SeedHex $Receipt.manifestSha256 64
+    if ($Receipt.producer -isnot [string]) { throw 'seedReceiptBinding' }
     if ($Receipt.schemaVersion -ne 2 -or $Receipt.seedId -cne $Manifest.seedId -or $Receipt.producer -cne $Producer -or $Receipt.manifestSha256 -cne $ManifestHash -or $Receipt.allPoolsClosed -isnot [bool] -or -not $Receipt.allPoolsClosed -or $Receipt.originalSQLiteOpens -ne 0 -or $Receipt.engineExecutions -ne 0) { throw 'seedReceiptBinding' }
     Assert-SeedBuild $Receipt.build
     foreach ($key in $Manifest.build.Keys) { if ($Receipt.build[$key] -cne $Manifest.build[$key]) { throw 'seedReceiptBuildMismatch' } }
@@ -673,6 +678,7 @@ function Invoke-AggregateSeedChecks([string]$Root) {
         @{name='null-pin';reason='seedPinFormat';change={param($m) $m.artifacts.state.sha256=$null}},
         @{name='description-pin';reason='seedPinFormat';change={param($m) $m.build.sourceCommit='fixed helper1 source commit, 40 lower hex'}},
         @{name='LF-profile';reason='seedBuildProfileMismatch';change={param($m) $m.build.migrationLineEndings='LF'}},
+        @{name='profile-array';reason='seedBuildProfileMismatch';change={param($m) $m.build.rustVersion=@('1.95.0')}},
         @{name='unknown-field';reason='seedObjectFields';change={param($m) $m.extra=1}},
         @{name='missing-field';reason='seedObjectFields';change={param($m) $m.Remove('artifacts') | Out-Null}},
         @{name='wrong-seed-id';reason='seedNamespaceBinding';change={param($m) $m.seedId=('a'*32)}},
@@ -680,6 +686,7 @@ function Invoke-AggregateSeedChecks([string]$Root) {
         @{name='artifact-alias';reason='seedArtifactPathAlias';change={param($m) $m.artifacts.agentMessageBoard.path=$m.artifacts.state.path}},
         @{name='missing-store';reason='seedMigrationOrder';change={param($m) $m.expectedMigrations=@($m.expectedMigrations | Select-Object -First 6)}},
         @{name='reordered-store';reason='seedMigrationOrder';change={param($m) $m.expectedMigrations[0].kind='logs'}},
+        @{name='kind-array';reason='seedMigrationOrder';change={param($m) $m.expectedMigrations[0].kind=@('state')}},
         @{name='migration-version-string';reason='seedIntegerType';change={param($m) $m.expectedMigrations[0].versions[0].version='1'}},
         @{name='missing-migration';reason='seedMigrationOrder';change={param($m) $m.expectedMigrations[0].versions=@($m.expectedMigrations[0].versions | Select-Object -First 57)}},
         @{name='memory-v2-checksum';reason='seedMemoryMigrationMismatch';change={param($m) $m.expectedMigrations[4].versions[0].checksumHex=('2'*96)}}
@@ -721,6 +728,8 @@ function Invoke-AggregateSeedChecks([string]$Root) {
         @{name='engine-executed';reason='seedReceiptBinding';change={param($r) $r.engineExecutions=1}},
         @{name='original-sqlite-open';reason='seedReceiptBinding';change={param($r) $r.originalSQLiteOpens=1}},
         @{name='manifest-hash';reason='seedReceiptBinding';change={param($r) $r.manifestSha256=('d'*64)}},
+        @{name='producer-array';reason='seedReceiptBinding';change={param($r) $r.producer=@('state')}},
+        @{name='file-kind-array';reason='seedFileVectorOrder';change={param($r) $r.stores[0].files[0].kind=@('main')}},
         @{name='build-mismatch';reason='seedReceiptBuildMismatch';change={param($r) $r.build.cargoLockSha256=('d'*64)}},
         @{name='success-bool';reason='seedIntegerType';change={param($r) $r.stores[0].migrations[0].success=$true}},
         @{name='checksum-mismatch';reason='seedMigrationReceiptMismatch';change={param($r) $r.stores[0].migrations[0].checksumHex=('2'*96)}},
