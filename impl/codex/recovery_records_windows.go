@@ -103,7 +103,7 @@ func recoveryRecords(home string) ([]recoveryRecord,error) {
 	root:=filepath.Join(home,".ctxhop-desktop-recovery");entry,e:=snapshotOpen(root,true)
 	if e==syscall.ERROR_FILE_NOT_FOUND {return []recoveryRecord{},nil}
 	if e!=nil {return []recoveryRecord{{Path:root,State:"unsafe",Files:[]string{},RetainedKinds:[]string{},ReasonCode:pointer("unsafe_namespace"),BlocksImport:true}},nil}
-	entries,e:=entry.File.ReadDir(100001);e=errors.Join(e,entry.File.Close());if e!=nil && e!=io.EOF || len(entries)>100000 {return nil,fail("recovery_namespace","복구 목록 한도/읽기 오류")}
+	entries,e:=entry.File.ReadDir(100001);if errors.Is(e,io.EOF) { e=nil };e=errors.Join(e,entry.File.Close());if e!=nil || len(entries)>100000 {return nil,fail("recovery_namespace","복구 목록 한도/읽기 오류")}
 	rows:=make([]recoveryRecord,0,len(entries));for _,entry:=range entries {r,e:=classifyRecoveryRecord(home,entry.Name());if e!=nil {return nil,e};rows=append(rows,r)};return rows,nil
 }
 func recoveryResolve(home,run,sha string) (row recoveryRecord,retErr error) {
