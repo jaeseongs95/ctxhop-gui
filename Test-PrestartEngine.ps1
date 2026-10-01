@@ -611,10 +611,10 @@ function Assert-SeedStoreInventory([object]$Store,[object]$Manifest,[int]$Index)
         Assert-SeedPragmaRows $table.xinfo 'xinfo'; Assert-SeedPragmaRows $table.foreignKeys 'foreignKeys'
         if (-not $table.xinfo.Count -or $table.indexes -isnot [array]) { throw 'seedTableInventoryIncomplete' }
         $indexNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($index in $table.indexes) {
-            Assert-SeedKeys $index @('name','listEntry','xinfo')
-            Assert-SeedPragmaRows @($index.listEntry) 'listEntry'; Assert-SeedPragmaRows $index.xinfo 'indexXinfo'
-            if ($index.name -isnot [string] -or $index.name -cne $index.listEntry.name -or -not $indexNames.Add($index.name) -or -not $objects.ContainsKey($index.name) -or $objects[$index.name].type -cne 'index' -or $objects[$index.name].table -cne $table.name) { throw 'seedIndexInventoryIncomplete' }
+        foreach ($indexEntry in $table.indexes) {
+            Assert-SeedKeys $indexEntry @('name','listEntry','xinfo')
+            Assert-SeedPragmaRows @($indexEntry.listEntry) 'listEntry'; Assert-SeedPragmaRows $indexEntry.xinfo 'indexXinfo'
+            if ($indexEntry.name -isnot [string] -or $indexEntry.name -cne $indexEntry.listEntry.name -or -not $indexNames.Add($indexEntry.name) -or -not $objects.ContainsKey($indexEntry.name) -or $objects[$indexEntry.name].type -cne 'index' -or $objects[$indexEntry.name].table -cne $table.name) { throw 'seedIndexInventoryIncomplete' }
         }
         foreach ($o in $Store.objects) { if ($o.type -ceq 'index' -and $o.table -ceq $table.name -and -not $indexNames.Contains($o.name)) { throw 'seedIndexInventoryIncomplete' } }
     }
@@ -929,6 +929,13 @@ function Invoke-AggregateSeedChecks([string]$Root) {
     Assert-FixtureThrows { Assert-SeedPragmaRows @($bad) 'xinfo' } 'seedObjectFields'
     $board=@{kind='agentMessageBoard';path=($manifest.sqliteHome+'\agent_message_board_1.sqlite');objects=@(@{type='table';name='synthetic';table='synthetic';sql='synthetic inventory only'});tables=@(@{name='synthetic';xinfo=@($pragma);foreignKeys=@();indexes=@()});migrations=$null;files=@(@{kind='main';present=$true;identity=('a'*24);size=4096;sha256=('b'*64)})+@(@('WAL','SHM','rollbackJournal') | ForEach-Object { @{kind=$_;present=$false;identity=$null;size=$null;sha256=$null} })}
     Assert-SeedStoreInventory $board $manifest 7
+    $indexedBoard=ConvertFrom-SeedJson (ConvertTo-Json $board -Depth 30 -Compress)
+    $indexedBoard.objects=@(@{type='index';name='synthetic_index';table='synthetic';sql='synthetic inventory only'})+@($indexedBoard.objects)
+    $indexedBoard.tables[0].indexes=@(@{name='synthetic_index';listEntry=@{seq=0;name='synthetic_index';unique=0;origin='c';partial=0};xinfo=@(@{seqno=0;cid=0;name='synthetic';desc=0;coll='BINARY';key=1},@{seqno=1;cid=-1;name=$null;desc=0;coll='BINARY';key=0})})
+    Assert-SeedStoreInventory $indexedBoard $manifest 7
+    Assert-Fixture $true 'indexed inventory preserves integer store ordinal'
+    $bad=ConvertFrom-SeedJson (ConvertTo-Json $indexedBoard -Depth 30 -Compress); $bad.tables[0].indexes=@()
+    Assert-FixtureThrows { Assert-SeedStoreInventory $bad $manifest 7 } 'seedIndexInventoryIncomplete'
     $bad=ConvertFrom-SeedJson (ConvertTo-Json $board -Depth 30 -Compress); $bad.migrations=@()
     Assert-FixtureThrows { Assert-SeedStoreInventory $bad $manifest 7 } 'seedBoardMigrationTable'
     $bad=ConvertFrom-SeedJson (ConvertTo-Json $board -Depth 30 -Compress); $bad.files[1].size=0
