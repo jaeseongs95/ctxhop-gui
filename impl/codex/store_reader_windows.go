@@ -14,8 +14,8 @@ import (
 	"unsafe"
 )
 
-// This callable source API remains behind the schema gate. It is not wired to
-// production complete/admission. Key facts still need canonical state metadata,
+// This callable source API checks the actual8 schema seal on finalized private
+// copies. It is not wired to production complete/admission. Key facts still need canonical state metadata,
 // strict file uncertainty and operation policy before they can authorize anything.
 func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *storeProofKeys) (facts []storeKeyEvidence, retErr error) {
 	if ctx == nil || s == nil || targets == nil || !s.Finalized || s.Draining || s.Closed || s.ReadersOpen != 0 {
@@ -24,10 +24,16 @@ func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *
 	if e := s.Verify(); e != nil {
 		return nil, e
 	}
-	// Check seal availability for every present store before the first SQLite open.
+	// Bind all present kinds to the actual factory seal before the first open.
+	seal, e := storeSchemaSealV2()
+	if e != nil {
+		return nil, e
+	}
 	for _, slot := range s.Stores {
-		if slot.Present && slot.Kind != "state" {
-			return nil, fail("engine_db_unknown", "actual auxiliary schema seal 미확보: "+slot.Kind)
+		if slot.Present {
+			if _, e := storeSchemaForKindV2(seal, slot.Kind); e != nil {
+				return nil, e
+			}
 		}
 	}
 	dir, e := systemDirectory()
@@ -68,7 +74,7 @@ func inspectPrivateStoreKeys(ctx context.Context, s *storeAcquisition, targets *
 }
 
 func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot storeSlot, targets *storeProofKeys) (proof storeKeyEvidence, retErr error) {
-	if parent == nil || dll == nil || targets == nil || slot.Data == nil || !slot.Present || !slot.Data.privateCopyReady() || slot.Data.Aggregate == nil || slot.Data.Aggregate.ReadersOpen != 0 || slot.Kind != "state" {
+	if parent == nil || dll == nil || targets == nil || slot.Data == nil || !slot.Present || !slot.Data.privateCopyReady() || slot.Data.Aggregate == nil || slot.Data.Aggregate.ReadersOpen != 0 {
 		return proof, fail("engine_db_unknown", "private store reader/schema gate 결속 오류")
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
@@ -143,7 +149,7 @@ func readFinalizedStoreKeys(parent context.Context, dll *syscall.DLL, slot store
 	if e != nil || len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "ok" {
 		return proof, fail("engine_db_unknown", "store integrity 불명")
 	}
-	if e := checkLiveSchema(dll, db); e != nil {
+	if e := checkStoreSchemaV2(dll, db, slot.Kind); e != nil {
 		return proof, e
 	}
 	remaining, buffered := storeKeyRowLimit, 0

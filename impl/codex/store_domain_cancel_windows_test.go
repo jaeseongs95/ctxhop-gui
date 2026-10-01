@@ -93,7 +93,7 @@ func TestStoreCancellationAfterReaderDrainNeverReturnsProof(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			closeFixture := sqliteFixture(t, home, false, liveFixtureSQL(t)+liveFixtureThread(rootID))
+			closeFixture := sqliteFixture(t, home, false, storeSchemaFixtureSQL(t, "state")+liveFixtureThread(rootID))
 			closeFixture()
 			targets := []storeTarget{}
 			for _, spec := range storeSpecs {

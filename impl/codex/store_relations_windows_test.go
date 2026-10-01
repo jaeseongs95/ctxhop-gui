@@ -249,7 +249,7 @@ func TestStoreNativePrivateReaderDrainAndAuxSealGate(t *testing.T) {
 	for _, variant := range []string{"success", "decoder-error", "cancelled", "schema-error"} {
 		t.Run(variant, func(t *testing.T) {
 			home := t.TempDir()
-			sql := liveFixtureSQL(t) + liveFixtureThread(rootID)
+			sql := storeSchemaFixtureSQL(t, "state") + liveFixtureThread(rootID)
 			if variant == "decoder-error" {
 				sql += `UPDATE threads SET source='unknown';`
 			}
@@ -295,7 +295,7 @@ func TestStoreNativePrivateReaderDrainAndAuxSealGate(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer s.Close(false)
-	if facts, e := inspectPrivateStoreKeys(context.Background(), s, relationTargets(t)); e == nil || facts != nil || !strings.Contains(e.Error(), "actual auxiliary schema seal") {
+	if facts, e := inspectPrivateStoreKeys(context.Background(), s, relationTargets(t)); e == nil || facts != nil || s.ReadersOpen != 0 {
 		t.Fatal("aux raw copies treated as schema proof", facts, e)
 	}
 	if e := s.Close(true); e != nil {
