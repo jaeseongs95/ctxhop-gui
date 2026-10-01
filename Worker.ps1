@@ -472,6 +472,7 @@ function Get-CodexRetainedKinds([object]$Record) {
     # 이 필드는 증명 결과의 표시일 뿐 원본 삭제·쓰기 권한이 아니다. 순서는 v2 store catalog와 같다.
     $allowed=@('state.migrationCursor','queue.revision','agentMessageBoard.deletedBoard')
     $kind=$Record.absenceKind; $kinds=$Record.retainedKinds
+    if ($null -ne $kind -and $kind -isnot [string]) { throw (T 'WkRetainedProofUnknown') }
     if ($null -ne $kinds -and $kinds -isnot [array]) { throw (T 'WkRetainedProofUnknown') }
     if ($null -eq $kind -or $kind -ceq 'absent') {
         if ($null -ne $kinds -and $kinds.Count) { throw (T 'WkRetainedProofUnknown') }
@@ -489,7 +490,10 @@ function Get-CodexRetainedKinds([object]$Record) {
     }
 }
 function Set-MarkerVendorAbsence([Collections.IDictionary]$Marker,[object]$Report,[string]$State) {
+    # 재시도 중 기존 증명을 누락·불일치 응답으로 없애지 않는다. 잘못된 표지도 먼저 거절한다.
+    $previous=@(Get-CodexRetainedKinds $Marker)
     $kinds=@(Get-CodexRetainedKinds $Report)
+    if ($previous.Count -and ($Marker.agent -cne 'codex-desktop' -or $State -cne 'rolled_back' -or ($previous -join '|') -cne ($kinds -join '|'))) { throw (T 'WkRetainedProofUnknown') }
     if ($kinds.Count) {
         if ($Marker.agent -cne 'codex-desktop' -or $State -cne 'rolled_back') { throw (T 'WkRetainedProofUnknown') }
         $Marker.absenceKind='retained'; $Marker.retainedKinds=[string[]]$kinds

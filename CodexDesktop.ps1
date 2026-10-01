@@ -260,7 +260,10 @@ $script:CodexDesktopOps=@{
         }
         $desktopRoot=Get-DesktopHome $R
         switch -CaseSensitive ([string]$R.mode) {
-            status { return @{state=(Get-DesktopRecord $desktopRoot ([string]$R.operationId)).state} }
+            status {
+                $row=Get-DesktopRecord $desktopRoot ([string]$R.operationId)
+                return @{state=$row.state;absenceKind=$row.absenceKind;retainedKinds=$row.retainedKinds}
+            }
             list { return @{records=@(Get-DesktopRecordRows $desktopRoot)} }
             rollback {
                 $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)

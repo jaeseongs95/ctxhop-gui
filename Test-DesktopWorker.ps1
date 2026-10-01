@@ -430,6 +430,37 @@ try {
     Assert ($again.absenceKind -ceq 'retained' -and $again.message -match '보존했습니다') 'an already rolled back Go record keeps its truthful retained result'
     $retainedMarker=@{operationId=$goRecord.operationId;agent='codex-desktop';home=$desktopRoot;absenceKind='retained';retainedKinds='state.migrationCursor|queue.revision|agentMessageBoard.deletedBoard'}
     Assert (-not (Test-DoneRecord $retainedMarker)) 'a malformed marker cannot match valid retained terminal metadata by joining strings'
+    # Go는 이미 완료됐지만 Worker 표지만 남은 실제 재시도는 status 경로로 증명을 가져온다.
+    foreach ($savedProof in @($false,$true)) {
+        $retryOp=[guid]::NewGuid().ToString('N')
+        $retryMarker=New-Marker ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id}) $retryOp @() $null 'conversation' $goRecord.recordId 'vendor'
+        if ($savedProof) { $retryMarker.absenceKind='retained'; $retryMarker.retainedKinds=$script:GoRetainedKinds; Save-Marker $retryMarker }
+        $retryBefore=$script:Calls.Count
+        $retry=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$retryOp}
+        Assert ($retry.outcome -ceq 'rolled_back' -and $retry.absenceKind -ceq 'retained' -and ($retry.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and $retry.message -match '보존했습니다') 'Worker retry preserves retained proof and truthful message with or without saved proof'
+        $retryDone=Get-Content -LiteralPath (Join-Path (Get-JournalDir) "done\$retryOp.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert ($retryDone.absenceKind -ceq 'retained' -and ($retryDone.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and -not [IO.File]::Exists((Join-Path (Get-JournalDir) "$retryOp.json"))) 'Worker retry saves matching retained terminal metadata before clearing its marker'
+        Assert (-not @($script:Calls | Select-Object -Skip $retryBefore | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'rollback'}).Count) 'an already rolled back Worker retry does not invoke Go rollback again'
+    }
+    # 새 상태 보고가 누락되거나 달라지면 기존 증명을 보존한 채 attention으로 남긴다.
+    $realVendor=${function:Invoke-Vendor}
+    foreach ($changedProof in @($false,$true)) {
+        $retryOp=[guid]::NewGuid().ToString('N')
+        $retryMarker=New-Marker ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id}) $retryOp @() $null 'conversation' $goRecord.recordId 'vendor'
+        $retryMarker.absenceKind='retained'; $retryMarker.retainedKinds=$script:GoRetainedKinds; Save-Marker $retryMarker
+        $script:ChangedRetainedProof=$changedProof
+        function Invoke-Vendor { param($Job,$Op,$Body)
+            if ($Op -ceq 'recover' -and $Body.mode -ceq 'status') {
+                if ($script:ChangedRetainedProof) { return @{state='rolled_back';absenceKind='retained';retainedKinds=@('queue.revision')} }
+                return @{state='rolled_back'}
+            }
+            & $realVendor $Job $Op $Body
+        }
+        try { $retry=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$retryOp} } finally { ${function:Invoke-Vendor}=$realVendor }
+        $saved=Get-Content -LiteralPath (Join-Path (Get-JournalDir) "$retryOp.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert ($retry.outcome -ceq 'attention' -and $saved.absenceKind -ceq 'retained' -and ($saved.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and -not [IO.File]::Exists((Join-Path (Get-JournalDir) "done\$retryOp.json"))) 'missing or changed vendor proof cannot erase the saved marker or create terminal success'
+        [IO.File]::Delete((Join-Path (Get-JournalDir) "$retryOp.json"))
+    }
     $script:GoRetainedKinds=$null
     Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'rollback'}).Count -eq 1) 'Go record rollback invokes Go'
     Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go rollback never invokes Python'
@@ -443,6 +474,26 @@ try {
         Assert ((Get-DesktopRecord $desktopRoot $badOp).state -ceq 'unreadable') 'malformed retained journal is unreadable and preserved'
         Throws {New-DesktopRollbackResult ([pscustomobject]$badJournal) 'fixture'} '보존한 엔진 기록'
         [IO.File]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp\journal.json"))
+    }
+    # absenceKind의 배열 비교·scalar 변환은 journal/done/marker에서 성공 증명이 될 수 없다.
+    $badTags=@([pscustomobject]@{value=@('absent')},[pscustomobject]@{value=@('absent','retained')},[pscustomobject]@{value=@{kind='absent'}},[pscustomobject]@{value=1},[pscustomobject]@{value=$true})
+    foreach ($case in $badTags) {
+        $badOp=[guid]::NewGuid().ToString('N')
+        $badJournal=@{status='rolled_back';home=$desktopRoot;id=$script:Id;impl='ctxhop-codex';absenceKind=$case.value;retainedKinds=@()}
+        Write-RunJournal $badOp ($badJournal | ConvertTo-Json -Compress -Depth 5)
+        Assert ((Get-DesktopRecord $desktopRoot $badOp).state -ceq 'unreadable') 'non-string absenceKind journal is rejected'
+        $plainMarker=@{operationId=$badOp;agent='codex-desktop';home=$desktopRoot}
+        $badDone=@{version=1;operationId=$badOp;agent='codex-desktop';home=$desktopRoot;outcome='rolled_back';vendorState='rolled_back';project=@{complete=$true};absenceKind=$case.value;retainedKinds=@()}
+        Save-ProjectJson (Join-Path (Get-JournalDir) "done\$badOp.json") $badDone
+        Assert (-not (Test-DoneRecord $plainMarker)) 'non-string absenceKind done cannot authorize marker removal'
+        $badDone.Remove('absenceKind'); $badDone.Remove('retainedKinds')
+        Save-ProjectJson (Join-Path (Get-JournalDir) "done\$badOp.json") $badDone
+        $plainMarker.absenceKind=$case.value; $plainMarker.retainedKinds=@()
+        Assert (-not (Test-DoneRecord $plainMarker)) 'non-string absenceKind marker cannot match a valid done record'
+        Throws {Set-MarkerVendorAbsence $plainMarker @{state='rolled_back'} 'rolled_back'} '보존한 엔진 기록'
+        Assert ($plainMarker.ContainsKey('absenceKind')) 'marker refresh does not silently clear malformed absence metadata'
+        [IO.File]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp\journal.json"))
+        [IO.File]::Delete((Join-Path (Get-JournalDir) "done\$badOp.json"))
     }
     $script:GoFail=$false; $script:GoState='exists'
     $script:State='conflict'; $job.action='Preview'; $r=Invoke-JobCore $job
