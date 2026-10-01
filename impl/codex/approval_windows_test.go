@@ -339,7 +339,7 @@ func TestApprovalResourceAndJournalBounds(t *testing.T) {
 }
 
 func TestApprovalRejectsChangedCanonicalHeaderAndReparse(t *testing.T) {
-	for _, kind := range []string{"root-parent", "duplicate-header", "member-junction"} {
+	for _, kind := range []string{"root-parent", "copied-header", "copied-header-invalid", "member-junction"} {
 		t.Run(kind, func(t *testing.T) {
 			o, f, _ := approvalFixture(t)
 			root := filepath.Dir(o.ApprovalEvidence.ManifestPath)
@@ -361,8 +361,19 @@ func TestApprovalRejectsChangedCanonicalHeaderAndReparse(t *testing.T) {
 			} else {
 				raw := append([]byte(nil), f.Members[0].Raw...)
 				end := bytes.IndexByte(raw, '\n')
-				if kind == "duplicate-header" {
-					raw = append(raw, raw[:end+1]...)
+				if strings.HasPrefix(kind, "copied-header") {
+					v, e := parseJSON(raw[:end])
+					if e != nil {
+						t.Fatal(e)
+					}
+					header := obj(obj(v)["payload"])
+					header["id"] = otherID
+					header["session_id"] = childID
+					header["parent_thread_id"] = rootID
+					if kind == "copied-header-invalid" {
+						header["session_id"] = nil
+					}
+					raw = append(raw, append(encoded(v), '\n')...)
 				} else {
 					v, e := parseJSON(raw[:end])
 					if e != nil {
@@ -384,6 +395,18 @@ func TestApprovalRejectsChangedCanonicalHeaderAndReparse(t *testing.T) {
 				o.ApprovalEvidence.ManifestSHA256 = digest(manifest)
 			}
 			l, e := pinApproval(o, f.Members)
+			if kind == "copied-header" {
+				if e != nil {
+					t.Fatal("canonical copied fork metadata rejected", e)
+				}
+				if l.Manifest.Members[0].ID != rootID || l.Manifest.Members[0].SessionID != rootID || l.Manifest.Members[0].ParentID != nil || l.Manifest.Members[0].ImmutableRolloutIDs[0] != rootID {
+					t.Fatal("later metadata promoted to owner")
+				}
+				if e = l.Close(); e != nil {
+					t.Fatal(e)
+				}
+				return
+			}
 			if e == nil {
 				l.Close()
 				t.Fatal("changed canonical source accepted", kind)

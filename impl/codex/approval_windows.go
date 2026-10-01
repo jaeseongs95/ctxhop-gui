@@ -345,7 +345,13 @@ func pinApproval(o options, ms []member) (lease *approvalLease, retErr error) {
 				}
 				first = false
 			} else if record["type"] == "session_meta" {
-				return nil, fail("approval_evidence", "승인 member 중복 header")
+				// recorder::load_rollout_items keeps copied fork metadata; only the
+				// first header supplies this member's ownership mapping.
+				_, e := canonicalRolloutSessionID(header)
+				parent := header["parent_thread_id"]
+				if e != nil || !uuidRE.MatchString(text(header["id"])) || parent != nil && !uuidRE.MatchString(text(parent)) {
+					return nil, fail("approval_evidence", "복사된 session_meta 타입 오류")
+				}
 			}
 		}
 		if first {
