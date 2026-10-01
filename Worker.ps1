@@ -548,6 +548,7 @@ function Test-DoneRecord([Collections.IDictionary]$Marker) {
     if ($done.version -ne 1 -or [string]$done.operationId -cne [string]$Marker.operationId -or [string]$done.agent -cne [string]$Marker.agent -or [string]$done.home -cne [string]$Marker.home) { return $false }
     try {
         $retained=@(Get-CodexRetainedKinds $done)
+        $null=@(Get-CodexRetainedKinds $Marker)
         if ($retained.Count) {
             if ($Marker.agent -cne 'codex-desktop' -or $done.outcome -cne 'rolled_back' -or $done.vendorState -cne 'rolled_back' -or $Marker.absenceKind -cne 'retained' -or (@($Marker.retainedKinds) -join '|') -cne ($retained -join '|')) { return $false }
         } elseif ($Marker.absenceKind -ceq 'retained') { return $false }

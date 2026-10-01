@@ -428,6 +428,8 @@ try {
     Assert ($retainedDone.absenceKind -ceq 'retained' -and ($retainedDone.retainedKinds -join '|') -ceq ($script:GoRetainedKinds -join '|') -and -not [IO.File]::Exists((Join-Path $testDirectory "CtxHopGUI\journal\$($goRecord.operationId).json"))) 'retained proof is preserved in the terminal record before clearing the marker'
     $again=Invoke-Vendor ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot}) 'recover' @{mode='rollback';recordId=$goRecord.recordId}
     Assert ($again.absenceKind -ceq 'retained' -and $again.message -match '보존했습니다') 'an already rolled back Go record keeps its truthful retained result'
+    $retainedMarker=@{operationId=$goRecord.operationId;agent='codex-desktop';home=$desktopRoot;absenceKind='retained';retainedKinds='state.migrationCursor|queue.revision|agentMessageBoard.deletedBoard'}
+    Assert (-not (Test-DoneRecord $retainedMarker)) 'a malformed marker cannot match valid retained terminal metadata by joining strings'
     $script:GoRetainedKinds=$null
     Assert (@($script:Calls | Select-Object -Skip $before | Where-Object {$_.kind -ceq 'go' -and $_.arguments[0] -ceq 'rollback'}).Count -eq 1) 'Go record rollback invokes Go'
     Assert (-not @($script:Calls | Select-Object -Skip $before | Where-Object kind -eq 'backend').Count) 'Go rollback never invokes Python'
