@@ -103,6 +103,7 @@ $manifest = @{
         normalEvents=448;events=512;normalRawBytes=917504;rawBytes=1048576;receiptBytes=65536;processes=2;threadsPerProcess=64}
     fixturePlanSha256='7f549a220081dd27f6a06ac0342ef121b3fa1e9096e2f42b2f832647f4a00099'
     actualProbe=0; runtimeCompatibility='notTested'; engineAcceptance='notRun'
+    powerShellVersion=$PSVersionTable.PSVersion.ToString(); osVersion=[Environment]::OSVersion.VersionString
 }
 Write-NewJson "$OutputRoot\build-manifest.json" $manifest
 Descriptor "$OutputRoot\build-manifest.json" | ConvertTo-Json -Depth 4

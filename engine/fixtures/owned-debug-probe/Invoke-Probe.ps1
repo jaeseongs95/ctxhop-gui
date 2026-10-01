@@ -137,6 +137,7 @@ try {
     $process = [Diagnostics.Process]::Start($start)
     $runtimeLaunches++
     try {
+        $observerBirth=$process.StartTime.ToUniversalTime().ToFileTimeUtc()
         $stdout=$process.StandardOutput.ReadToEndAsync(); $stderr=$process.StandardError.ReadToEndAsync()
         $completed=$process.WaitForExit(30000)
         if (!$completed) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
@@ -155,6 +156,7 @@ try {
         $records=@(Get-Content -LiteralPath $rawPath | ForEach-Object { $_ | ConvertFrom-Json -AsHashtable })
         if (!$completed -or $exitCode -ne 0 -or !$receipt.lifecycleSupported -or $receipt.runId -cne $recipe.runId -or
             $receipt.manifestSha256 -cne $ApprovedLaunchManifestSha256 -or $receipt.observerPid -ne $pidValue -or
+            $receipt.observerBirth -ne $observerBirth -or
             $receipt.observerSha256 -cne $observerDescriptor[0].sha256 -or $receipt.helperSha256 -cne $helperDescriptor[0].sha256 -or
             $receipt.events -ne $records.Count -or $receipt.continued -ne $records.Count -or $records.Count -gt 512 -or
             $receipt.activeProcesses -ne 0 -or $receipt.totalProcesses -ne 2 -or $receipt.failure -ne 0 -or
@@ -173,15 +175,27 @@ try {
             $record=$records[$i]
             if ($record.seq -ne $i+1 -or !$record.continued -or $record.thread -ne $receipt.observerThread -or
                 $record.failure -ne 0 -or $record.slot -notin @(0,1) -or $record.ms -gt 15000 -or
-                $record.pid -ne ($record.slot -eq 0 ? $receipt.parent.pid : $receipt.child.pid)) { throw 'Raw event binding rejected' }
+                $record.pid -ne ($record.slot -eq 0 ? $receipt.parent.pid : $receipt.child.pid) -or
+                $record.birth -ne ($record.slot -eq 0 ? $receipt.parent.birth : $receipt.child.birth)) { throw 'Raw event binding rejected' }
         }
         Write-NewJson "$($recipe.root)\out\runner-receipt.json" @{
             schemaVersion=1;actualProbe=$runtimeLaunches;buildManifestSha256=$ApprovedBuildManifestSha256;
             launchManifestSha256=$ApprovedLaunchManifestSha256;runId=$recipe.runId;sourceCommit=$manifest.sourceCommit;
             observerExit=$exitCode;stdout=$outText;stderr=$errText;nativeReceiptSha256=(Get-FileHash -LiteralPath $receiptPath).Hash.ToLowerInvariant();
             rawSha256=(Get-FileHash -LiteralPath $rawPath).Hash.ToLowerInvariant();lifecycleSupported=$true;
+            osVersion=[Environment]::OSVersion.VersionString;powerShellVersion=$PSVersionTable.PSVersion.ToString();
             fileEffects='NOT_OBSERVABLE';networkEffects='NOT_OBSERVABLE';engineAcceptance='notRun'
         }
+    } catch {
+        # A partial or rejected native receipt never becomes a successful run.
+        Write-NewJson "$($recipe.root)\out\runner-failure.json" @{
+            schemaVersion=1;actualProbe=$runtimeLaunches;runId=$recipe.runId;
+            buildManifestSha256=$ApprovedBuildManifestSha256;launchManifestSha256=$ApprovedLaunchManifestSha256;
+            status='failed';reason=$_.Exception.Message;cleanup='unproven';
+            lifecycleSupported=$false;fileEffects='NOT_OBSERVABLE';networkEffects='NOT_OBSERVABLE';
+            engineAcceptance='notRun'
+        }
+        throw
     } finally { $process.Dispose() }
 } finally {
     for ($pinIndex=$pins.Count-1;$pinIndex -ge 0;$pinIndex--) { $pins[$pinIndex].Dispose() }

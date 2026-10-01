@@ -86,8 +86,8 @@ static void sample_exit(Life *life) {
     if (wait == WAIT_OBJECT_0) {
         DWORD code;
         life->signaled = TRUE;
-        if (!GetExitCodeProcess(life->retained, &code) || code != life->exitCode)
-            fail(34, GetLastError());
+        if (!GetExitCodeProcess(life->retained, &code)) fail(34, GetLastError());
+        else if (code != life->exitCode) fail(34, 0);
         own_close(&life->retained);
         life->referenceClosed = TRUE;
     } else if (wait == WAIT_FAILED) fail(35, GetLastError());
@@ -235,15 +235,18 @@ int wmain(int argc, wchar_t **argv)
                 current->member=member;
                 if (!member) fail(22,0);
                 imageLength=MAX_PATH;
-                if (!QueryFullProcessImageNameW(event.u.CreateProcessInfo.hProcess,0,imagePath,&imageLength)
-                    || _wcsicmp(imagePath,helper)) fail(23,GetLastError());
-                if (!event.u.CreateProcessInfo.hFile
-                    || !GetFileInformationByHandle(event.u.CreateProcessInfo.hFile,&eventInfo)
-                    || !same_file(&helperInfo,&eventInfo)) fail(24,GetLastError());
+                if (!QueryFullProcessImageNameW(event.u.CreateProcessInfo.hProcess,0,imagePath,&imageLength))
+                    fail(23,GetLastError());
+                else if (_wcsicmp(imagePath,helper)) fail(23,0);
+                if (!event.u.CreateProcessInfo.hFile) fail(24,0);
+                else if (!GetFileInformationByHandle(event.u.CreateProcessInfo.hFile,&eventInfo))
+                    fail(24,GetLastError());
+                else if (!same_file(&helperInfo,&eventInfo)) fail(24,0);
             }
             own_close(&event.u.CreateProcessInfo.hFile);
         } else if (slot==2) {
             fail(25,0);
+            if (event.dwDebugEventCode==EXCEPTION_DEBUG_EVENT) status=DBG_EXCEPTION_NOT_HANDLED;
             if (event.dwDebugEventCode==LOAD_DLL_DEBUG_EVENT) own_close(&event.u.LoadDll.hFile);
         } else {
             Life *current=&life[slot];
@@ -279,14 +282,19 @@ int wmain(int argc, wchar_t **argv)
         }
         if (GetCurrentThreadId()!=osThread) { fail(36,0); incomplete=TRUE; break; }
         if (!ContinueDebugEvent(event.dwProcessId,event.dwThreadId,status)) {
-            fail(37,GetLastError()); incomplete=TRUE; break;
+            fail(37,GetLastError()); incomplete=TRUE;
+            sprintf_s(row,sizeof(row),
+                "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,\"continued\":false,\"failure\":%lu,\"error\":%lu}\n",
+                events,GetTickCount64()-start,osThread,event.dwDebugEventCode,
+                event.dwProcessId,event.dwThreadId,slot,failure,failureError);
+            output(row); break;
         }
         ++continued;
         if (slot<2 && event.dwDebugEventCode==EXIT_PROCESS_DEBUG_EVENT) life[slot].exitContinued=TRUE;
         sprintf_s(row,sizeof(row),
-            "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,\"continueStatus\":%lu,\"continued\":true,\"failure\":%lu,\"error\":%lu}\n",
+            "{\"seq\":%lu,\"ms\":%llu,\"thread\":%lu,\"event\":%lu,\"pid\":%lu,\"tid\":%lu,\"slot\":%lu,\"birth\":%llu,\"continueStatus\":%lu,\"continued\":true,\"failure\":%lu,\"error\":%lu}\n",
             events,GetTickCount64()-start,osThread,event.dwDebugEventCode,event.dwProcessId,
-            event.dwThreadId,slot,status,failure,failureError);
+            event.dwThreadId,slot,slot<2 ? life[slot].birth : 0,status,failure,failureError);
         output(row);
     }
     sample_exit(&life[0]); sample_exit(&life[1]);
