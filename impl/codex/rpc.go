@@ -47,7 +47,7 @@ func enginePath(o options) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	if !hashRE.MatchString(engineSHA256) || loaderContractID == "" {
+	if !hashRE.MatchString(engineSHA256) || !strings.HasPrefix(loaderContractID, "ctxhop-prestart-v2:") || len(loaderContractID) == len("ctxhop-prestart-v2:") {
 		return "", fail("engine_untrusted", "검증된 protected engine 배포 pin이 없습니다")
 	}
 	if !strings.EqualFold(filepath.Base(path), "ctxhop-codex-engine.exe") {
@@ -260,7 +260,7 @@ func openEngine(o options, operation string, members []member) (*session, error)
 		}
 		descriptors = append(descriptors, object{"id": m.ID, "parentId": m.Parent, "role": role, "rolloutPath": path, "rolloutSha256": sha})
 	}
-	r, e := s.Call("ctxhop/prepare", object{"contractVersion": 1, "requestNonce": requestNonce, "operation": operation, "home": o.Home, "cwd": o.Cwd, "offline": true, "members": descriptors})
+	r, e := s.Call("ctxhop/prepare", object{"contractVersion": 2, "requestNonce": requestNonce, "operation": operation, "home": o.Home, "cwd": o.Cwd, "offline": true, "members": descriptors})
 	if e != nil {
 		p.close()
 		var re *rpcError
@@ -277,7 +277,7 @@ func openEngine(o options, operation string, members []member) (*session, error)
 			return nil, fail("prestart_schema", "DB 관측 전 member snapshot 완성 금지")
 		}
 	}
-	if e = validateProjection(r, requestNonce, operation, o, checkMembers, int64(p.PID)); e != nil {
+	if e = validateProjection(r, requestNonce, operation, o, checkMembers, int64(p.PID), nil); e != nil {
 		p.close()
 		return nil, e
 	}
@@ -291,58 +291,68 @@ func openEngine(o options, operation string, members []member) (*session, error)
 }
 func (s *session) bind() {
 	s.Binding = object{}
-	for _, k := range []string{"requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest"} {
+	for _, k := range []string{"contractVersion", "requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest"} {
 		s.Binding[k] = s.Projection[k]
 	}
 	s.Binding["operation"] = s.Operation
 }
 func (s *session) complete(observed dbView) error {
 	if observed.Acquisition != nil && observed.Acquisition.Aggregate != nil {
-		return fail("engine_db_unknown", "v2 aggregate proof/catalog/schema 연결 전 complete 금지")
+		return fail("engine_db_unknown", "실제8 schema·metadata·strict inventory 검증 전 운영 complete 금지")
 	}
 	if s.Projection["inputComplete"] == true {
 		return nil
 	}
-	observation := observed.Observation
-	if observed.Acquisition != nil {
-		if e := observed.Acquisition.VerifyPrivate(); e != nil {
-			return e
-		}
-		current, e := observed.Acquisition.Observation()
-		if e != nil {
-			return e
-		}
-		if !bytes.Equal(encoded(observation), encoded(current)) {
-			return fail("engine_db_changed", "U-a 이후 acquisition 변경")
-		}
-	} else if s.P != nil {
-		return fail("engine_db_unknown", "complete에 유지된 raw acquisition 누락")
+	// Production admission remains closed until the actual eight-store schema,
+	// canonical metadata and strict file inventory are wired. A v1 state view is
+	// never promoted. The same v2 adapter is exercised by protocol-only fixtures.
+	if s.P != nil || observed.Acquisition != nil {
+		return fail("engine_db_unknown", "검증된 v2 전체 store proof가 없는 운영 complete 금지")
 	}
-	if e := validateObservation(observation, text(s.Projection["stateDb"])); e != nil {
+	observation := observed.StoreObservation
+	targets, e := validateStoreTargetsV2(s.Projection["proofTargets"], s.Options.Home)
+	if e != nil {
+		return e
+	}
+	d, e := validateStoreObservationV2(observation, s.Options.Home, targets)
+	if e != nil {
+		return e
+	}
+	local := object{"acquisitionId": observation["acquisitionId"], "storeObservationDigest": d, "storeProof": observed.StoreProof}
+	if e = validateStoreBindingsV2(local, observation, s.Options.Home, targets, s.Members, true); e != nil {
+		return e
+	}
+	localProof, e := storeCanonicalJSON(observed.StoreProof)
+	if e != nil {
+		return e
+	}
+	if e = validateRPCBindingV2(s.Binding); e != nil {
 		return e
 	}
 	params := object{}
 	for k, v := range s.Binding {
 		params[k] = v
 	}
-	params["dbObservation"] = observation
+	params["storeObservation"] = observation
 	r, e := s.Call("ctxhop/complete", params)
 	if e != nil {
 		return e
 	}
-	if observed.Acquisition != nil {
-		if e := observed.Acquisition.VerifyPrivate(); e != nil {
-			return e
-		}
-	}
 	oldGen, _ := integer(s.Projection["generation"])
 	newGen, _ := integer(r["generation"])
-	if newGen <= oldGen || text(r["processNonce"]) != text(s.Projection["processNonce"]) || text(r["snapshotId"]) != text(s.Projection["snapshotId"]) || r["inputComplete"] != true || r["acquisitionId"] != obj(observation["acquisition"])["acquisitionId"] {
+	if newGen <= oldGen || text(r["processNonce"]) != text(s.Projection["processNonce"]) || text(r["snapshotId"]) != text(s.Projection["snapshotId"]) || r["inputComplete"] != true || r["acquisitionId"] != observation["acquisitionId"] {
 		return fail("prestart_binding", "최종 complete binding 오류")
 	}
 	pid, _ := integer(s.Projection["processId"])
-	if e = validateProjection(r, text(s.Projection["requestNonce"]), s.Operation, s.Options, s.Members, pid); e != nil {
+	if e = validateProjection(r, text(s.Projection["requestNonce"]), s.Operation, s.Options, s.Members, pid, observation); e != nil {
 		return e
+	}
+	providerProof, e := storeCanonicalJSON(r["storeProof"])
+	if e != nil {
+		return e
+	}
+	if !bytes.Equal(providerProof, localProof) {
+		return fail("prestart_binding", "Go/provider typed store proof 불일치")
 	}
 	s.Projection = r
 	s.bind()
@@ -417,15 +427,15 @@ func validateObservation(raw object, state string) error {
 	}
 	return nil
 }
-func validateProjection(r object, n, operation string, o options, members []member, pid int64) error {
-	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "effects") {
+func validateProjection(r object, n, operation string, o options, members []member, pid int64, observation object) error {
+	if !exact(r, "contractVersion", "requestNonce", "processId", "processNonce", "snapshotId", "generation", "engineVersion", "loaderContractId", "inputComplete", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "contexts", "authResolution", "policyResolution", "validity", "projectionDigest", "acquisitionId", "storeObservationDigest", "storeProof", "effects") {
 		return fail("prestart_schema", "알 수 없는 prepare projection 구조")
 	}
 	version, ok := integer(r["contractVersion"])
 	processID, pok := integer(r["processId"])
 	gen, gok := integer(r["generation"])
 	partial := r["inputComplete"] == false && len(members) == 0 && operation != "plan" && operation != "bootstrap"
-	if !ok || version != 1 || !pok || processID != pid || !gok || gen < 1 || text(r["requestNonce"]) != n || text(r["processNonce"]) == "" || text(r["snapshotId"]) == "" || !hashRE.MatchString(text(r["projectionDigest"])) || text(r["loaderContractId"]) != loaderContractID || !versionAllowed(text(r["engineVersion"])) || r["inputComplete"] != true && !partial || r["sqliteRedirect"] != false {
+	if !ok || version != 2 || !pok || processID != pid || !gok || gen < 1 || text(r["requestNonce"]) != n || text(r["processNonce"]) == "" || text(r["snapshotId"]) == "" || !hashRE.MatchString(text(r["projectionDigest"])) || !strings.HasPrefix(loaderContractID, "ctxhop-prestart-v2:") || len(loaderContractID) == len("ctxhop-prestart-v2:") || text(r["loaderContractId"]) != loaderContractID || !versionAllowed(text(r["engineVersion"])) || r["inputComplete"] != true && !partial || r["sqliteRedirect"] != false {
 		return fail("prestart_binding", "prepare binding/입력 완전성 오류")
 	}
 	for _, k := range []string{"home", "normalSqliteHome", "operationSqliteHome"} {
@@ -456,27 +466,32 @@ func validateProjection(r object, n, operation string, o options, members []memb
 			return fail("prestart_expired", "준비 정책 유효기간 오류")
 		}
 	}
-	targets := array(r["writeTargets"])
-	kinds := map[string]bool{"state": false, "logs": false, "goals": false, "memories": false, "memoriesV2": false, "queue": false, "threadHistory": false}
-	paths := map[string]bool{}
-	if len(targets) != len(kinds) {
-		return fail("prestart_targets", "DB write descriptor 누락")
+	targets, e := validateStoreTargetsV2(r["proofTargets"], o.Home)
+	if e != nil {
+		return e
 	}
-	for _, v := range targets {
-		t := obj(v)
-		kind, path := text(t["kind"]), text(t["path"])
-		seen, known := kinds[kind]
-		if !exact(t, "kind", "path") || !known || seen || !filepath.IsAbs(path) || !within(o.Home, path) || samePath(path, o.Home) || paths[strings.ToLower(filepath.Clean(path))] {
-			return fail("prestart_targets", "DB write descriptor 오류")
+	writesTargets, e := validateStoreTargetsV2(r["writeTargets"], o.Home)
+	if e != nil {
+		return e
+	}
+	for i, target := range targets {
+		if !samePath(target.Path, writesTargets[i].Path) {
+			return fail("prestart_targets", "proof/write descriptor 불일치")
 		}
-		if e := noReparse(path); e != nil {
+		if e := noReparse(target.Path); e != nil {
 			return e
 		}
-		if kind == "state" && !samePath(path, text(r["stateDb"])) {
-			return fail("prestart_targets", "state descriptor 불일치")
+		if e := noReparse(writesTargets[i].Path); e != nil {
+			return e
 		}
-		kinds[kind] = true
-		paths[strings.ToLower(filepath.Clean(path))] = true
+	}
+	storeBinding := object{"acquisitionId": r["acquisitionId"], "storeObservationDigest": r["storeObservationDigest"], "storeProof": r["storeProof"]}
+	var rawObservation any
+	if observation != nil {
+		rawObservation = observation
+	}
+	if e := validateStoreBindingsV2(storeBinding, rawObservation, o.Home, targets, members, acquired); e != nil {
+		return e
 	}
 	projects := array(r["projectConfig"])
 	if projects == nil {
@@ -628,6 +643,9 @@ func (s *session) activate() error {
 	if s.Projection["inputComplete"] != true {
 		return fail("prestart_incomplete", "complete 전 activate 금지")
 	}
+	if e := validateRPCBindingV2(s.Binding); e != nil {
+		return e
+	}
 	for _, step := range []struct{ method, key string }{{"ctxhop/accept", "accepted"}, {"ctxhop/activate", "activated"}} {
 		if e := s.revalidateHandoff(); e != nil {
 			return e
@@ -636,7 +654,7 @@ func (s *session) activate() error {
 		if e != nil {
 			return e
 		}
-		if r[step.key] != true {
+		if !exact(r, "contractVersion", "requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest", "operation", step.key) || r[step.key] != true {
 			return fail("activation_binding", "activation 승인 누락")
 		}
 		for k, v := range s.Binding {

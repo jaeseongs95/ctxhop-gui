@@ -30,7 +30,7 @@ func summary(f *family) object {
 }
 func stableProjection(p object) object {
 	r := object{}
-	for _, k := range []string{"engineVersion", "loaderContractId", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "projectConfig", "authResolution", "policyResolution", "validity"} {
+	for _, k := range []string{"contractVersion", "engineVersion", "loaderContractId", "home", "normalSqliteHome", "operationSqliteHome", "stateDb", "sqliteRedirect", "writeTargets", "proofTargets", "projectConfig", "authResolution", "policyResolution", "validity"} {
 		r[k] = p[k]
 	}
 	return r

@@ -417,7 +417,11 @@ type dbView struct {
 	Hashes      map[string]string
 	Acquisition *dbAcquisition
 	Observation object
-	Backend     object
+	// V2 fields are deliberately separate from the historical state-only view.
+	// Native admission does not populate them until actual8 proof gates pass.
+	StoreObservation object
+	StoreProof       object
+	Backend          object
 }
 
 func checkDB(home, statePath string, members []member, allowMissing bool) (dbView, error) {

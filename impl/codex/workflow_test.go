@@ -14,6 +14,7 @@ type mockHome struct {
 	Archived bool
 }
 type mockEngine struct {
+	T           *testing.T
 	Homes       map[string]*mockHome
 	Active      bool
 	Deletes     int
@@ -28,8 +29,8 @@ func installMock(t *testing.T, f *family) *mockEngine {
 	oldPrepare, oldGuard, oldState, oldPreparedState := prepareEngine, checkGuard, readState, readPreparedState
 	oldPin, oldLoader := engineSHA256, loaderContractID
 	engineSHA256 = strings.Repeat("a", 64)
-	loaderContractID = "fixture"
-	m := &mockEngine{Homes: map[string]*mockHome{}, Family: f}
+	loaderContractID = "ctxhop-prestart-v2:fixture"
+	m := &mockEngine{T: t, Homes: map[string]*mockHome{}, Family: f}
 	prepareEngine = m.prepare
 	checkGuard = func(p *process) error {
 		m.Events = append(m.Events, "guard")
@@ -60,7 +61,16 @@ func installMock(t *testing.T, f *family) *mockEngine {
 		if hash := v.Hashes[state+"-wal"]; hash != "absent" {
 			wal = hash
 		}
-		v.Observation = mockObservation(state, v.Hashes[state], wal)
+		v.StoreObservation = mockStoreObservation(state, v.Hashes[state], wal)
+		targets := []storeTarget{}
+		for _, spec := range storeSpecs {
+			targets = append(targets, storeTarget{spec.Kind, filepath.Join(home, spec.Filename)})
+		}
+		d, proofError := validateStoreObservationV2(v.StoreObservation, home, targets)
+		if proofError != nil {
+			return v, proofError
+		}
+		v.StoreProof = wireStoreProof(t, d, ms)
 		return v, e
 	}
 	t.Cleanup(func() {
@@ -87,6 +97,39 @@ func mockObservation(state, hash string, wal any) object {
 		"source":  object{"directoryIdentity": strings.Repeat("1", 24), "main": main("2", hash), "wal": sw, "shm": nil},
 		"private": object{"directory": filepath.Join(os.TempDir(), "mock-private-acquisition"), "directoryIdentity": strings.Repeat("3", 24), "main": main("4", hash), "wal": pw},
 	}}
+}
+
+// These provenance identities and zero counts model only the wire protocol.
+// They are never native schema, ownership, inventory or admission evidence.
+func mockStoreObservation(state, hash string, wal any) object {
+	legacy := mockObservation(state, hash, wal)
+	acq := obj(legacy["acquisition"])
+	privateRoot := text(obj(acq["private"])["directory"])
+	obj(acq["private"])["directory"] = filepath.Join(privateRoot, "state")
+	stores := []any{}
+	for i, spec := range storeSpecs {
+		var nested any
+		if i == 0 {
+			nested = acq
+		}
+		stores = append(stores, object{"kind": spec.Kind, "dbPath": filepath.Join(filepath.Dir(state), spec.Filename), "present": i == 0, "acquisition": nested})
+	}
+	return object{"schemaVersion": 2, "acquisitionId": acq["acquisitionId"], "sourceRoot": object{"directory": filepath.Dir(state), "directoryIdentity": obj(acq["source"])["directoryIdentity"]}, "privateRoot": object{"directory": privateRoot, "directoryIdentity": strings.Repeat("e", 24)}, "stores": stores}
+}
+
+func mockStoreCompleted(t *testing.T, p, observation object, members []member) {
+	t.Helper()
+	targets, e := validateStoreTargetsV2(p["proofTargets"], text(p["home"]))
+	if e != nil {
+		t.Fatal(e)
+	}
+	d, e := validateStoreObservationV2(observation, text(p["home"]), targets)
+	if e != nil {
+		t.Fatal(e)
+	}
+	p["acquisitionId"] = observation["acquisitionId"]
+	p["storeObservationDigest"] = d
+	p["storeProof"] = wireStoreProof(t, d, members)
 }
 func (m *mockEngine) home(home string) *mockHome {
 	h := m.Homes[home]
@@ -118,9 +161,12 @@ func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error
 		}
 		switch method {
 		case "ctxhop/complete":
+			if !exact(p, "contractVersion", "requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest", "operation", "storeObservation") {
+				return nil, fail("mock_rpc", "v2 complete exact8 fields")
+			}
 			r := projection(o, op, ms, true)
 			r["generation"] = num(2)
-			r["acquisitionId"] = obj(obj(p["dbObservation"])["acquisition"])["acquisitionId"]
+			mockStoreCompleted(m.T, r, obj(p["storeObservation"]), ms)
 			return r, nil
 		case "ctxhop/accept", "ctxhop/activate":
 			r := object{}

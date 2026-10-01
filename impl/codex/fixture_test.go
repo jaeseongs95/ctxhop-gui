@@ -298,12 +298,8 @@ func TestJournalAndMove(t *testing.T) {
 
 func projection(o options, op string, ms []member, complete bool) object {
 	targets := []any{}
-	for _, k := range []string{"state", "logs", "goals", "memories", "memoriesV2", "queue", "threadHistory"} {
-		name := k + "_1.sqlite"
-		if k == "state" {
-			name = "state_5.sqlite"
-		}
-		targets = append(targets, object{"kind": k, "path": filepath.Join(o.Home, name)})
+	for _, spec := range storeSpecs {
+		targets = append(targets, object{"kind": spec.Kind, "path": filepath.Join(o.Home, spec.Filename)})
 	}
 	contexts := []any{object{"memberId": nil, "ownerId": nil, "phase": "startup", "cwd": o.Cwd, "rolloutSha256": nil, "settingsDigest": nil, "contextId": "startup", "sqliteHome": o.Home}}
 	if complete {
@@ -331,17 +327,19 @@ func projection(o options, op string, ms []member, complete bool) object {
 	if acquired {
 		acquisitionID = strings.Repeat("a", 32)
 	}
-	return object{"contractVersion": num(1), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "acquisitionId": acquisitionID, "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false, "privateSqliteSidecarsMayChange": acquired}}
+	return object{"contractVersion": num(2), "requestNonce": "nonce", "processId": num(123), "processNonce": "process", "snapshotId": "snapshot", "generation": num(1), "engineVersion": "0.159.2", "loaderContractId": loaderContractID, "inputComplete": complete, "home": o.Home, "normalSqliteHome": o.Home, "operationSqliteHome": o.Home, "stateDb": filepath.Join(o.Home, "state_5.sqlite"), "sqliteRedirect": false, "writeTargets": targets, "proofTargets": clone(targets), "projectConfig": []any{}, "contexts": contexts, "authResolution": "resolved", "policyResolution": "resolved", "validity": object{"kind": "normal-loader-semantics", "revision": "stable-input", "expiresAt": nil}, "projectionDigest": strings.Repeat("a", 64), "acquisitionId": acquisitionID, "storeObservationDigest": nil, "storeProof": nil, "effects": object{"applicationWrites": num(0), "networkRequests": num(0), "sqliteShmMayChange": false, "privateSqliteSidecarsMayChange": acquired}}
 }
 func TestProjectionAndToken(t *testing.T) {
 	old := loaderContractID
-	loaderContractID = "fixture"
+	loaderContractID = "ctxhop-prestart-v2:fixture"
 	defer func() { loaderContractID = old }()
 	o := options{Home: t.TempDir(), Cwd: t.TempDir()}
 	f := fixtureFamily("legacy")
 	support(f, o.Home)
 	p := projection(o, "import", f.Members, true)
-	if e := validateProjection(p, "nonce", "import", o, f.Members, 123); e != nil {
+	observation := mockStoreObservation(text(p["stateDb"]), strings.Repeat("a", 64), nil)
+	mockStoreCompleted(t, p, observation, f.Members)
+	if e := validateProjection(p, "nonce", "import", o, f.Members, 123, observation); e != nil {
 		t.Fatal(e)
 	}
 	for _, mutation := range []struct {
@@ -351,7 +349,7 @@ func TestProjectionAndToken(t *testing.T) {
 		t.Run(mutation.name, func(t *testing.T) {
 			q := obj(clone(p))
 			mutation.f(q)
-			if e := validateProjection(q, "nonce", "import", o, f.Members, 123); e == nil {
+			if e := validateProjection(q, "nonce", "import", o, f.Members, 123, observation); e == nil {
 				t.Fatal("accepted")
 			}
 		})
