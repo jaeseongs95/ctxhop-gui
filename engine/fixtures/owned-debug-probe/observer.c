@@ -64,7 +64,7 @@ static BOOL hex_arg(const wchar_t *text, size_t n) {
 static BOOL plain_path(const wchar_t *path) {
     DWORD attributes;
     wchar_t copy[MAX_PATH], *end;
-    if (wcslen(path) >= MAX_PATH || path[1] != L':' || path[2] != L'\\'
+    if (wcslen(path) < 3 || wcslen(path) >= MAX_PATH || path[1] != L':' || path[2] != L'\\'
         || wcschr(path, L'"') || wcsstr(path, L"..")) return FALSE;
     wcscpy_s(copy, MAX_PATH, path);
     for (end = copy + 3; ; ++end) {
@@ -95,10 +95,11 @@ static void sample_exit(Life *life) {
 
 int wmain(int argc, wchar_t **argv)
 {
-    const wchar_t *helper, *run, *root, *manifest, *helperSha, *observerSha;
+    const wchar_t *helper, *run, *root, *workspace, *manifest, *helperSha, *observerSha, *workspaceName;
     wchar_t rawPath[MAX_PATH], receiptPath[MAX_PATH], cwd[MAX_PATH], command[2*MAX_PATH];
     wchar_t selfPath[MAX_PATH], imagePath[MAX_PATH];
     wchar_t expectedRoot[MAX_PATH];
+    wchar_t buildNonce[33], expectedImage[MAX_PATH];
     LPWCH environment;
     char row[2048], receipt[8192], runA[33], manifestA[65], helperA[65], observerA[65];
     HANDLE job = NULL, helperPin = INVALID_HANDLE_VALUE, observerPin = INVALID_HANDLE_VALUE;
@@ -116,17 +117,29 @@ int wmain(int argc, wchar_t **argv)
     BOOL bound = FALSE, launched = FALSE, success = FALSE, killOnExit = FALSE;
     BOOL assigned = FALSE, ownParentClosed = FALSE;
     DEBUG_EVENT event;
-    if (argc != 13 || wcscmp(argv[1], L"--helper") || wcscmp(argv[3], L"--run")
-        || wcscmp(argv[5], L"--root") || wcscmp(argv[7], L"--manifest")
-        || wcscmp(argv[9], L"--helper-sha") || wcscmp(argv[11], L"--observer-sha"))
+    if (argc != 15 || wcscmp(argv[1], L"--helper") || wcscmp(argv[3], L"--run")
+        || wcscmp(argv[5], L"--root") || wcscmp(argv[7], L"--workspace") || wcscmp(argv[9], L"--manifest")
+        || wcscmp(argv[11], L"--helper-sha") || wcscmp(argv[13], L"--observer-sha"))
         return 2;
-    helper=argv[2]; run=argv[4]; root=argv[6]; manifest=argv[8];
-    helperSha=argv[10]; observerSha=argv[12];
+    helper=argv[2]; run=argv[4]; root=argv[6]; workspace=argv[8]; manifest=argv[10];
+    helperSha=argv[12]; observerSha=argv[14];
     if (!hex_arg(run,32) || !hex_arg(manifest,64) || !hex_arg(helperSha,64)
         || !hex_arg(observerSha,64) || !plain_path(helper) || !plain_path(root)
-        || wcslen(root)>200)
+        || !plain_path(workspace) || wcslen(workspace)>180 || wcslen(root)>230)
         return 2;
-    swprintf_s(expectedRoot,MAX_PATH,L"D:\\Go\\codex-s4\\helper3-r45-fixture-owned-debug-run-%ls",run);
+    workspaceName=wcsrchr(workspace,L'\\');
+    if (!workspaceName || wcsncmp(workspaceName+1,L"ctxhop-owned-debug-",19)
+        || !hex_arg(workspaceName+20,32)) return 2;
+    if (_wcsnicmp(helper,workspace,wcslen(workspace)) || helper[wcslen(workspace)]!=L'\\'
+        || wcsncmp(helper+wcslen(workspace)+1,L"build-",6)
+        || wcslen(helper+wcslen(workspace)+1)!=49) return 2;
+    wcsncpy_s(buildNonce,33,helper+wcslen(workspace)+7,32);
+    if (!hex_arg(buildNonce,32)) return 2;
+    swprintf_s(expectedImage,MAX_PATH,L"%ls\\build-%ls\\helper.exe",workspace,buildNonce);
+    if (_wcsicmp(helper,expectedImage)) return 2;
+    swprintf_s(expectedImage,MAX_PATH,L"%ls\\build-%ls\\observer.exe",workspace,buildNonce);
+    if (!GetModuleFileNameW(NULL,selfPath,MAX_PATH) || _wcsicmp(selfPath,expectedImage)) return 2;
+    swprintf_s(expectedRoot,MAX_PATH,L"%ls\\run-%ls",workspace,run);
     if (wcscmp(root,expectedRoot)) return 2;
     if (swprintf_s(rawPath,MAX_PATH,L"%ls\\out\\events.ndjson",root)<0
         || swprintf_s(receiptPath,MAX_PATH,L"%ls\\out\\receipt.json",root)<0

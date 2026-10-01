@@ -1,8 +1,9 @@
-#requires -Version 7.0
+#requires -Version 7.4
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateSet('Prepare','Execute')][string]$Mode,
     [Parameter(Mandatory)][string]$BuildManifest,
+    [Parameter(Mandatory)][string]$FixtureWorkspace,
     [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$ApprovedBuildManifestSha256,
     [string]$LaunchManifest,
     [string]$ApprovedLaunchManifestSha256,
@@ -13,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $pins = [Collections.Generic.List[IDisposable]]::new()
 $runtimeLaunches = 0
 function Assert-PlainPath([string]$Path) {
-    if (![IO.Path]::IsPathFullyQualified($Path)) { throw 'Absolute path required' }
+    if (![IO.Path]::IsPathFullyQualified($Path) -or $Path.StartsWith('\\')) { throw 'Local absolute path required' }
     $item = Get-Item -LiteralPath $Path -Force
     while ($null -ne $item) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse: $Path" }
@@ -38,28 +39,42 @@ function Write-NewJson([string]$Path,$Value) {
     } finally { $stream.Dispose() }
 }
 function New-Recipe([string]$RunId,[string]$Observer,[string]$Helper,[string]$ManifestHash,[string]$ObserverHash,[string]$HelperHash) {
-    $root = "D:\Go\codex-s4\helper3-r45-fixture-owned-debug-run-$RunId"
+    $root = Join-Path $FixtureWorkspace ("run-$RunId")
     @{
         schemaVersion=1; runId=$RunId; root=$root; cwd="$root\cwd"
         environment=@{SystemRoot=$env:SystemRoot;WINDIR=$env:SystemRoot;HOME="$root\home";USERPROFILE="$root\home";
             CODEX_HOME="$root\home";TEMP="$root\temp";TMP="$root\temp";OWNED_DEBUG_RUN=$RunId}
-        observer=$Observer; helper=$Helper; buildManifest=$BuildManifest; buildManifestSha256=$ManifestHash
+        fixtureWorkspace=$FixtureWorkspace;observer=$Observer; helper=$Helper; buildManifest=$BuildManifest; buildManifestSha256=$ManifestHash
         observerSha256=$ObserverHash; helperSha256=$HelperHash
         parentArgv=@($Helper,'--role','parent','--run',$RunId); childArgv=@($Helper,'--role','child','--run',$RunId)
-        argv=@('--helper',$Helper,'--run',$RunId,'--root',$root,'--manifest','LAUNCH_MANIFEST_SHA256',
+        argv=@('--helper',$Helper,'--run',$RunId,'--root',$root,'--workspace',$FixtureWorkspace,'--manifest','LAUNCH_MANIFEST_SHA256',
             '--helper-sha',$HelperHash,'--observer-sha',$ObserverHash)
         normalMs=15000;cleanupMs=5000;totalMs=20000;outerMs=30000;events=512;rawBytes=1048576;receiptBytes=65536
         capabilityScope='ownedSyntheticDebugLifecycle';fileEffects='NOT_OBSERVABLE';networkEffects='NOT_OBSERVABLE'
     }
 }
 try {
+    if (![IO.Path]::IsPathFullyQualified($FixtureWorkspace) -or ![IO.Path]::IsPathFullyQualified($BuildManifest)) {
+        throw 'Absolute input required'
+    }
+    $FixtureWorkspace=[IO.Path]::GetFullPath($FixtureWorkspace).TrimEnd('\')
+    if ($FixtureWorkspace.StartsWith('\\') -or $FixtureWorkspace.Length -gt 180 -or
+        [IO.Path]::GetFileName($FixtureWorkspace) -cnotmatch '^ctxhop-owned-debug-[a-f0-9]{32}$') { throw 'Invalid owned workspace' }
+    Assert-PlainPath $FixtureWorkspace
     $BuildManifest = [IO.Path]::GetFullPath($BuildManifest)
     $buildRoot = [IO.Path]::GetDirectoryName($BuildManifest)
-    if ([IO.Path]::GetDirectoryName($buildRoot) -ne 'D:\Go\codex-s4' -or
-        [IO.Path]::GetFileName($buildRoot) -notmatch '^helper3-r45-fixture-owned-debug-build-[a-f0-9]{32}$' -or
+    if ([IO.Path]::GetDirectoryName($buildRoot) -ne $FixtureWorkspace -or
+        [IO.Path]::GetFileName($buildRoot) -notmatch '^build-[a-f0-9]{32}$' -or
         [IO.Path]::GetFileName($BuildManifest) -ne 'build-manifest.json') { throw 'Foreign build manifest path' }
     $null = Pin $BuildManifest $ApprovedBuildManifestSha256
     $manifest = Get-Content -LiteralPath $BuildManifest -Raw | ConvertFrom-Json -AsHashtable
+    if ($manifest.fixtureWorkspace -ne $FixtureWorkspace -or
+        $manifest.workspaceNonce -cne [IO.Path]::GetFileName($FixtureWorkspace).Substring(19) -or
+        $manifest.workspaceOwner.path -ne "$FixtureWorkspace\fixture-owner.json") { throw 'Workspace binding mismatch' }
+    $null = Pin $manifest.workspaceOwner.path $manifest.workspaceOwner.sha256
+    $owner = Get-Content -LiteralPath $manifest.workspaceOwner.path -Raw | ConvertFrom-Json -AsHashtable
+    if ($owner.schemaVersion -ne 1 -or $owner.workspace -ne $FixtureWorkspace -or
+        $owner.nonce -cne $manifest.workspaceNonce -or $owner.sourceCommit -cne $manifest.sourceCommit) { throw 'Foreign workspace owner' }
     if ($manifest.schemaVersion -ne 1 -or $manifest.actualProbe -ne 0 -or
         $manifest.sourceCommit -notmatch '^[a-f0-9]{40}$' -or
         $manifest.capabilityScope -ne 'ownedSyntheticDebugLifecycle' -or $manifest.images.Count -ne 2 -or
@@ -76,6 +91,13 @@ try {
         }
         $null = Pin $matches[0].path $matches[0].sha256
     }
+    # Reuse only the hash-pinned bounded process function, never builder top-level code.
+    $tokens=$null; $errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Build-Probe.ps1'),[ref]$tokens,[ref]$errors)
+    $bounded=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Invoke-BoundedProcess'},$true))
+    if ($errors.Count -or $bounded.Count -ne 1) { throw 'Bounded runner source invalid' }
+    . ([scriptblock]::Create($bounded[0].Extent.Text))
     $observer = "$buildRoot\observer.exe"; $helper = "$buildRoot\helper.exe"
     $observerDescriptor = @($manifest.images | Where-Object { $_.path -eq $observer })
     $helperDescriptor = @($manifest.images | Where-Object { $_.path -eq $helper })
@@ -86,8 +108,8 @@ try {
         if ($ExecuteReviewedProbe -or $LaunchManifest -or $ApprovedLaunchManifestSha256) { throw 'Prepare cannot execute' }
         $run = [Guid]::NewGuid().ToString('N')
         $recipe = New-Recipe $run $observer $helper $ApprovedBuildManifestSha256 $observerDescriptor[0].sha256 $helperDescriptor[0].sha256
-        $prepareRoot = 'D:\Go\codex-s4\helper3-r45-fixture-owned-debug-launch-' + [Guid]::NewGuid().ToString('N')
-        Assert-PlainPath 'D:\Go\codex-s4'
+        $prepareRoot = Join-Path $FixtureWorkspace ('launch-'+[Guid]::NewGuid().ToString('N'))
+        Assert-PlainPath $FixtureWorkspace
         if (Test-Path -LiteralPath $prepareRoot) { throw 'Prepare output already exists' }
         New-Item -ItemType Directory -Path $prepareRoot | Out-Null
         Write-NewJson "$prepareRoot\launch-manifest.json" $recipe
@@ -100,8 +122,8 @@ try {
     }
     $LaunchManifest = [IO.Path]::GetFullPath($LaunchManifest)
     $launchParent = [IO.Path]::GetDirectoryName($LaunchManifest)
-    if ([IO.Path]::GetDirectoryName($launchParent) -ne 'D:\Go\codex-s4' -or
-        [IO.Path]::GetFileName($launchParent) -notmatch '^helper3-r45-fixture-owned-debug-launch-[a-f0-9]{32}$' -or
+    if ([IO.Path]::GetDirectoryName($launchParent) -ne $FixtureWorkspace -or
+        [IO.Path]::GetFileName($launchParent) -notmatch '^launch-[a-f0-9]{32}$' -or
         [IO.Path]::GetFileName($LaunchManifest) -ne 'launch-manifest.json') { throw 'Foreign launch manifest' }
     $null = Pin $LaunchManifest $ApprovedLaunchManifestSha256
     $recipe = Get-Content -LiteralPath $LaunchManifest -Raw | ConvertFrom-Json -AsHashtable
@@ -121,7 +143,7 @@ try {
         return "$A" -ceq "$B"
     }
     if (!(Same-Tree $recipe $expected)) { throw 'Launch recipe differs from fixed contract' }
-    Assert-PlainPath 'D:\Go\codex-s4'
+    Assert-PlainPath $FixtureWorkspace
     if (Test-Path -LiteralPath $recipe.root) { throw 'Run root already exists; never reuse' }
     New-Item -ItemType Directory -Path $recipe.root | Out-Null
     foreach ($name in @('cwd','home','temp','out')) { New-Item -ItemType Directory -Path "$($recipe.root)\$name" | Out-Null }
@@ -134,18 +156,14 @@ try {
     foreach ($argument in $recipe.argv) {
         $start.ArgumentList.Add(($argument -ceq 'LAUNCH_MANIFEST_SHA256' ? $ApprovedLaunchManifestSha256 : $argument))
     }
-    $process = [Diagnostics.Process]::Start($start)
-    $runtimeLaunches++
+    $outcome = Invoke-BoundedProcess $start 30000
+    if ($null -ne $outcome.pid) { $runtimeLaunches++ }
     try {
-        $observerBirth=$process.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $stdout=$process.StandardOutput.ReadToEndAsync(); $stderr=$process.StandardError.ReadToEndAsync()
-        $completed=$process.WaitForExit(30000)
-        if (!$completed) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
-        if (!$process.HasExited) { throw 'Owned observer cleanup failed' }
-        $process.WaitForExit()
-        $exitCode=$process.ExitCode
-        $pidValue=$process.Id
-        $outText=$stdout.GetAwaiter().GetResult(); $errText=$stderr.GetAwaiter().GetResult()
+        if ($outcome.reason -or !$outcome.parentExited -or !$outcome.stdoutDrained -or !$outcome.stderrDrained) {
+            throw 'Owned observer exit/drain failed or incomplete'
+        }
+        $observerBirth=$outcome.birth; $exitCode=$outcome.exitCode; $pidValue=$outcome.pid
+        $outText=$outcome.stdout; $errText=$outcome.stderr
         if ($outText.Length -gt 8192 -or $errText.Length -gt 8192) { throw 'Observer output bound exceeded' }
         $receiptPath="$($recipe.root)\out\receipt.json"; $rawPath="$($recipe.root)\out\events.ndjson"
         Assert-PlainPath $receiptPath; Assert-PlainPath $rawPath
@@ -154,7 +172,7 @@ try {
         }
         $receipt=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
         $records=@(Get-Content -LiteralPath $rawPath | ForEach-Object { $_ | ConvertFrom-Json -AsHashtable })
-        if (!$completed -or $exitCode -ne 0 -or $receipt.schemaVersion -ne 1 -or
+        if ($exitCode -ne 0 -or $receipt.schemaVersion -ne 1 -or
             $receipt.capabilityScope -ne 'ownedSyntheticDebugLifecycle' -or $receipt.engineAcceptance -ne 'notRun' -or
             !$receipt.lifecycleSupported -or !$receipt.createProcessResult -or $receipt.runId -cne $recipe.runId -or
             $receipt.manifestSha256 -cne $ApprovedLaunchManifestSha256 -or $receipt.observerPid -ne $pidValue -or
@@ -196,11 +214,12 @@ try {
             schemaVersion=1;actualProbe=$runtimeLaunches;runId=$recipe.runId;
             buildManifestSha256=$ApprovedBuildManifestSha256;launchManifestSha256=$ApprovedLaunchManifestSha256;
             status='failed';reason=$_.Exception.Message;cleanup='unproven';
+            processOutcome=$outcome;
             lifecycleSupported=$false;fileEffects='NOT_OBSERVABLE';networkEffects='NOT_OBSERVABLE';
             engineAcceptance='notRun'
         }
         throw
-    } finally { $process.Dispose() }
+    }
 } finally {
     for ($pinIndex=$pins.Count-1;$pinIndex -ge 0;$pinIndex--) { $pins[$pinIndex].Dispose() }
 }
