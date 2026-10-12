@@ -17,6 +17,21 @@ jobs:
         with:
           go-version: '1.27.1'
           cache: false
+      - name: Go fixtures and static checks (no vendor engine)
+        shell: powershell
+        run: |
+          Push-Location impl/codex
+          try {
+            go test -count=1 ./...
+            if ($LASTEXITCODE -ne 0) { throw 'Go fixtures failed' }
+            go vet ./...
+            if ($LASTEXITCODE -ne 0) { throw 'Go static checks failed' }
+          } finally { Pop-Location }
+      - name: Preparation runner self-checks (no vendor engine)
+        shell: pwsh
+        run: |
+          $workspace = Join-Path ([IO.Path]::GetTempPath()) ('ctxhop-prestart-' + [guid]::NewGuid().ToString('N'))
+          .\Test-PrestartEngine.ps1 -Mode SelfTest -FixtureWorkspace $workspace
       - name: Prepare the pinned Rust and MSVC toolchain
         shell: powershell
         run: |
@@ -43,19 +58,3 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed += $t }
           }
           if ($failed) { throw "failed: $($failed -join ', ')" }
-
-      - name: Go fixtures and static checks (no vendor engine)
-        shell: powershell
-        run: |
-          Push-Location impl/codex
-          try {
-            go test -count=1 ./...
-            if ($LASTEXITCODE -ne 0) { throw 'Go fixtures failed' }
-            go vet ./...
-            if ($LASTEXITCODE -ne 0) { throw 'Go static checks failed' }
-          } finally { Pop-Location }
-      - name: Preparation runner self-checks (no vendor engine)
-        shell: pwsh
-        run: |
-          $workspace = Join-Path ([IO.Path]::GetTempPath()) ('ctxhop-prestart-' + [guid]::NewGuid().ToString('N'))
-          .\Test-PrestartEngine.ps1 -Mode SelfTest -FixtureWorkspace $workspace
