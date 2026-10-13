@@ -39,6 +39,11 @@ function Invoke-Native([string]$Exe, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Exe $($Arguments -join ' ') exited $LASTEXITCODE" }
 }
 
+$repo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'Get-BuildPins.ps1')
+$pins=Get-BuildPins $repo
+$provider=$pins.Provider; $goPin=$pins.GoPin
+
 # Relative paths are taken from the current location once, before the builds change it.
 $full = { param($p) $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($p) }
 $Out = & $full $Out; $TempDir = & $full $TempDir
@@ -83,12 +88,6 @@ foreach ($t in $targets) {
         patches = @($t.Patches | ForEach-Object { [ordered]@{ name = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $patches $_)).Hash } }) }
 }
 # Build the protected provider first and bind the local Go helper to its exact image.
-$providerPath=Join-Path $PSScriptRoot '..\engine\provider.json'
-$provider=Get-Content -LiteralPath $providerPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($provider.engineSha256 -cnotmatch '^[0-9a-f]{64}$' -or $provider.normalEngineSha256 -cnotmatch '^[0-9a-f]{64}$' -or $provider.loaderContractId -cnotmatch '^ctxhop-prestart-v2:[0-9a-f]{64}$') { throw 'protected provider pins are not finalized' }
-$goAdapter=Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\CodexDesktop.ps1') -Raw -Encoding UTF8
-$goPin=[regex]::Match($goAdapter, "DesktopGoSHA256='([A-Fa-f0-9]{64})'")
-if (-not $goPin.Success) { throw 'Codex Go adapter pin is not finalized' }
 $engineOut=Join-Path $Out 'protected-build'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-codex-engine.ps1') -Out $engineOut -SourceGit $EngineSourceGit -CargoExe $CargoExe -VerifyPin
 if ($LASTEXITCODE -ne 0) { throw "protected engine build failed: $LASTEXITCODE" }
@@ -97,7 +96,6 @@ Copy-Item -LiteralPath (Join-Path $engineOut 'ctxhop-codex-engine.exe') -Destina
 Copy-Item -LiteralPath (Join-Path $engineOut 'engine-build-info.json') -Destination (Join-Path $engine 'engine-build-info.json')
 
 # No checkout conversion: this helper is built only from committed LF archive bytes.
-$repo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $helperZip=Join-Path $Out 'codex-helper.zip'; $helperSource=Join-Path $Out 'codex-helper-source'
 Invoke-Native git @('-c','core.autocrlf=false','-C',$repo,'archive','--format=zip','-o',$helperZip,'HEAD','impl/codex')
 Expand-Archive -LiteralPath $helperZip -DestinationPath $helperSource

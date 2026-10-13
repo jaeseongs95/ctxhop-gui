@@ -17,6 +17,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'Get-BuildPins.ps1')
+$null=Get-BuildPins $repo
 if (@(git -C $repo status --porcelain).Count) { throw 'the working tree has uncommitted changes' }
 if (Test-Path -LiteralPath $Out) { throw "output exists: $Out" }
 New-Item -ItemType Directory -Path $Out | Out-Null
