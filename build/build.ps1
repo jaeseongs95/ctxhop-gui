@@ -19,11 +19,15 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'Get-BuildPins.ps1')
 $null=Get-BuildPins $repo
-if (@(git -C $repo status --porcelain).Count) { throw 'the working tree has uncommitted changes' }
+$status = @(git -C $repo status --porcelain)
+if ($LASTEXITCODE -ne 0) { throw "git status failed: $LASTEXITCODE" }
+if ($status.Count) { throw 'the working tree has uncommitted changes' }
 if (Test-Path -LiteralPath $Out) { throw "output exists: $Out" }
+$head = git -C $repo rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed: $LASTEXITCODE" }
 New-Item -ItemType Directory -Path $Out | Out-Null
 $Out = (Resolve-Path -LiteralPath $Out).Path
-"repo HEAD: $(git -C $repo rev-parse HEAD)"
+"repo HEAD: $head"
 
 # Empty values are left out: powershell.exe -File drops an empty argument and the parameter would miss its value.
 $exeArgs = @('-Out', (Join-Path $Out 'exes'), '-GoExe', $GoExe, '-TempDir', $TempDir)
@@ -47,7 +51,7 @@ Copy-Item -LiteralPath (Join-Path $Out 'exes\engine') -Destination (Join-Path $p
 # What this package was built from: this repository's commit, the upstream commit, patch and exe hashes, Go.
 $info = Get-Content -LiteralPath (Join-Path $Out 'exes\build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $info | Add-Member -NotePropertyName repository -NotePropertyValue 'https://github.com/jaeseongs95/ctxhop-gui'
-$info | Add-Member -NotePropertyName commit -NotePropertyValue (git -C $repo rev-parse HEAD)
+$info | Add-Member -NotePropertyName commit -NotePropertyValue $head
 [IO.File]::WriteAllText((Join-Path $pkg 'build-info.json'), ($info | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding $false))
 "package files: $(@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Force).Count)"
 

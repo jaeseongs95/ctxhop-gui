@@ -14,8 +14,26 @@ function Write-Utf8([string]$Path,[string]$Text) { [IO.File]::WriteAllText($Path
 
 # Only the harness replaces commands; the copied public build scripts stay intact.
 function git {
-    if ($args -contains 'status') { return }
-    if ($args -contains 'rev-parse') { return ('1'*40) }
+    $global:LASTEXITCODE=0
+    if ($args -contains 'status') {
+        $global:CtxHopBuildPreflightGitCalls.Add('status')
+        if ($global:CtxHopBuildPreflightGitCase -like 'git-status-*') {
+            $global:LASTEXITCODE=128
+            if ($global:CtxHopBuildPreflightGitCase -eq 'git-status-output') { return ' M synthetic.txt' }
+            return
+        }
+        if ($global:CtxHopBuildPreflightGitCase -eq 'git-dirty') { return ' M synthetic.txt' }
+        return
+    }
+    if ($args -contains 'rev-parse') {
+        $global:CtxHopBuildPreflightGitCalls.Add('head')
+        if ($global:CtxHopBuildPreflightGitCase -like 'git-head-*') {
+            $global:LASTEXITCODE=128
+            if ($global:CtxHopBuildPreflightGitCase -eq 'git-head-output') { return ('1'*40) }
+            return
+        }
+        return ('1'*40)
+    }
     $global:CtxHopBuildPreflightToolCalls.Add('git')
     throw 'BUILD_TOOL_SENTINEL'
 }
@@ -39,10 +57,16 @@ $cases=@(
     @{id='loader-null';field='loaderContractId';value=$null},
     @{id='loader-format';field='loaderContractId';value=('ctxhop-prestart-v2:'+('A'*64))},
     @{id='go-missing'},
-    @{id='valid'}
+    @{id='valid'},
+    @{id='git-status-empty';entry='build.ps1';error='git status failed: 128'},
+    @{id='git-status-output';entry='build.ps1';error='git status failed: 128'},
+    @{id='git-head-empty';entry='build.ps1';error='git rev-parse HEAD failed: 128'},
+    @{id='git-head-output';entry='build.ps1';error='git rev-parse HEAD failed: 128'},
+    @{id='git-dirty';entry='build.ps1';error='the working tree has uncommitted changes'}
 )
 foreach ($entry in @('build.ps1','build-exes.ps1')) {
     foreach ($case in $cases) {
+        if ($case.entry -and $case.entry -ne $entry) { continue }
         $name=$entry.Replace('.ps1','')+'-'+$case.id
         $fixture=Join-Path $run $name
         $build=Join-Path $fixture 'build'
@@ -61,6 +85,8 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
         $temp=Join-Path $fixture 'temp'
         $goWork=Join-Path $fixture 'go-work'
         $global:CtxHopBuildPreflightToolCalls=[Collections.Generic.List[string]]::new()
+        $global:CtxHopBuildPreflightGitCalls=[Collections.Generic.List[string]]::new()
+        $global:CtxHopBuildPreflightGitCase=$case.id
         $before=@{}
         foreach ($key in $environmentKeys) { $before[$key]=[Environment]::GetEnvironmentVariable($key,'Process') }
         $message=''
@@ -75,7 +101,7 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
             }
             $outExists=Test-Path -LiteralPath $out
             $tempExists=Test-Path -LiteralPath $temp
-            $expected=if ($case.id -eq 'valid') {'BUILD_TOOL_SENTINEL'} elseif ($case.id -eq 'go-missing') {'Codex Go adapter pin is not finalized'} else {'protected provider pins are not finalized'}
+            $expected=if ($case.error) {$case.error} elseif ($case.id -eq 'valid') {'BUILD_TOOL_SENTINEL'} elseif ($case.id -eq 'go-missing') {'Codex Go adapter pin is not finalized'} else {'protected provider pins are not finalized'}
             Assert ($message -ceq $expected) "$name expected pin error or positive sentinel; got [$message]"
             if ($case.id -eq 'valid') {
                 $nextTool=if ($entry -eq 'build.ps1') {'child-build'} else {'go'}
@@ -86,7 +112,7 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
                 Assert ($global:CtxHopBuildPreflightToolCalls.Count -eq 0) "$name makes no build tool calls"
                 Assert ($environmentUnchanged) "$name preserves the build environment"
             }
-            $receipt=[ordered]@{entryPoint=$entry;caseId=$case.id;expected=$expected;actual=$message;toolCalls=@($global:CtxHopBuildPreflightToolCalls.ToArray());outputExists=$outExists;tempExists=$tempExists;environmentUnchanged=$environmentUnchanged}
+            $receipt=[ordered]@{entryPoint=$entry;caseId=$case.id;expected=$expected;actual=$message;gitCalls=@($global:CtxHopBuildPreflightGitCalls.ToArray());toolCalls=@($global:CtxHopBuildPreflightToolCalls.ToArray());outputExists=$outExists;tempExists=$tempExists;environmentUnchanged=$environmentUnchanged}
             Write-Utf8 (Join-Path $fixture 'receipt.json') ($receipt|ConvertTo-Json -Depth 5)
         } finally {
             foreach ($key in $environmentKeys) { [Environment]::SetEnvironmentVariable($key,$before[$key],'Process') }
