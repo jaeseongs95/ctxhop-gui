@@ -51,9 +51,15 @@ jobs:
         shell: powershell
         run: |
           $pkg = Join-Path $env:RUNNER_TEMP 'out\ctxhop-gui-vnext'
+          . .\build\Get-BuildPins.ps1
+          $pins = Get-BuildPins $pkg
           $failed = @()
           foreach ($t in 'Test-Strings', 'Test-ProjectFiles', 'Test-Contract', 'Test-DesktopWorker', 'Test-DesktopGUI', 'Test-ClaudeWorker', 'Test-ClaudeGUI') {
-            & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $pkg "$t.ps1")
+            $testArgs = @()
+            if ($t -eq 'Test-DesktopWorker') {
+              $testArgs = @('-RecoveryHelperPath', (Join-Path $pkg 'bin\ctxhop-codex.exe'), '-RecoveryHelperSHA256', $pins.GoPin.Groups[1].Value)
+            }
+            & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $pkg "$t.ps1") @testArgs
             "$t exit=$LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) { $failed += $t }
           }
