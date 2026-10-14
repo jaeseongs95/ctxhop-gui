@@ -17,7 +17,7 @@ function Invoke-EngineBuildNative([string]$Exe,[string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Exe exited $LASTEXITCODE" }
 }
 $repo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-if (@(git -C $repo status --porcelain).Count) { throw 'the working tree has uncommitted changes' }
+if (@(Invoke-EngineBuildNative git @('-C',$repo,'status','--porcelain')).Count) { throw 'the working tree has uncommitted changes' }
 $providerPath=Join-Path $repo 'engine\provider.json'
 $provider=Get-Content -LiteralPath $providerPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($provider.schemaVersion -ne 1 -or $provider.baseCommit -cnotmatch '^[0-9a-f]{40}$' -or $provider.target -cne 'x86_64-pc-windows-msvc' -or $provider.rustVersion -cne '1.95.0' -or $provider.migrationLineEndings -cne 'CRLF') { throw 'invalid provider manifest' }
