@@ -62,7 +62,11 @@ $cases=@(
     @{id='git-status-output';entry='build.ps1';error='git status failed: 128'},
     @{id='git-head-empty';entry='build.ps1';error='git rev-parse HEAD failed: 128'},
     @{id='git-head-output';entry='build.ps1';error='git rev-parse HEAD failed: 128'},
-    @{id='git-dirty';entry='build.ps1';error='the working tree has uncommitted changes'}
+    @{id='git-dirty';entry='build.ps1';error='the working tree has uncommitted changes'},
+    @{id='go-exit-output';entry='build-exes.ps1';goExit=42;goOutput='go version go1.27.1 windows/amd64'},
+    @{id='go-exit-empty';entry='build-exes.ps1';goExit=42;goOutput=''},
+    @{id='go-wrong';entry='build-exes.ps1';goExit=0;goOutput='go version go1.26.0 windows/amd64'},
+    @{id='go-valid';entry='build-exes.ps1';goExit=0;goOutput='go version go1.27.1 windows/amd64'}
 )
 foreach ($entry in @('build.ps1','build-exes.ps1')) {
     foreach ($case in $cases) {
@@ -90,8 +94,17 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
         $before=@{}
         foreach ($key in $environmentKeys) { $before[$key]=[Environment]::GetEnvironmentVariable($key,'Process') }
         $message=''
+        $goExe='Invoke-BuildToolSentinel'
+        $goArgsPath=Join-Path $fixture 'go-args.txt'
+        if ($case.ContainsKey('goExit')) {
+            $goExe=Join-Path $fixture 'go version stub.cmd'
+            $lines=@('@echo off','echo %* > "%~dp0go-args.txt"')
+            if ($case.goOutput) { $lines+=('echo '+$case.goOutput) }
+            $lines+=('exit /b '+$case.goExit)
+            Write-Utf8 $goExe (($lines -join "`r`n")+"`r`n")
+        }
         try {
-            $arguments=@{Out=$out;TempDir=$temp;GoWork=$goWork;GoExe='Invoke-BuildToolSentinel'}
+            $arguments=@{Out=$out;TempDir=$temp;GoWork=$goWork;GoExe=$goExe}
             if ($entry -eq 'build.ps1') { $arguments.Tag='20261013';$arguments.NoInstaller=$true }
             try { & (Join-Path $build $entry) @arguments | Out-Null }
             catch { $message=$_.Exception.Message }
@@ -101,9 +114,15 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
             }
             $outExists=Test-Path -LiteralPath $out
             $tempExists=Test-Path -LiteralPath $temp
-            $expected=if ($case.error) {$case.error} elseif ($case.id -eq 'valid') {'BUILD_TOOL_SENTINEL'} elseif ($case.id -eq 'go-missing') {'Codex Go adapter pin is not finalized'} else {'protected provider pins are not finalized'}
+            $expected=if ($case.ContainsKey('goExit') -and $case.goExit -ne 0) {"$goExe version exited $($case.goExit)"} elseif ($case.id -eq 'go-wrong') {'need go1.27.1 windows/amd64, got: go version go1.26.0 windows/amd64'} elseif ($case.id -eq 'go-valid') {'BUILD_TOOL_SENTINEL'} elseif ($case.error) {$case.error} elseif ($case.id -eq 'valid') {'BUILD_TOOL_SENTINEL'} elseif ($case.id -eq 'go-missing') {'Codex Go adapter pin is not finalized'} else {'protected provider pins are not finalized'}
             Assert ($message -ceq $expected) "$name expected pin error or positive sentinel; got [$message]"
-            if ($case.id -eq 'valid') {
+            if ($case.ContainsKey('goExit')) {
+                $nextCalls=if ($case.id -eq 'go-valid') {1} else {0}
+                Assert ($global:CtxHopBuildPreflightToolCalls.Count -eq $nextCalls) "$name stops before downstream Git/source/build or reaches positive sentinel"
+                Assert ($outExists -and $tempExists) "$name preserves existing output and temp setup before version check"
+                $observedGoArgs=if (Test-Path -LiteralPath $goArgsPath) {(Get-Content -LiteralPath $goArgsPath -Raw).Trim()} else {''}
+                Assert ($observedGoArgs -ceq 'version') "$name invokes the actual local native stub with version"
+            } elseif ($case.id -eq 'valid') {
                 $nextTool=if ($entry -eq 'build.ps1') {'child-build'} else {'go'}
                 Assert ($global:CtxHopBuildPreflightToolCalls.Count -eq 1 -and $global:CtxHopBuildPreflightToolCalls[0] -ceq $nextTool) "$name reaches the next stub build stage"
                 Assert ($outExists) "$name reaches output creation"
@@ -112,7 +131,7 @@ foreach ($entry in @('build.ps1','build-exes.ps1')) {
                 Assert ($global:CtxHopBuildPreflightToolCalls.Count -eq 0) "$name makes no build tool calls"
                 Assert ($environmentUnchanged) "$name preserves the build environment"
             }
-            $receipt=[ordered]@{entryPoint=$entry;caseId=$case.id;expected=$expected;actual=$message;gitCalls=@($global:CtxHopBuildPreflightGitCalls.ToArray());toolCalls=@($global:CtxHopBuildPreflightToolCalls.ToArray());outputExists=$outExists;tempExists=$tempExists;environmentUnchanged=$environmentUnchanged}
+            $receipt=[ordered]@{entryPoint=$entry;caseId=$case.id;expected=$expected;actual=$message;gitCalls=@($global:CtxHopBuildPreflightGitCalls.ToArray());toolCalls=@($global:CtxHopBuildPreflightToolCalls.ToArray());outputExists=$outExists;tempExists=$tempExists;environmentUnchanged=$environmentUnchanged;goExit=$case.goExit;goOutput=$case.goOutput;goArguments=if(Test-Path -LiteralPath $goArgsPath){(Get-Content -LiteralPath $goArgsPath -Raw).Trim()}else{$null}}
             Write-Utf8 (Join-Path $fixture 'receipt.json') ($receipt|ConvertTo-Json -Depth 5)
         } finally {
             foreach ($key in $environmentKeys) { [Environment]::SetEnvironmentVariable($key,$before[$key],'Process') }

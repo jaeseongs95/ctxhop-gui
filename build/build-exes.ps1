@@ -58,7 +58,7 @@ if ($GoWork) { $env:GOPATH = Join-Path $GoWork 'gopath'; $env:GOCACHE = Join-Pat
 # GONOSUMDB, GOPRIVATE, GOINSECURE) and the cache locations are left to the caller; go.sum still pins every module.
 foreach ($v in 'GOFLAGS', 'GOEXPERIMENT', 'GOFIPS140', 'GOROOT', 'GOMODCACHE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 $env:GOENV = 'off'; $env:GOWORK = 'off'; $env:GOTOOLCHAIN = 'local'; $env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:GOAMD64 = 'v1'
-$goVersion = & $GoExe version
+$goVersion = Invoke-Native $GoExe @('version')
 if ($goVersion -ne 'go version go1.27.1 windows/amd64') { throw "need go1.27.1 windows/amd64, got: $goVersion" }
 $goVersion
 "upstream: $Upstream $Commit"
