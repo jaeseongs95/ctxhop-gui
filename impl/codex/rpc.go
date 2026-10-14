@@ -23,19 +23,19 @@ type rpcError struct {
 
 func (e *rpcError) Error() string { return fmt.Sprintf("엔진 RPC 오류 (%d)", e.Code) } // engine의 비밀 포함 오류 문자열은 전달하지 않는다.
 type session struct {
-	P           *process
-	Projection  object
-	Binding     object
-	Members     []member
-	Options     options
-	Operation   string
-	Acquisition *dbAcquisition
-	Evidence    *approvalLease
-	Recovery    *recoveryLease
+	P               *process
+	Projection      object
+	Binding         object
+	Members         []member
+	Options         options
+	Operation       string
+	Acquisition     *dbAcquisition
+	Evidence        *approvalLease
+	Recovery        *recoveryLease
 	DiscoveryIssued bool
-	Call        func(string, object) (object, error)
-	Notify      func(string, object) error
-	Close       func() error
+	Call            func(string, object) (object, error)
+	Notify          func(string, object) error
+	Close           func() error
 }
 
 func enginePath(o options) (string, error) {
@@ -165,9 +165,13 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	}
 	keepEvidence := false
 	recovery, e := pinRecovery(o, members)
-	if e != nil { return nil, e }
+	if e != nil {
+		return nil, e
+	}
 	defer func() {
-		if !keepEvidence && recovery != nil { recovery.Close() }
+		if !keepEvidence && recovery != nil {
+			recovery.Close()
+		}
 		if !keepEvidence && evidence != nil {
 			evidence.Close()
 		}
@@ -181,7 +185,10 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	s := &session{P: p, Evidence: evidence, Recovery: recovery}
 	s.Close = func() error {
 		e := p.close()
-		if e == nil && s.Recovery != nil { e = s.Recovery.Close(); s.Recovery = nil }
+		if e == nil && s.Recovery != nil {
+			e = s.Recovery.Close()
+			s.Recovery = nil
+		}
 		if e == nil && s.Evidence != nil {
 			e = s.Evidence.Close()
 			s.Evidence = nil
@@ -283,8 +290,7 @@ func openEngine(o options, operation string, members []member) (*session, error)
 			}
 			return r.m, r.e
 		case <-time.After(time.Until(deadline)):
-			p.close()
-			return nil, fail("rpc_timeout", "RPC 응답 시간 초과")
+			return nil, errors.Join(fail("rpc_timeout", "RPC 응답 시간 초과"), p.close())
 		}
 	}
 	requestNonce := nonce()
@@ -296,8 +302,7 @@ func openEngine(o options, operation string, members []member) (*session, error)
 			path = nil
 			sha = nil
 		} else if e != nil {
-			p.close()
-			return nil, e
+			return nil, errors.Join(e, p.close())
 		}
 		role := "root"
 		if m.Parent != nil {
@@ -307,29 +312,26 @@ func openEngine(o options, operation string, members []member) (*session, error)
 	}
 	params, e := prepareRequest(o, operation, requestNonce, descriptors)
 	if e != nil {
-		p.close()
-		return nil, e
+		return nil, errors.Join(e, p.close())
 	}
 	r, e := s.Call("ctxhop/prepare", params)
 	if e != nil {
-		p.close()
+		closeErr := p.close()
 		var re *rpcError
 		if asRPC(e, &re) && text(re.Data["reasonCode"]) != "" {
-			return nil, fail(text(re.Data["reasonCode"]), "protected engine 준비가 안전하게 거절됐습니다")
+			return nil, errors.Join(fail(text(re.Data["reasonCode"]), "protected engine 준비가 안전하게 거절됐습니다"), closeErr)
 		}
-		return nil, e
+		return nil, errors.Join(e, closeErr)
 	}
 	checkMembers := members
 	if operation != "plan" && operation != "bootstrap" {
 		checkMembers = nil
 		if r["inputComplete"] != false {
-			p.close()
-			return nil, fail("prestart_schema", "DB 관측 전 member snapshot 완성 금지")
+			return nil, errors.Join(fail("prestart_schema", "DB 관측 전 member snapshot 완성 금지"), p.close())
 		}
 	}
 	if e = validateProjection(r, requestNonce, operation, o, checkMembers, int64(p.PID), nil); e != nil {
-		p.close()
-		return nil, e
+		return nil, errors.Join(e, p.close())
 	}
 	s.Members = members
 	s.Options = o
@@ -348,7 +350,9 @@ func (s *session) bind() {
 	s.Binding["operation"] = s.Operation
 }
 func (s *session) complete(observed dbView) error {
-	if s.DiscoveryIssued { return fail("recovery_plan", "discovery 프로세스 complete 금지") }
+	if s.DiscoveryIssued {
+		return fail("recovery_plan", "discovery 프로세스 complete 금지")
+	}
 	if observed.Acquisition != nil && observed.Acquisition.Aggregate != nil {
 		return fail("engine_db_unknown", "실제8 schema·metadata·strict inventory 검증 전 운영 complete 금지")
 	}
@@ -707,7 +711,9 @@ func checkOtherStoreAbsence(projection object) error {
 	return nil
 }
 func (s *session) activate() error {
-	if s.DiscoveryIssued { return fail("recovery_plan", "discovery 프로세스 activate 금지") }
+	if s.DiscoveryIssued {
+		return fail("recovery_plan", "discovery 프로세스 activate 금지")
+	}
 	if s.Projection["inputComplete"] != true {
 		return fail("prestart_incomplete", "complete 전 activate 금지")
 	}

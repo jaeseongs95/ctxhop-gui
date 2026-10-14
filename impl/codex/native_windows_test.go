@@ -19,6 +19,9 @@ import (
 // 소유 테스트 실행파일의 좁은 하위 프로세스. vendor engine/auth/socket은 사용하지 않는다.
 func init() {
 	switch os.Getenv("CTXHOP_OWNED_JOB_FIXTURE") {
+	case "exit":
+		os.Stdout.WriteString("fixture-ready\n")
+		os.Exit(0)
 	case "pipe":
 		os.Stdout.WriteString("fixture-ready\n")
 		io.Copy(io.Discard, os.Stdin)

@@ -60,13 +60,20 @@ func snapshotInfo(f *os.File, directory bool) (syscall.ByHandleFileInformation, 
 	return info, nil
 }
 func snapshotOpen(path string, directory bool) (snapshotEntry, error) {
+	access := uint32(syscall.GENERIC_READ)
+	if directory {
+		access = 0x80
+	}
+	return snapshotOpenAccess(path, directory, access)
+}
+func snapshotOpenAccess(path string, directory bool, access uint32) (snapshotEntry, error) {
 	u, e := syscall.UTF16PtrFromString(path)
 	if e != nil {
 		return snapshotEntry{}, e
 	}
-	access, share, flags := uint32(syscall.GENERIC_READ), uint32(syscall.FILE_SHARE_READ), uint32(0x00200000)
+	share, flags := uint32(syscall.FILE_SHARE_READ), uint32(0x00200000)
 	if directory {
-		access, share, flags = 0x80, 3, 0x02200000 // directory metadata; no DELETE sharing
+		share, flags = 3, 0x02200000 // no DELETE sharing; ancestors retain metadata-only access
 	}
 	h, e := syscall.CreateFile(u, access, share, nil, syscall.OPEN_EXISTING, flags, 0)
 	if e != nil {
@@ -78,6 +85,33 @@ func snapshotOpen(path string, directory bool) (snapshotEntry, error) {
 		return snapshotEntry{}, errors.Join(e, f.Close())
 	}
 	return snapshotEntry{File: f, Info: info}, nil
+}
+
+// Enumeration requires LIST_DIRECTORY on a separate reader. The held metadata
+// pin binds identity; the LIST_DIRECTORY reader excludes DELETE sharing.
+var snapshotDirectoryRead = (*os.File).ReadDir
+
+func snapshotDirectoryEntries(pin snapshotEntry, count int) (entries []os.DirEntry, retErr error) {
+	if pin.File == nil || count < 1 {
+		return nil, fail("snapshot_directory", "directory pin/count invalid")
+	}
+	info, e := snapshotInfo(pin.File, true)
+	if e != nil || !snapshotIdentity(pin.Info, info) {
+		return nil, errors.Join(fail("snapshot_directory", "directory pin identity changed"), e)
+	}
+	reader, e := snapshotOpenAccess(pin.File.Name(), true, 0x81)
+	if e != nil {
+		return nil, e
+	}
+	defer func() { retErr = errors.Join(retErr, reader.File.Close()) }()
+	if !snapshotIdentity(pin.Info, reader.Info) {
+		return nil, fail("snapshot_directory", "directory reader identity changed")
+	}
+	entries, e = snapshotDirectoryRead(reader.File, count)
+	if errors.Is(e, io.EOF) {
+		e = nil
+	}
+	return entries, e
 }
 func (s *dbAcquisition) lockDirs(path string) error {
 	paths := []string{}

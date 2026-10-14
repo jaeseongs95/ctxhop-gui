@@ -361,8 +361,8 @@ try {
         [pscustomobject]@{kind='marker';operationId=('1'*32);recordRef=$null;agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$true;canResolve=$true;canFinalizeLocal=$false;sha256='AB';path='D:\기록';targets=@('D:\합성');files=@([pscustomobject]@{index=0;target='D:\합성\a.txt';class='owned';current=('a'*64)},$unknownFile)},
         [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('2'*32);agent='claude-code';nativeId=$id;state='unreadable';error='';canRollback=$false;canResolve=$true;canFinalizeLocal=$false;sha256='CD';path='';files=@()},
         [pscustomobject]@{kind='project';operationId=$null;recordRef='D:\예전 기록';agent='';nativeId='';state='failed';error='';canRollback=$false;canResolve=$true;canFinalizeLocal=$false;sha256='EF';path='D:\예전 기록';files=@()},
-        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=$null;agent='codex-desktop';nativeId=$null;state='unreadable';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$false;sha256=$null;path='';reasonCode='invalid_name';files=@()},
-        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('4'*32);agent='codex-desktop';nativeId=$id;state='pending';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$true;sha256=('a'*64);path='D:\임시 기록';files=@()})}
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=$null;agent='codex-desktop';nativeId=$null;state='unsafe';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$false;sha256=$null;path='';reasonCode='invalid_name';files=@()},
+        [pscustomobject]@{kind='vendor';operationId=$null;recordRef=('4'*32);agent='codex-desktop';nativeId=('a'*24);state='pending';error='';canRollback=$false;canResolve=$false;canFinalizeLocal=$true;sha256=('a'*64);path='D:\임시 기록';files=@()})}
     $ui=New-JournalDialog $journal
     try {
         $null=$ui.dialog.Handle; $null=$ui.list.Handle   # 창을 띄우지 않고도 선택 이벤트가 오게 한다

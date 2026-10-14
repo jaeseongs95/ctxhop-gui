@@ -493,6 +493,11 @@ function Set-MarkerVendorAbsence([Collections.IDictionary]$Marker,[object]$Repor
     # 재시도 중 기존 증명을 누락·불일치 응답으로 없애지 않는다. 잘못된 표지도 먼저 거절한다.
     $previous=@(Get-CodexRetainedKinds $Marker)
     $kinds=@(Get-CodexRetainedKinds $Report)
+    # Cleanup receipt metadata is historical display, not a completed project rollback proof.
+    if ($State -ceq 'pending' -and $Report.canFinalizeLocal -eq $true) {
+        if ($Marker.agent -cne 'codex-desktop' -or $Report.canRollback -ne $false -or $Report.canResolve -ne $false -or $Report.blocksImport -ne $true -or $null -ne $Report.reasonCode -or ($previous.Count -and ($previous -join '|') -cne ($kinds -join '|'))) { throw (T 'WkRetainedProofUnknown') }
+        return
+    }
     if ($previous.Count -and ($Marker.agent -cne 'codex-desktop' -or $State -cne 'rolled_back' -or ($previous -join '|') -cne ($kinds -join '|'))) { throw (T 'WkRetainedProofUnknown') }
     if ($kinds.Count) {
         if ($Marker.agent -cne 'codex-desktop' -or $State -cne 'rolled_back') { throw (T 'WkRetainedProofUnknown') }
@@ -508,7 +513,7 @@ function Get-VendorState([Collections.IDictionary]$Marker) {
     try {
         $report=Invoke-Vendor (Get-MarkerJob $Marker) 'recover' @{mode='status';operationId=(Get-MarkerRef $Marker)}
         $state=[string]$report.state
-        if ($state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable')) { return 'failed' }
+        if ($state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable','unsafe')) { return 'failed' }
         Set-MarkerVendorAbsence $Marker $report $state
     } catch { return 'failed' }
     return $state
@@ -600,7 +605,7 @@ function Resolve-Marker([Collections.IDictionary]$Marker,[string]$Mode,[object[]
         if ($phase -eq 'conversation' -and (Test-ProjectSuccess $Marker)) { return (Close-Marker $Marker 'completed' $(if ($OkEqual) {'equal'} else {'complete'}) @{success=$true}) }
         return (Set-MarkerAttention $Marker (T 'WkJournalCompleteMismatch'))
     }
-    if ($VendorState -in @('unreadable','failed')) { return (Set-MarkerAttention $Marker (T 'WkJournalVendorUnreadable' $VendorState)) }
+    if ($VendorState -in @('unreadable','unsafe','failed')) { return (Set-MarkerAttention $Marker (T 'WkJournalVendorUnreadable' $VendorState)) }
     $auto=$VendorState -in @('absent','rolled_back','none') -and $Mode -in @('restore','rollback')
     $user=$VendorState -in @('pending','resolved') -and $Mode -eq 'rollback'
     if (-not ($auto -or $user)) { return 'waiting' }
@@ -677,7 +682,7 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
         }
         $files=@(); $canRollback=$state -in @('absent','rolled_back','pending','resolved','none') -and ($marker.recordKind -ne 'project' -or [IO.File]::Exists((Join-Path $marker.recordRef 'restore-plan.json')))
         try { $plan=Read-ProjectPlan ([string]$marker.projectRecovery); if ($plan) { $files=@(Get-ProjectUndoView @($plan.files)) } } catch { $canRollback=$false }
-        $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;canResolve=($state -cnotin @('busy','failed'));canFinalizeLocal=$false;blocksImport=$true;reasonCode='';sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
+        $row=[pscustomobject]@{kind='marker';operationId=$marker.operationId;recordRef=$marker.recordRef;agent=$marker.agent;nativeId=$marker.nativeId;state=$state;error=[string]$marker.error;canRollback=$canRollback;canResolve=($state -cnotin @('busy','failed','unsafe'));canFinalizeLocal=$false;blocksImport=$true;reasonCode='';sha256='';files=$files;path=[string]$marker.projectRecovery;targets=@($marker.targets);phase=$marker.phase}
         $rows.Add($row); $byRef["$($marker.agent)/$(Get-MarkerRef $marker)"]=$row
     }
     $map=Get-Content -LiteralPath $script:ImplsFile -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -689,15 +694,17 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
             # 표지가 있는 기록은 표지 행에 벤더 파일 목록과 해시를 붙인다. 없는 기록은 따로 보인다.
             if ($row) {
                 $row.sha256=[string]$record.sha256; $row.files=@($row.files)+@($record.files | Where-Object { $_ })
-                if ($null -ne $record.canResolve) {
+                $row.reasonCode=$record.reasonCode
+                # A failed/unsafe marker status cannot acquire capabilities from a list merge.
+                if ($null -ne $record.canResolve -and $row.state -cnotin @('failed','unsafe')) {
                     $row.canResolve=$record.canResolve -and $row.state -cne 'busy'; $row.canFinalizeLocal=$record.canFinalizeLocal -and $row.state -cne 'busy'
-                    $row.canRollback=$row.canRollback -and $record.canRollback; $row.blocksImport=$record.blocksImport; $row.reasonCode=[string]$record.reasonCode
+                    $row.canRollback=$row.canRollback -and $record.canRollback; $row.blocksImport=$record.blocksImport
                     if ($row.state -cne 'busy') { $row.state=[string]$record.state }
                     if (-not $row.path) { $row.path=[string]$record.path }
                 }
                 continue
             }
-            $rows.Add([pscustomobject]@{kind='vendor';operationId=$record.operationId;recordRef=$record.recordId;agent=$agent;nativeId=$record.nativeId;state=[string]$record.state;error='';canRollback=[bool]$record.canRollback;canResolve=$(if ($null -ne $record.canResolve) {[bool]$record.canResolve} else {[bool]$record.sha256});canFinalizeLocal=[bool]$record.canFinalizeLocal;blocksImport=$(if ($null -ne $record.blocksImport) {[bool]$record.blocksImport} else {$true});reasonCode=[string]$record.reasonCode;sha256=[string]$record.sha256;files=@($record.files | Where-Object { $_ });path=[string]$record.path})
+            $rows.Add([pscustomobject]@{kind='vendor';operationId=$record.operationId;recordRef=$record.recordId;agent=$agent;nativeId=$record.nativeId;state=[string]$record.state;error='';canRollback=[bool]$record.canRollback;canResolve=$(if ($null -ne $record.canResolve) {[bool]$record.canResolve} else {[bool]$record.sha256});canFinalizeLocal=[bool]$record.canFinalizeLocal;blocksImport=$(if ($null -ne $record.blocksImport) {[bool]$record.blocksImport} else {$true});reasonCode=$record.reasonCode;sha256=[string]$record.sha256;files=@($record.files | Where-Object { $_ });path=[string]$record.path})
         }
     }
     foreach ($row in @(Get-ProjectRecordRows $referenced)) { $rows.Add($row) }
@@ -705,18 +712,18 @@ function Get-JournalRows([object]$Job,[switch]$Auto) {
 }
 function Invoke-JournalFinalize([object]$Job) {
     # Local vendor cleanup only. Do not create a marker or undo project files here.
-    $agent=[string]$Job.agent; $home=[string]$Job.home; $recordId=[string]$Job.recordId
+    $agent=[string]$Job.agent; $finalizeHome=[string]$Job.home; $recordId=[string]$Job.recordId
     if ($Job.operationId) {
         $null=Assert-OperationId $Job.operationId
         $entry=@(Read-Markers | Where-Object { $_.name -ceq [string]$Job.operationId })
         if ($entry.Count -ne 1 -or -not $entry[0].marker) { throw (T 'WkJournalMissing' $Job.operationId) }
         $marker=$entry[0].marker
         if ($marker.recordKind -ceq 'project' -or (Test-WorkerWritersGone $marker) -cne 'gone') { throw (T 'WkRecoveryActionUnavailable') }
-        $agent=[string]$marker.agent; $home=[string]$marker.home; $recordId=Get-MarkerRef $marker
+        $agent=[string]$marker.agent; $finalizeHome=[string]$marker.home; $recordId=Get-MarkerRef $marker
     }
     if ($agent -cne 'codex-desktop') { throw (T 'WkRecoveryActionUnavailable') }
     $null=Assert-OperationId $recordId
-    $report=Invoke-Vendor ([pscustomobject]@{agent=$agent;home=$home}) 'recover' @{mode='finalize';recordId=$recordId}
+    $report=Invoke-Vendor ([pscustomobject]@{agent=$agent;home=$finalizeHome}) 'recover' @{mode='finalize';recordId=$recordId}
     if ($report.effect -cne 'finalized' -or $report.terminalStatus -cnotin @('complete','rolled_back')) { throw (T 'WkRecoveryActionUnavailable') }
     return @{outcome='finalized';terminalStatus=$report.terminalStatus;message=(T 'WkRecoveryFinalized')}
 }
@@ -766,6 +773,7 @@ function Invoke-JournalClose([object]$Job) {
     Enter-Marker $marker
     $state=Get-VendorState $marker
     if ($state -eq 'failed') { throw (T 'WkJournalVendorUnreadable' $state) }
+    if ($state -ceq 'unsafe') { throw (T 'WkRecoveryActionUnavailable') }
     if ($marker.recordKind -eq 'project') {
         $folder=[string]$marker.recordRef; $sha=Get-ProjectRecordSha $folder
         if (-not $sha -or $sha -cne [string]$Job.sha256) { throw (T 'WkRecordChanged') }

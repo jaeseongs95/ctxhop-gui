@@ -260,7 +260,9 @@ func saveJournal(run string, j *journal, initial bool) error {
 }
 func loadJournal(home, run string) (*journal, error) {
 	row, lease, e := pinRecoveryRecord(home, run, false)
-	if lease == nil { return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다") }
+	if lease == nil {
+		return nil, fail("unreadable", "복구 기록을 읽을 수 없습니다")
+	}
 	b := append([]byte(nil), lease.Bytes...)
 	e = errors.Join(e, lease.Close())
 	if e != nil || row.NativeID == nil || filepath.Base(row.Path) != "journal.json" {
@@ -270,7 +272,9 @@ func loadJournal(home, run string) (*journal, error) {
 	if e == nil && j.ApprovalEvidence != nil && !samePath(j.ApprovalEvidence.ManifestPath, approvalPath(options{Home: home, Run: run})) {
 		return nil, fail("unsupported_record", "복구 기록의 승인 operation 경로 오류")
 	}
-	if e == nil && j.RecoveryEvidence != nil && !samePath(j.RecoveryEvidence.ManifestPath, recoveryPath(options{Home: home, Run: run})) { return nil, fail("unsupported_record", "복구 evidence operation 경로 오류") }
+	if e == nil && j.RecoveryEvidence != nil && !samePath(j.RecoveryEvidence.ManifestPath, recoveryPath(options{Home: home, Run: run})) {
+		return nil, fail("unsupported_record", "복구 evidence operation 경로 오류")
+	}
 	return j, e
 }
 func decodeJournal(home string, b []byte) (*journal, error) {
@@ -281,6 +285,7 @@ func decodeJournal(home string, b []byte) (*journal, error) {
 	var j journal
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
+	d.UseNumber()
 	if e = d.Decode(&j); e != nil {
 		return nil, fail("unreadable", "복구 기록 구조 오류")
 	}
@@ -310,10 +315,14 @@ func decodeJournal(home string, b []byte) (*journal, error) {
 	v, _ := parseJSON(b)
 	r := obj(v)
 	if j.RecoveryEvidence != nil {
-		if j.Version != 4 || !exact(obj(r["recoveryEvidence"]), "profile", "manifestPath", "manifestSha256") || !recoveryDescriptorValid(j.RecoveryEvidence, options{Home: home, Run: filepath.Base(filepath.Dir(filepath.Dir(j.RecoveryEvidence.ManifestPath)))}) { return nil, fail("unsupported_record", "복구 descriptor 계약 오류") }
+		if j.Version != 4 || !exact(obj(r["recoveryEvidence"]), "profile", "manifestPath", "manifestSha256") || !recoveryDescriptorValid(j.RecoveryEvidence, options{Home: home, Run: filepath.Base(filepath.Dir(filepath.Dir(j.RecoveryEvidence.ManifestPath)))}) {
+			return nil, fail("unsupported_record", "복구 descriptor 계약 오류")
+		}
 	}
 	if j.LocalFinalization != nil {
-		if j.Version != 4 || !exact(obj(r["localFinalization"]), "state", "receiptPath", "receiptSha256", "receiptDigest", "terminalStatus", "terminalProof", "absenceKind", "retainedKinds") { return nil, fail("unsupported_record", "최종 정리 journal 키 오류") }
+		if j.Version != 4 || !exact(obj(r["localFinalization"]), "state", "receiptPath", "receiptSha256", "receiptDigest", "terminalStatus", "terminalProof", "absenceKind", "retainedKinds") {
+			return nil, fail("unsupported_record", "최종 정리 journal 키 오류")
+		}
 	}
 	return &j, nil
 }
@@ -445,16 +454,24 @@ func verifyOwned(home string, j *journal, first bool) (homeScan, error) {
 	return s, nil
 }
 func pendingRuns(home string) ([]string, error) {
- rows, e := recoveryRecords(home)
- if e != nil { return nil, e }
- out := []string{}
- for _, row := range rows {
-  if !row.BlocksImport { continue }
-  if row.State != "pending" && row.State != "cleanup_pending" { return nil, fail("pending_record", "복구 기록을 안전하게 분류할 수 없습니다") }
-  if row.RecordID == nil { return nil, fail("pending_record", "복구 ID 불명") }
-  out = append(out, *row.RecordID)
- }
- return out, nil
+	rows, e := recoveryRecords(home)
+	if e != nil {
+		return nil, e
+	}
+	out := []string{}
+	for _, row := range rows {
+		if !row.BlocksImport {
+			continue
+		}
+		if row.State != "pending" && row.State != "cleanup_pending" {
+			return nil, fail("pending_record", "복구 기록을 안전하게 분류할 수 없습니다")
+		}
+		if row.RecordID == nil {
+			return nil, fail("pending_record", "복구 ID 불명")
+		}
+		out = append(out, *row.RecordID)
+	}
+	return out, nil
 }
 
 func readRecoveryRecord(path string, contents bool) (b []byte, retErr error) {

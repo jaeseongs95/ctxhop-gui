@@ -134,26 +134,34 @@ function New-DesktopRollbackResult([object]$Record,[string]$Path) {
 function Assert-DesktopRecoveryRecord([object]$Row,[string]$RecordId='') {
     $keys=@('recordId','operationId','nativeId','path','state','sha256','canRollback','files','impl','absenceKind','retainedKinds','reasonCode','blocksImport','canResolve','canFinalizeLocal')
     if ($null -eq $Row -or (($Row.PSObject.Properties.Name | Sort-Object) -join ',') -cne (($keys | Sort-Object) -join ',')) { throw (T 'WkRecoveryRowInvalid') }
-    if ($Row.state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable') -or $Row.path -isnot [string] -or -not [IO.Path]::IsPathRooted($Row.path) -or $Row.reasonCode -isnot [string]) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.state -isnot [string] -or $Row.state -cnotin @('absent','pending','complete','rolled_back','resolved','unreadable','unsafe') -or $Row.path -isnot [string] -or -not [IO.Path]::IsPathRooted($Row.path) -or ($null -ne $Row.reasonCode -and $Row.reasonCode -isnot [string])) { throw (T 'WkRecoveryRowInvalid') }
     foreach ($key in 'canRollback','blocksImport','canResolve','canFinalizeLocal') { if ($Row.$key -isnot [bool]) { throw (T 'WkRecoveryRowInvalid') } }
     foreach ($key in 'recordId','operationId') { if ($null -ne $Row.$key -and ($Row.$key -isnot [string] -or $Row.$key -cnotmatch '^[0-9a-f]{32}$')) { throw (T 'WkRecoveryRowInvalid') } }
     if ($Row.recordId -cne $Row.operationId -or ($RecordId -and $null -ne $Row.recordId -and $Row.recordId -cne $RecordId)) { throw (T 'WkRecoveryRowInvalid') }
-    if ($null -eq $Row.recordId -and ($Row.state -cne 'unreadable' -or $null -ne $Row.nativeId -or $null -ne $Row.sha256 -or -not $Row.blocksImport -or $Row.canRollback -or $Row.canResolve -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
-    if ($null -ne $Row.nativeId) { if ($Row.nativeId -isnot [string]) { throw (T 'WkRecoveryRowInvalid') }; Assert-NativeId $Row.nativeId }
+    if ($null -eq $Row.recordId -and ($Row.state -cnotin @('unreadable','unsafe') -or -not $Row.reasonCode -or $null -ne $Row.nativeId -or $null -ne $Row.sha256 -or -not $Row.blocksImport -or $Row.canRollback -or $Row.canResolve -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
+    # Recovery nativeId identifies the journal file, not an M ThreadId.
+    if ($null -ne $Row.nativeId -and ($Row.nativeId -isnot [string] -or $Row.nativeId -cnotmatch '^[0-9a-f]{24}$')) { throw (T 'WkRecoveryRowInvalid') }
     if ($null -ne $Row.sha256 -and ($Row.sha256 -isnot [string] -or $Row.sha256 -notmatch '^[0-9a-fA-F]{64}$')) { throw (T 'WkRecoveryRowInvalid') }
     if (($null -ne $Row.files -and $Row.files -isnot [array]) -or $Row.retainedKinds -isnot [array] -or ($null -ne $Row.impl -and $Row.impl -isnot [string])) { throw (T 'WkRecoveryRowInvalid') }
+    foreach ($file in $Row.files) { if ($file -isnot [string]) { throw (T 'WkRecoveryRowInvalid') } }
     $null=Get-CodexRetainedKinds $Row
-    if ($Row.canRollback -and ($Row.state -cne 'pending' -or $Row.impl -cnotin @($null,'ctxhop-codex') -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.state -ceq 'unsafe' -and (-not $Row.reasonCode -or $Row.canRollback -or $Row.canResolve -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
+    if (($Row.canRollback -or $Row.canResolve -or $Row.canFinalizeLocal) -and (-not $Row.recordId -or -not $Row.nativeId -or -not $Row.sha256)) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.state -cin @('absent','complete','rolled_back','resolved') -and ($Row.canRollback -or $Row.canResolve -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.state -ceq 'absent' -and ($null -ne $Row.nativeId -or $null -ne $Row.sha256)) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.canRollback -and ($Row.state -cne 'pending' -or $Row.impl -cnotin @($null,'python','ctxhop-codex') -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
     if ($Row.canResolve -and ($Row.state -cnotin @('pending','unreadable') -or -not $Row.sha256 -or -not $Row.recordId -or $Row.canFinalizeLocal)) { throw (T 'WkRecoveryRowInvalid') }
-    if ($Row.canFinalizeLocal -and ($Row.state -cne 'pending' -or $Row.canRollback -or $Row.canResolve)) { throw (T 'WkRecoveryRowInvalid') }
-    if ($Row.blocksImport -ne ($Row.state -cin @('pending','unreadable'))) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.canFinalizeLocal -and ($Row.state -cne 'pending' -or $Row.impl -cne 'ctxhop-codex' -or $Row.canRollback -or $Row.canResolve -or $null -ne $Row.reasonCode)) { throw (T 'WkRecoveryRowInvalid') }
+    if ($Row.blocksImport -ne ($Row.state -cin @('pending','unreadable','unsafe'))) { throw (T 'WkRecoveryRowInvalid') }
+}
+function Read-DesktopRecoveryResponse([object]$Report,[string]$RecordId) {
+    if (($Report.PSObject.Properties.Name -join ',') -cne 'record') { throw (T 'WkRecoveryRowInvalid') }
+    Assert-DesktopRecoveryRecord $Report.record $RecordId
+    return $Report.record
 }
 function Get-DesktopRecord([string]$DesktopRoot,[string]$RecordId) {
     $null=Assert-OperationId $RecordId
-    $report=Invoke-DesktopGo @('recovery-status','--home',$DesktopRoot,'--run',$RecordId)
-    if (($report.PSObject.Properties.Name -join ',') -cne 'record') { throw (T 'WkRecoveryRowInvalid') }
-    Assert-DesktopRecoveryRecord $report.record $RecordId
-    return $report.record
+    return (Read-DesktopRecoveryResponse (Invoke-DesktopGo @('recovery-status','--home',$DesktopRoot,'--run',$RecordId)) $RecordId)
 }
 function Get-DesktopRecordRows([string]$DesktopRoot) {
     $report=Invoke-DesktopGo @('recovery-list','--home',$DesktopRoot)
@@ -256,10 +264,10 @@ $script:CodexDesktopOps=@{
                 $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)
                 if ($row.state -eq 'rolled_back') { return (New-DesktopRollbackResult $row $row.path) }
                 if (-not $row.canRollback) { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordNotPending' $row.state);records=@([pscustomobject]$row)} }
-                if ($row.impl -cnotin @($null,'ctxhop-codex')) { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordImplUnknown');records=@([pscustomobject]$row)} }
+                if ($row.impl -cnotin @($null,'python','ctxhop-codex')) { return @{status='failed';reasonCode='unsupported_record';reason=(T 'WkRecordImplUnknown');records=@([pscustomobject]$row)} }
                 try {
                     if ($row.impl -ceq 'ctxhop-codex') { $done=Invoke-DesktopGo @('rollback','--home',$desktopRoot,'--run',$row.recordId) }
-                    else { $done=Invoke-DesktopBackend @('recover','--home',$desktopRoot,'--run',$row.path) }
+                    else { $done=Invoke-DesktopBackend @('recover','--home',$desktopRoot,'--run',([IO.Path]::GetDirectoryName($row.path))) }
                 }
                 catch {
                     # 백엔드는 중단 뒤 대화가 바뀌었으면 되돌리지 않고 멈춘다. 기록은 pending으로 남는다.
@@ -275,16 +283,16 @@ $script:CodexDesktopOps=@{
                 $sha=([string]$R.sha256).ToLowerInvariant()
                 if ($sha -cnotmatch '^[0-9a-f]{64}$') { return @{status='failed';reasonCode='changed';reason=(T 'WkRecordChanged');records=@($row)} }
                 if ($row.state -cne 'resolved' -and $row.sha256 -ine $sha) { return @{status='failed';reasonCode='changed';reason=(T 'WkRecordChanged');records=@($row)} }
-                $done=Invoke-DesktopGo @('recovery-resolve','--home',$desktopRoot,'--run',$row.recordId,'--sha256',$sha)
-                if ($done.status -cne 'resolved') { throw (T 'WkRestoreStatusUnknown' $done.status) }
+                $done=Read-DesktopRecoveryResponse (Invoke-DesktopGo @('recovery-resolve','--home',$desktopRoot,'--run',$row.recordId,'--sha256',$sha)) $row.recordId
+                if ($done.state -cne 'resolved') { throw (T 'WkRestoreStatusUnknown' $done.state) }
                 return @{effect='resolved';message=(T 'WkRecoverResolved' $row.path)}
             }
             finalize {
                 $row=Get-DesktopRecord $desktopRoot ([string]$R.recordId)
                 if (-not $row.canFinalizeLocal) { return @{status='failed';reasonCode=$row.reasonCode;reason=(T 'WkRecoveryActionUnavailable');records=@($row)} }
-                $done=Invoke-DesktopGo @('finalize','--home',$desktopRoot,'--run',$row.recordId)
-                if ($done.status -cnotin @('complete','rolled_back')) { throw (T 'WkRestoreStatusUnknown' $done.status) }
-                return @{effect='finalized';terminalStatus=$done.status;message=(T 'WkRecoveryFinalized')}
+                $done=Read-DesktopRecoveryResponse (Invoke-DesktopGo @('finalize','--home',$desktopRoot,'--run',$row.recordId)) $row.recordId
+                if ($done.state -cnotin @('complete','rolled_back')) { throw (T 'WkRestoreStatusUnknown' $done.state) }
+                return @{effect='finalized';terminalStatus=$done.state;message=(T 'WkRecoveryFinalized')}
             }
         }
         throw (T 'WkRecoverModeInvalid' ([string]$R.mode))

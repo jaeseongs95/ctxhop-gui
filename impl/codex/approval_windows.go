@@ -190,6 +190,12 @@ func approvalHash(f *os.File, max int64, deadline time.Time) (string, int64, err
 	}
 }
 func validateApprovalManifest(raw []byte, o options, ms []member) (approvalManifest, error) {
+	return validateApprovalManifestPins(raw, o, ms, approvalPins{engineSHA256, normalEngineSHA256, loaderContractID})
+}
+
+// Pure compact metadata validation also supports the operation's stored pins.
+// Cleanup restarts must not require the currently installed engine or sources.
+func validateApprovalManifestPins(raw []byte, o options, ms []member, pins approvalPins) (approvalManifest, error) {
 	var m approvalManifest
 	if len(raw) > 4<<20 {
 		return m, fail("resourceLimit", "승인 manifest 크기 한도 초과")
@@ -213,7 +219,7 @@ func validateApprovalManifest(raw []byte, o options, ms []member) (approvalManif
 	if e = d.Decode(&m); e != nil {
 		return m, fail("approval_evidence", "승인 manifest 타입 오류")
 	}
-	if m.SchemaVersion != 1 || m.Profile != approvalProfile || !hashRE.MatchString(m.ArchiveSHA256) || (m.ArchiveFormat != 1 && m.ArchiveFormat != 2) || !opRE.MatchString(o.Run) || m.OperationID != o.Run || !samePath(m.Home, o.Home) || !samePath(m.Cwd, o.Cwd) || m.Pins != (approvalPins{engineSHA256, normalEngineSHA256, loaderContractID}) || len(m.Members) != len(ms) || len(ms) < 1 || len(ms) > 2000 {
+	if m.SchemaVersion != 1 || m.Profile != approvalProfile || !hashRE.MatchString(m.ArchiveSHA256) || (m.ArchiveFormat != 1 && m.ArchiveFormat != 2) || !opRE.MatchString(o.Run) || m.OperationID != o.Run || !samePath(m.Home, o.Home) || !samePath(m.Cwd, o.Cwd) || m.Pins != pins || len(m.Members) != len(ms) || len(ms) < 1 || len(ms) > 2000 {
 		return m, fail("approval_evidence", "승인 scope/pin 오류")
 	}
 	seen := map[string]bool{}
@@ -375,6 +381,13 @@ func createApproval(o options, f *family) (*approvalDescriptor, *approvalOwnersh
 	if _, e := validateApprovalManifest(raw, o, f.Members); e != nil {
 		return nil, nil, e
 	}
+	sizes := make([]int64, len(f.Members))
+	for i, member := range f.Members {
+		sizes[i] = int64(len(member.Raw))
+	}
+	if e := preflightEvidenceCopies(evidenceBudgetRoot(o), o.Run, sizes...); e != nil {
+		return nil, nil, e
+	}
 	if e := noReparse(root); e != nil {
 		return nil, nil, e
 	}
@@ -503,12 +516,20 @@ func validateApprovalProjection(r object, o options, ms []member, acquired bool)
 		return fail("approval_evidence", "완료 승인 digest 결속 오류")
 	}
 	if o.RecoveryEvidence == nil {
-		if r["recoveryEvidenceDigest"] != nil { return fail("recovery_evidence", "복구 descriptor 없는 digest") }
+		if r["recoveryEvidenceDigest"] != nil {
+			return fail("recovery_evidence", "복구 descriptor 없는 digest")
+		}
 	} else {
-		if r["recoveryEvidenceDigest"] != o.RecoveryEvidence.ManifestSHA256 { return fail("recovery_evidence", "완료 복구 digest 결속 오류") }
+		if r["recoveryEvidenceDigest"] != o.RecoveryEvidence.ManifestSHA256 {
+			return fail("recovery_evidence", "완료 복구 digest 결속 오류")
+		}
 		recovery, e := pinRecovery(o, ms)
-		if e != nil { return e }
-		if e = recovery.Close(); e != nil { return e }
+		if e != nil {
+			return e
+		}
+		if e = recovery.Close(); e != nil {
+			return e
+		}
 	}
 	l, e := pinApproval(o, ms)
 	if e != nil {
@@ -545,8 +566,7 @@ func writeRPCFrame(p *process, b []byte, deadline time.Time) error {
 		}
 		return e
 	case <-time.After(time.Until(deadline)):
-		p.close()
-		return fail("rpc_timeout", "RPC 전송 시간 초과")
+		return errors.Join(fail("rpc_timeout", "RPC 전송 시간 초과"), p.close())
 	}
 }
 

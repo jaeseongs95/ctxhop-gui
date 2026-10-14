@@ -1,5 +1,5 @@
 ﻿#requires -Version 5.1
-param([string]$RecoveryHelperPath,[string]$RecoveryHelperSHA256)
+param([string]$RecoveryHelperPath,[string]$RecoveryHelperSHA256,[switch]$MockRecoveryRecords)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 . (Join-Path $PSScriptRoot 'CodexDesktop.ps1') -LibraryOnly
@@ -30,6 +30,69 @@ $oldLocal=$env:LOCALAPPDATA; $oldCodexHome=$env:CODEX_HOME
 $script:Calls=@(); $script:Id='11111111-1111-4111-8111-111111111111'; $script:State='conflict'; $script:ApplyFail=$false
 $script:BundleA='peer-a/'+('a'*32); $script:BundleB='peer-b/'+('b'*32)
 $script:Metadata=[pscustomobject]@{sessionId=$script:Id;title='합성 대화';sourceCwd='D:\source';updatedAt='2026-09-26T01:00:00Z';historyMode='paginated';cliVersion='0.116.0';recordCount=4}
+function New-RecoveryFixtureJournal([string]$HomeValue,[string]$Status,[string]$Impl='python') {
+    $path=Join-Path $HomeValue "sessions\2026\09\26\rollout-2026-09-26T00-00-00-$($script:Id).jsonl"
+    if ($Impl -ceq 'python') {
+        $record=[ordered]@{version=2;status=$Status;home=$HomeValue;id=$script:Id;before='absent';members=@([ordered]@{id=$script:Id;path=$path;before='absent';after=('a'*64);beforeFile=$null;afterFile=('b'*64)});edges=@();createdDb=@()}
+    } else {
+        # A supported v3 decoder fixture; engine calls/pins are not exercised by this synthetic importer.
+        $record=[ordered]@{version=3;impl='ctxhop-codex';status=$Status;phase='created';home=$HomeValue;id=$script:Id;cwd=$HomeValue;archiveSha256=('a'*64);archived=$false;members=@([ordered]@{id=$script:Id;parent=$null;path=$path;size=1;sha256=('b'*64)});engineVersion='0.159.2';engineSha256=('c'*64);normalEngineSha256=('d'*64);loaderContractId='ctxhop-prestart-v2:synthetic'}
+    }
+    return (ConvertTo-Json -InputObject $record -Depth 6 -Compress)
+}
+function Get-RetainedFixtureRow([string]$Op,[object]$Row) {
+    $Row.absenceKind='retained'; $Row.retainedKinds=$script:RecoveryOverrides[$Op]
+    return $Row
+}
+function Get-MockRecoveryRow([string]$HomeValue,[string]$Op) {
+    # JSON/capability consumer fixture only. This does not model native FS safety or grant cleanup authority.
+    $run=Join-Path $HomeValue ".ctxhop-desktop-recovery\$Op"
+    $row=[ordered]@{recordId=$Op;operationId=$Op;nativeId=$null;path=$run;state='unreadable';sha256=$null;canRollback=$false;files=@();impl=$null;absenceKind=$null;retainedKinds=@();reasonCode='record_missing';blocksImport=$true;canResolve=$false;canFinalizeLocal=$false}
+    if ($Op -cnotmatch '^[0-9a-f]{32}$') { $row.recordId=$null; $row.operationId=$null; $row.state='unsafe'; $row.reasonCode='invalid_record_id' }
+    elseif (-not [IO.Directory]::Exists($run)) { $row.state='absent'; $row.reasonCode=$null; $row.absenceKind=$null; $row.blocksImport=$false }
+    else {
+        $names=@('journal.json','journal.resolved.json' | Where-Object { [IO.File]::Exists((Join-Path $run $_)) }); $row.files=$names
+        if ($names.Count -eq 2) { $row.reasonCode='record_ambiguous' }
+        elseif ($names.Count -eq 1) {
+            $row.path=Join-Path $run $names[0]; $row.nativeId='a'*24; $row.sha256=(Get-FileHash -LiteralPath $row.path -Algorithm SHA256).Hash.ToLowerInvariant(); $row.canResolve=$true
+            if ($names[0] -ceq 'journal.resolved.json') { $row.state='resolved'; $row.reasonCode=$null; $row.blocksImport=$false; $row.canResolve=$false }
+            else {
+                try {
+                    $journal=Get-Content -LiteralPath $row.path -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($journal.home -cne $HomeValue -or $journal.id -cne $script:Id) { throw 'binding' }
+                    if ($journal.impl -ceq 'ctxhop-codex') {
+                        if ($journal.version -ne 3 -or -not $journal.members.Count -or $journal.absenceKind -or $null -ne $journal.retainedKinds) { throw 'contract' }
+                        $row.impl='ctxhop-codex'
+                    } else {
+                        if ($null -ne $journal.impl -or $journal.version -ne 2 -or -not $journal.members.Count -or $journal.edges -isnot [array]) { throw 'legacy' }
+                        $row.impl='python'
+                    }
+                    if ($journal.status -cnotin @('pending','complete','rolled_back')) { throw 'status' }
+                    $row.state=$journal.status; $row.reasonCode=$null; $row.blocksImport=($journal.status -ceq 'pending'); $row.canRollback=$row.blocksImport; $row.canResolve=$row.blocksImport
+                } catch { $row.reasonCode='record_contract_invalid' }
+            }
+        }
+    }
+    $result=ConvertTo-Json -InputObject $row -Depth 8 | ConvertFrom-Json
+    if ($script:RecoveryOverrides.ContainsKey($Op)) { $result=Get-RetainedFixtureRow $Op $result }
+    return $result
+}
+function Invoke-MockRecoveryRecords([string[]]$Arguments) {
+    $fixtureHome=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
+    if ($Arguments[0] -ceq 'recovery-list') {
+        $root=Join-Path $fixtureHome '.ctxhop-desktop-recovery'
+        $records=@(if ([IO.Directory]::Exists($root)) { foreach ($dir in [IO.Directory]::GetDirectories($root)) { Get-MockRecoveryRow $fixtureHome ([IO.Path]::GetFileName($dir)) } })
+        return [pscustomobject]@{records=$records}
+    }
+    $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]; $row=Get-MockRecoveryRow $fixtureHome $op
+    if ($Arguments[0] -ceq 'recovery-resolve') {
+        $sha=$Arguments[[array]::IndexOf($Arguments,'--sha256')+1]
+        if (($row.state -cne 'resolved' -and -not $row.canResolve) -or $row.sha256 -cne $sha) { throw 'mock record changed' }
+        if ($row.state -cne 'resolved') { [IO.File]::Move($row.path,(Join-Path ([IO.Path]::GetDirectoryName($row.path)) 'journal.resolved.json')) }
+        $row=Get-MockRecoveryRow $fixtureHome $op
+    }
+    return [pscustomobject]@{record=$row}
+}
 function Invoke-DesktopBackend([string[]]$Arguments) {
     $script:Calls+=,[pscustomobject]@{kind='backend';arguments=$Arguments}
     switch ($Arguments[0]) {
@@ -56,7 +119,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
             $run=Join-Path $Arguments[[array]::IndexOf($Arguments,'--home')+1] (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
             if (-not $script:ApplyNoRecord) {
                 $null=New-Item -ItemType Directory -Path $run -Force
-                [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status=$(if ($script:ApplyFail) {'pending'} else {'complete'});home=$Arguments[[array]::IndexOf($Arguments,'--home')+1];id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(New-RecoveryFixtureJournal $Arguments[[array]::IndexOf($Arguments,'--home')+1] $(if ($script:ApplyFail) {'pending'} else {'complete'})),[Text.UTF8Encoding]::new($false))
             }
             if ($script:ApplyFail) {
                 $e=[InvalidOperationException]::new('복원 실패, 복구 기록 유지')
@@ -80,7 +143,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
                 throw $e
             }
             $journal=Join-Path $Arguments[[array]::IndexOf($Arguments,'--run')+1] 'journal.json'
-            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json; $record.status='rolled_back'
+            $record=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json; $record.status='rolled_back'
             [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
             return @{status='rolled_back';id=$record.id;members=1}
         }
@@ -89,15 +152,23 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
 }
 # Go routing is tested independently of the native engine. Existing cases use an explicit exists plan.
 $script:GoState='exists'; $script:GoFail=$false; $script:GoRetainedKinds=$null
-# Recovery classification/rename use the frozen native helper against only synthetic runs.
-if (-not $RecoveryHelperPath) { $RecoveryHelperPath=Join-Path $PSScriptRoot 'bin\ctxhop-codex.exe'; $RecoveryHelperSHA256=$script:DesktopGoSHA256 }
-if ($RecoveryHelperSHA256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Supply the fixed recovery helper path and SHA256 for this test.' }
-Assert-FrozenFile $RecoveryHelperPath $RecoveryHelperSHA256
-$script:RecoveryFixtureExe=$RecoveryHelperPath; $script:RecoveryCalls=0
+# Native classification/rename requires an explicitly supplied frozen helper.
+if ($MockRecoveryRecords) {
+    if ($RecoveryHelperPath -or $RecoveryHelperSHA256) { throw 'Choose mock recovery records or an explicit native helper, not both.' }
+} else {
+    if (-not $RecoveryHelperPath -or $RecoveryHelperSHA256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Supply a fixed recovery helper path and SHA256, or explicitly select -MockRecoveryRecords.' }
+    Assert-FrozenFile $RecoveryHelperPath $RecoveryHelperSHA256
+}
+$script:RecoveryFixtureExe=$RecoveryHelperPath; $script:RecoveryCalls=0; $script:MockRecoveryCalls=0; $script:RecoveryOverrides=@{}; $script:NativeRecoveryCounts=@{}; $script:MockRecoveryCounts=@{}
+Write-Output "Recovery mode: $(if ($MockRecoveryRecords) {'mock consumer only; native safety unverified'} else {'native classifier/rename'}); helper SHA256: $RecoveryHelperSHA256"
 function Invoke-DesktopGo([string[]]$Arguments) {
     if ($Arguments[0] -cin @('recovery-list','recovery-status','recovery-resolve','finalize')) {
-        $script:RecoveryCalls++
-        return (Invoke-JsonNative $script:RecoveryFixtureExe $Arguments)
+        if ($MockRecoveryRecords) { $script:MockRecoveryCalls++; $script:MockRecoveryCounts[$Arguments[0]]++; return (Invoke-MockRecoveryRecords $Arguments) }
+        $script:RecoveryCalls++; $script:NativeRecoveryCounts[$Arguments[0]]++
+        $report=Invoke-JsonNative $script:RecoveryFixtureExe $Arguments
+        # Retained engine proof is a separately injected consumer fixture, never a forged Go journal.
+        if ($Arguments[0] -ceq 'recovery-status' -and $script:RecoveryOverrides.ContainsKey($Arguments[-1])) { $report.record=Get-RetainedFixtureRow $Arguments[-1] $report.record }
+        return $report
     }
     $script:Calls+=,[pscustomobject]@{kind='go';arguments=$Arguments}
     switch ($Arguments[0]) {
@@ -114,7 +185,7 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
             $run=Join-Path $goFixtureHome (".ctxhop-desktop-recovery\"+$op)
             $null=[IO.Directory]::CreateDirectory($run)
-            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=1;status=$(if ($script:GoFail) {'pending'} else {'complete'});home=$goFixtureHome;id=$script:Id;impl='ctxhop-codex'}) -Compress),[Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(New-RecoveryFixtureJournal $goFixtureHome $(if ($script:GoFail) {'pending'} else {'complete'}) 'ctxhop-codex'),[Text.UTF8Encoding]::new($false))
             if ($script:GoFail) {
                 $e=[InvalidOperationException]::new('synthetic Go placement failure')
                 $e.Data['backendResult']=[pscustomobject]@{error='synthetic Go placement failure';reasonCode='fixture_interrupted';pending=@($op)}
@@ -126,13 +197,12 @@ function Invoke-DesktopGo([string[]]$Arguments) {
             $goFixtureHome=$Arguments[[array]::IndexOf($Arguments,'--home')+1]
             $op=$Arguments[[array]::IndexOf($Arguments,'--run')+1]
             $journal=Join-Path $goFixtureHome ".ctxhop-desktop-recovery\$op\journal.json"
-            $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
+            $record=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
             Assert ($record.impl -ceq 'ctxhop-codex') 'Go rollback receives a Go record only'
             $record.status='rolled_back'
             $result=@{status='rolled_back'}
             if ($null -ne $script:GoRetainedKinds) {
-                $record | Add-Member NoteProperty absenceKind 'retained' -Force
-                $record | Add-Member NoteProperty retainedKinds $script:GoRetainedKinds -Force
+                $script:RecoveryOverrides[$op]=$script:GoRetainedKinds
                 $result.absenceKind='retained'; $result.retainedKinds=$script:GoRetainedKinds
             }
             [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
@@ -268,7 +338,7 @@ try {
         $null=New-Item -ItemType Directory -Path (Join-Path $recoveryRoot $Op) -Force
         [IO.File]::WriteAllText((Join-Path $recoveryRoot "$Op\$Name"),$Text,[Text.UTF8Encoding]::new($false))
     }
-    function Get-RunJson([string]$Status,[string]$HomeValue=$desktopRoot) { return (ConvertTo-Json -InputObject ([ordered]@{version=2;status=$Status;home=$HomeValue;id=$script:Id}) -Compress) }
+    function Get-RunJson([string]$Status,[string]$HomeValue=$desktopRoot) { return (New-RecoveryFixtureJournal $HomeValue $Status) }
     $recoverJob=[pscustomobject]@{agent='codex-desktop';home=$desktopRoot}
     function Get-CodexState([string]$Op) { return (Invoke-Vendor $recoverJob 'recover' @{mode='status';operationId=$Op}).state }
     $ops=@{}; foreach ($name in 'absent','empty','pending','complete','rolled','resolved','both','broken','foreign') { $ops[$name]=[guid]::NewGuid().ToString('N') }
@@ -286,7 +356,7 @@ try {
     Assert (@($listed | Where-Object { $null -eq $_.recordId -and $_.reasonCode -and $_.blocksImport -and -not $_.canResolve -and -not $_.canRollback -and -not $_.canFinalizeLocal }).Count -eq 1) 'an invalid namespace name remains a visible non-actionable diagnostic'
     Assert ((@($listed | Where-Object { $null -ne $_.recordId } | ForEach-Object recordId | Sort-Object) -join ',') -eq (@($ops.empty,$ops.pending,$ops.both,$ops.broken,$ops.foreign | Sort-Object) -join ',')) 'list shows pending, empty and unreadable records'
     $pendingRow=@($listed | Where-Object recordId -eq $ops.pending)[0]
-    Assert ($pendingRow.canRollback -and $pendingRow.nativeId -eq $script:Id -and $pendingRow.sha256 -eq (Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.pending)\journal.json") -Algorithm SHA256).Hash) 'a pending row can be rolled back and carries its record hash'
+    Assert ($pendingRow.canRollback -and $pendingRow.nativeId -cmatch '^[0-9a-f]{24}$' -and $pendingRow.impl -ceq 'python' -and $pendingRow.sha256 -eq (Get-FileHash -LiteralPath (Join-Path $recoveryRoot "$($ops.pending)\journal.json") -Algorithm SHA256).Hash) 'a pending row can be rolled back and carries its record hash'
     Assert (-not @($listed | Where-Object { $_.recordId -ne $ops.pending -and $_.canRollback }).Count) 'unreadable rows cannot be rolled back'
     Assert (-not (Get-DesktopRecord $desktopRoot $ops.empty).canResolve -and -not (Get-DesktopRecord $desktopRoot $ops.both).canResolve -and (Get-DesktopRecord $desktopRoot $ops.broken).canResolve) 'only a single safe raw record can be closed'
     # 되돌리기: pending만 백엔드 recover로 되돌린다. 백엔드가 멈추면 기록은 그대로다.
@@ -312,6 +382,155 @@ try {
     $failure=$null; try { $null=Invoke-Vendor $recoverJob 'recover' @{mode='resolve';recordId=$ops.both;sha256=$brokenHash} } catch { $failure=$_ }
     Assert ($failure.Exception.Data['vendorResult'].status -ceq 'failed' -and [IO.File]::Exists((Join-Path $recoveryRoot "$($ops.both)\journal.json"))) 'a record whose closed name already exists is not overwritten'
     Remove-Item -LiteralPath $recoveryRoot -Recurse
+    if (-not $MockRecoveryRecords) {
+        # Native local finalization: explicit synthetic v4 preplacing receipt, no engine or DB proof.
+        function Get-NativeFixtureSha([string]$Value) {
+            $hash=[Security.Cryptography.SHA256]::Create()
+            try { return (Get-ProjectHex ($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))) } finally { $hash.Dispose() }
+        }
+        $nativeOp=[guid]::NewGuid().ToString('N'); $identityOp=[guid]::NewGuid().ToString('N')
+        $nativeRun=Join-Path $recoveryRoot $nativeOp; $identityRun=Join-Path $recoveryRoot $identityOp
+        $null=[IO.Directory]::CreateDirectory((Join-Path $nativeRun 'stage'))
+        $null=[IO.Directory]::CreateDirectory($identityRun)
+        $ownedText='synthetic owned stage bytes'; $ownedSource=Join-Path $identityRun 'journal.json'
+        [IO.File]::WriteAllText($ownedSource,$ownedText,[Text.UTF8Encoding]::new($false))
+        $identity=(Invoke-DesktopGo @('recovery-status','--home',$desktopRoot,'--run',$identityOp)).record
+        Assert ($identity.nativeId -cmatch '^[0-9a-f]{24}$' -and $identity.sha256 -ceq (Get-NativeFixtureSha $ownedText)) 'native helper supplies the current synthetic artifact identity and raw hash'
+        $ownedPath=Join-Path $nativeRun 'stage\0000.jsonl'
+        [IO.File]::Move($ownedSource,$ownedPath); [IO.Directory]::Delete($identityRun,$false)
+        $keepPath=Join-Path $nativeRun 'stage\keep.txt'; [IO.File]::WriteAllText($keepPath,'preserve unknown sibling')
+        # Ordinally sorted keys match the producer canonical digest for this bounded fixture.
+        $receipt=[ordered]@{approvalManifestSha256=$null;home=$desktopRoot;kind='ctxhop-local-finalization-v1';operationId=$nativeOp;ownedArtifacts=@([ordered]@{identity=$identity.nativeId;path='stage/0000.jsonl';sha256=$identity.sha256;size=[Text.Encoding]::UTF8.GetByteCount($ownedText)});recoveryEvidenceDigest=$null;schemaVersion=1;terminalProofDigest=$null;terminalStatus='rolled_back'}
+        $receiptDigest=Get-NativeFixtureSha (ConvertTo-Json -InputObject $receipt -Depth 10 -Compress)
+        $receipt.receiptDigest=$receiptDigest
+        $receiptRaw=(ConvertTo-Json -InputObject $receipt -Depth 10 -Compress)+"`n"
+        $receiptPath=Join-Path $nativeRun 'local-finalization.json'
+        [IO.File]::WriteAllText($receiptPath,$receiptRaw,[Text.UTF8Encoding]::new($false))
+        $journal=New-RecoveryFixtureJournal $desktopRoot 'pending' 'ctxhop-codex' | ConvertFrom-Json
+        $journal.version=4
+        $journal | Add-Member NoteProperty recoveryEvidence $null
+        $journal | Add-Member NoteProperty localFinalization ([ordered]@{state='cleanup_pending';receiptPath=$receiptPath;receiptSha256=(Get-NativeFixtureSha $receiptRaw);receiptDigest=$receiptDigest;terminalStatus='rolled_back';terminalProof=$null;absenceKind='preplacing_target_absent';retainedKinds=@()})
+        [IO.File]::WriteAllText((Join-Path $nativeRun 'journal.json'),(ConvertTo-Json -InputObject $journal -Depth 12 -Compress),[Text.UTF8Encoding]::new($false))
+        $row=Get-DesktopRecord $desktopRoot $nativeOp
+        Assert ($row.state -ceq 'pending' -and $row.blocksImport -and $row.canFinalizeLocal -and -not $row.canRollback -and -not $row.canResolve -and $row.absenceKind -ceq 'absent' -and -not $row.retainedKinds.Count) 'native bound receipt exposes cleanup only and normalizes preplacing absence'
+        $rows=@(Get-DesktopRecordRows $desktopRoot)
+        Assert (@($rows | Where-Object { $_.recordId -ceq $nativeOp -and $_.state -ceq 'pending' }).Count -eq 1) 'native recovery-list exposes internal cleanup as external pending'
+        $beforeCalls=$script:Calls.Count; $beforeMarkers=@(Read-Markers).Count
+        [IO.File]::AppendAllText($receiptPath,' ')
+        $bad=Get-DesktopRecord $desktopRoot $nativeOp
+        Assert ($bad.state -ceq 'unreadable' -and $bad.reasonCode -ceq 'finalization_binding_invalid' -and -not $bad.canFinalizeLocal) 'changed receipt bytes cannot authorize native cleanup'
+        Throws { Invoke-DesktopGo @('finalize','--home',$desktopRoot,'--run',$nativeOp) } 'finalization_binding|최종 정리'
+        Assert ([IO.File]::Exists($ownedPath) -and [IO.File]::ReadAllText($keepPath) -ceq 'preserve unknown sibling') 'failed native finalization preserves owned and unknown artifacts'
+        [IO.File]::WriteAllText($receiptPath,$receiptRaw,[Text.UTF8Encoding]::new($false))
+        $result=Invoke-JobCore @{action='FinalizeJournal';agent='codex-desktop';home=$desktopRoot;recordId=$nativeOp}
+        Assert ($result.outcome -ceq 'finalized' -and $result.terminalStatus -ceq 'rolled_back') 'Worker consumes the actual native finalize record response'
+        $terminal=Get-DesktopRecord $desktopRoot $nativeOp
+        Assert ($terminal.state -ceq 'rolled_back' -and -not $terminal.blocksImport -and -not $terminal.canRollback -and -not $terminal.canResolve -and -not $terminal.canFinalizeLocal) 'native finalization reaches a terminal row without action capabilities'
+        Assert (-not [IO.File]::Exists($ownedPath) -and [IO.File]::ReadAllText($keepPath) -ceq 'preserve unknown sibling' -and [IO.File]::ReadAllText($receiptPath) -ceq $receiptRaw -and [IO.File]::Exists((Join-Path $nativeRun 'journal.json'))) 'native finalization removes only the bound artifact and retains journal, receipt and unknown sibling'
+        $again=Read-DesktopRecoveryResponse (Invoke-DesktopGo @('finalize','--home',$desktopRoot,'--run',$nativeOp)) $nativeOp
+        Assert ($again.state -ceq 'rolled_back' -and $script:Calls.Count -eq $beforeCalls -and @(Read-Markers).Count -eq $beforeMarkers) 'native finalization is idempotent and performs no engine, bundle or project-marker operation'
+        Write-Output 'Native v4 cleanup: bound file removed; tampered receipt rejected; unknown sibling and compact metadata preserved; idempotent replay passed.'
+    }
+
+    # Frozen row15 consumer matrix. Wire fixtures do not claim native filesystem or engine proof.
+    function New-ContractRecord {
+        return [pscustomobject][ordered]@{recordId=('e'*32);operationId=('e'*32);nativeId=('a'*24);path=(Join-Path $desktopRoot ('.ctxhop-desktop-recovery\'+('e'*32)+'\journal.json'));state='pending';sha256=('a'*64);canRollback=$true;files=@('journal.json');impl='python';absenceKind=$null;retainedKinds=@();reasonCode=$null;blocksImport=$true;canResolve=$true;canFinalizeLocal=$false}
+    }
+    foreach ($impl in @($null,'python','ctxhop-codex')) {
+        $wire=New-ContractRecord; $wire.impl=$impl; Assert-DesktopRecoveryRecord $wire ('e'*32)
+        Assert ($wire.nativeId.Length -eq 24 -and $null -eq $wire.reasonCode) 'journal identity and nullable reason remain distinct from a conversation UUID'
+    }
+    $wire=New-ContractRecord; $wire.files=$null; Assert-DesktopRecoveryRecord $wire
+    $wire.files=@(); Assert-DesktopRecoveryRecord $wire
+    Assert ($wire.files -is [array]) 'null and empty file inventories are accepted without scalar conversion'
+    foreach ($change in @(
+        @{nativeId=$script:Id},@{nativeId='A'*24},@{reasonCode=1},@{state=@('pending')},@{state='cleanup_pending'},
+        @{recordId='x'},@{operationId='f'*32},@{sha256='bad'},@{canRollback=1},@{blocksImport='true'},
+        @{files='journal.json'},@{files=@(1)},@{retainedKinds=$null},@{impl='unknown'},@{canFinalizeLocal=$true},
+        @{state='unsafe'},@{state='complete';blocksImport=$false},@{state='pending';blocksImport=$false},@{nativeId=$null},
+        @{absenceKind=@('run_absent');state='absent';nativeId=$null;sha256=$null;canRollback=$false;canResolve=$false;blocksImport=$false}
+    )) {
+        $wire=New-ContractRecord; foreach ($key in $change.Keys) { $wire.$key=$change[$key] }
+        $rejected=$false; try { Assert-DesktopRecoveryRecord $wire } catch { $rejected=$true }
+        Assert $rejected "malformed row cannot confer authority: $($change.Keys -join ',')"
+    }
+    $wire=New-ContractRecord; $wire | Add-Member NoteProperty extra $true
+    Throws { Assert-DesktopRecoveryRecord $wire } '복구 기록'
+    $wire.PSObject.Properties.Remove('extra'); $wire.PSObject.Properties.Remove('reasonCode')
+    Throws { Assert-DesktopRecoveryRecord $wire } '복구 기록'
+    $unsafe=New-ContractRecord; $unsafe.state='unsafe'; $unsafe.recordId=$null; $unsafe.operationId=$null; $unsafe.nativeId=$null; $unsafe.sha256=$null; $unsafe.canRollback=$false; $unsafe.canResolve=$false; $unsafe.reasonCode='invalid_record_id'
+    Assert-DesktopRecoveryRecord $unsafe
+    Assert ($unsafe.blocksImport -and -not $unsafe.canFinalizeLocal) 'unsafe diagnostics stay visible with all actions disabled'
+    $wire=New-ContractRecord; $wire.state='absent'; $wire.nativeId=$null; $wire.sha256=$null; $wire.canRollback=$false; $wire.canResolve=$false; $wire.blocksImport=$false; $wire.absenceKind=$null
+    Assert-DesktopRecoveryRecord $wire
+    Assert ($null -eq $wire.absenceKind -and -not @(Get-CodexRetainedKinds $wire).Count) 'missing run carries no application absence or retained proof'
+    $wire.absenceKind='run_absent'; Throws { Assert-DesktopRecoveryRecord $wire } '보존한 엔진 기록'
+    $cleanup=New-ContractRecord; $cleanup.state='pending'; $cleanup.impl='ctxhop-codex'; $cleanup.canRollback=$false; $cleanup.canResolve=$false; $cleanup.canFinalizeLocal=$true
+    Assert-DesktopRecoveryRecord $cleanup
+    foreach ($change in @(@{state='cleanup_pending'},@{canRollback=$true},@{canResolve=$true},@{state='complete'},@{blocksImport=$false},@{reasonCode='bad'},@{impl='python'})) {
+        $badCleanup=$cleanup.PSObject.Copy(); foreach ($key in $change.Keys) { $badCleanup.$key=$change[$key] }
+        Throws { Assert-DesktopRecoveryRecord $badCleanup } '복구 기록'
+    }
+    $badCleanup=New-ContractRecord; $badCleanup.canRollback=$false; $badCleanup.canResolve=$false; $badCleanup.canFinalizeLocal=$true
+    Throws { Assert-DesktopRecoveryRecord $badCleanup } '복구 기록'
+    $badCleanup=New-ContractRecord; $badCleanup.absenceKind='terminal_source_absence'; $badCleanup.retainedKinds=@('journal','local_finalization','approval_manifest','recovery_manifest')
+    Throws { Assert-DesktopRecoveryRecord $badCleanup } '보존한 엔진 기록'
+    $realGo=${function:Invoke-DesktopGo}; $realUndo=${function:Undo-MarkerProject}; $realGuard=${function:Test-MarkerEngineClosed}
+    $script:ConsumerCalls=@(); $script:ConsumerRow=$cleanup; $script:ConsumerTerminal='complete'; $script:ConsumerBadResponse=$false
+    function Invoke-DesktopGo([string[]]$Arguments) {
+        $script:ConsumerCalls+=,$Arguments[0]
+        switch ($Arguments[0]) {
+            recovery-status { return [pscustomobject]@{record=$script:ConsumerRow} }
+            recovery-list { return [pscustomobject]@{records=@($script:ConsumerRow)} }
+            finalize {
+                if ($script:ConsumerBadResponse) { return @{status='complete'} }
+                $row=New-ContractRecord; $row.impl='ctxhop-codex'; $row.state=$script:ConsumerTerminal; $row.canRollback=$false; $row.canResolve=$false; $row.blocksImport=($row.state -ceq 'pending')
+                return [pscustomobject]@{record=$row}
+            }
+            default { throw "Unexpected engine/app operation in local cleanup: $($Arguments[0])" }
+        }
+    }
+    function Undo-MarkerProject { throw 'Local finalization must not undo project files' }
+    function Test-MarkerEngineClosed { throw 'Local finalization must not start an engine guard' }
+    try {
+        $rows=(Get-JournalRows @{home=$desktopRoot}).rows
+        $row=@($rows | Where-Object { $_.recordRef -ceq ('e'*32) })[0]
+        Assert ($row.canFinalizeLocal -and -not $row.canRollback -and -not $row.canResolve -and $row.blocksImport -and $null -eq $row.reasonCode) 'Worker preserves cleanup-only capabilities and nullable reason'
+        foreach ($terminal in 'complete','rolled_back') {
+            $script:ConsumerTerminal=$terminal
+            $final=Invoke-JobCore @{action='FinalizeJournal';agent='codex-desktop';home=$desktopRoot;recordId=('e'*32)}
+            Assert ($final.outcome -ceq 'finalized' -and $final.terminalStatus -ceq $terminal -and -not @(Read-Markers).Count) 'standalone finalize reads record.state and creates no project marker'
+        }
+        $marker=New-Marker ([pscustomobject]@{agent='codex-desktop';home=$desktopRoot;nativeId=$script:Id}) ('d'*32) @() $null 'conversation' ('e'*32) 'vendor'
+        $row=@((Get-JournalRows @{home=$desktopRoot}).rows | Where-Object operationId -eq ('d'*32))[0]
+        Assert ($row.state -ceq 'pending' -and $row.canFinalizeLocal -and -not $row.canRollback -and -not $row.canResolve -and $null -eq $row.reasonCode) 'marker merge preserves cleanup-only authority'
+        Throws { Invoke-JobCore @{action='CloseJournal';operationId=('d'*32)} } '안전하게 수행할 수'
+        $script:ConsumerRow=$cleanup.PSObject.Copy(); $script:ConsumerRow.absenceKind='retained'; $script:ConsumerRow.retainedKinds=@('state.migrationCursor','queue.revision','agentMessageBoard.deletedBoard')
+        $row=@((Get-JournalRows @{home=$desktopRoot}).rows | Where-Object operationId -eq ('d'*32))[0]
+        Assert ($row.state -ceq 'pending' -and $row.canFinalizeLocal -and -not $row.canRollback -and -not $row.canResolve -and $row.blocksImport) 'historical retained cleanup preserves only local finalization authority'
+        Assert (-not @(Get-CodexRetainedKinds @((Read-Markers | Where-Object name -eq ('d'*32)))[0].marker).Count) 'cleanup receipt display does not grant the project marker a rollback proof'
+        Throws { Invoke-JobCore @{action='CloseJournal';operationId=('d'*32)} } '안전하게 수행할 수'
+        $script:ConsumerRow=$cleanup
+        $before=[IO.File]::ReadAllText((Join-Path (Get-JournalDir) ('d'*32+'.json')))
+        $final=Invoke-JobCore @{action='FinalizeJournal';operationId=('d'*32)}
+        Assert ($final.outcome -ceq 'finalized' -and [IO.File]::ReadAllText((Join-Path (Get-JournalDir) ('d'*32+'.json'))) -ceq $before) 'finalization leaves the project marker for independent project resolution'
+        $script:ConsumerBadResponse=$true
+        Throws { Invoke-JobCore @{action='FinalizeJournal';agent='codex-desktop';home=$desktopRoot;recordId=('e'*32)} } '복구 기록'
+        $script:ConsumerBadResponse=$false; $script:ConsumerTerminal='pending'
+        Throws { Invoke-JobCore @{action='FinalizeJournal';agent='codex-desktop';home=$desktopRoot;recordId=('e'*32)} } '복원 결과'
+        $script:ConsumerRow=New-ContractRecord
+        $before=$script:ConsumerCalls.Count
+        Throws { Invoke-JobCore @{action='FinalizeJournal';agent='codex-desktop';home=$desktopRoot;recordId=('e'*32)} } '안전하게 수행할 수'
+        Assert (-not @($script:ConsumerCalls | Select-Object -Skip $before | Where-Object { $_ -ceq 'finalize' }).Count) 'missing finalization capability stops before mutation'
+        $script:ConsumerRow=$unsafe.PSObject.Copy(); $script:ConsumerRow.recordId='e'*32; $script:ConsumerRow.operationId='e'*32; $script:ConsumerRow.reasonCode='unsafe_ancestor'
+        $rows=(Get-JournalRows @{home=$desktopRoot}).rows
+        Assert (@($rows | Where-Object { $_.state -ceq 'unsafe' -and $_.blocksImport -and -not $_.canRollback -and -not $_.canResolve -and -not $_.canFinalizeLocal -and $_.reasonCode -ceq 'unsafe_ancestor' }).Count -eq 1) 'marker and vendor unsafe diagnostics preserve failure reason and disable all actions'
+        Throws { Invoke-JobCore @{action='CloseJournal';operationId=('d'*32)} } '안전하게 수행할 수'
+        Assert ([IO.File]::Exists((Join-Path (Get-JournalDir) ('d'*32+'.json')))) 'unsafe status cannot authorize marker closure'
+    } finally {
+        ${function:Invoke-DesktopGo}=$realGo; ${function:Undo-MarkerProject}=$realUndo; ${function:Test-MarkerEngineClosed}=$realGuard
+        [IO.File]::Delete((Join-Path (Get-JournalDir) ('d'*32+'.json')))
+    }
     # Claude 복구 기록(S3 명세 3.4절): 작업 ID 이름의 pending에 쓰기 전 상태(prepared)를 남기고, 되돌리기는 확인한 unknown만 한다.
     $oldClaudeDir=$env:CLAUDE_CONFIG_DIR; $oldJournal=$script:TestJournalRoot; $realClosed=${function:Assert-AgentClosed}
     try {
@@ -332,7 +551,7 @@ try {
             return $case
         }
         $case=New-ClaudeCase '22222222-2222-4222-8222-222222222222'
-        $record=Get-Content -LiteralPath $case.journal -Raw | ConvertFrom-Json
+        $record=Get-Content -LiteralPath $case.journal -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert ([IO.Path]::GetFileName($case.journal) -ceq "$($case.op).pending.json" -and $record.operationId -ceq $case.op) 'the Claude record is named after the operation ID'
         Assert ($record.prepared.conversation.before -eq (Get-TextSha 'conv-before') -and (Get-Content -LiteralPath $record.prepared.conversation.beforeCopy -Raw) -eq 'conv-before' -and @($record.prepared.sidecar.files).Count -eq 2) "the record keeps the state before the restore: $($record.prepared | ConvertTo-Json -Compress -Depth 5)"
         Throws { Begin-Restore ([pscustomobject]@{agent='claude-code';nativeId=$case.id;remoteId='r';projectPath='D:\work';operationId=$case.op}) } '이미 있어'
@@ -486,6 +705,7 @@ try {
         Assert ((Get-DesktopRecord $desktopRoot $badOp).state -ceq 'unreadable') 'malformed retained journal is unreadable and preserved'
         Throws {New-DesktopRollbackResult ([pscustomobject]$badJournal) 'fixture'} '보존한 엔진 기록'
         [IO.File]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp\journal.json"))
+        [IO.Directory]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp"))
     }
     # absenceKind의 배열 비교·scalar 변환은 journal/done/marker에서 성공 증명이 될 수 없다.
     $badTags=@([pscustomobject]@{value=@('absent')},[pscustomobject]@{value=@('absent','retained')},[pscustomobject]@{value=@{kind='absent'}},[pscustomobject]@{value=1},[pscustomobject]@{value=$true})
@@ -505,6 +725,7 @@ try {
         Throws {Set-MarkerVendorAbsence $plainMarker @{state='rolled_back'} 'rolled_back'} '보존한 엔진 기록'
         Assert ($plainMarker.ContainsKey('absenceKind')) 'marker refresh does not silently clear malformed absence metadata'
         [IO.File]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp\journal.json"))
+        [IO.Directory]::Delete((Join-Path $desktopRoot ".ctxhop-desktop-recovery\$badOp"))
         [IO.File]::Delete((Join-Path (Get-JournalDir) "done\$badOp.json"))
     }
     $script:GoFail=$false; $script:GoState='exists'
@@ -520,7 +741,7 @@ try {
     Assert ($blocked.Exception.Message -match '중단된 복원') 'open is blocked while a restore is interrupted'
     $rolled=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$row[0].operationId}
     Assert ($rolled.outcome -ceq 'rolled_back' -and -not @((Invoke-JobCore $journalJob).rows).Count) "rolling back clears the interrupted restore: $($rolled | ConvertTo-Json -Compress)"
-    $done=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($row[0].operationId).json") -Raw | ConvertFrom-Json
+    $done=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($row[0].operationId).json") -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($done.outcome -ceq 'rolled_back' -and $done.vendorState -ceq 'rolled_back') 'the end record says the restore was rolled back'
     $script:ApplyFail=$false
     Assert (Test-Path -LiteralPath $r.receipt) 'failed restore must retain inspect and archive evidence'
@@ -579,7 +800,7 @@ try {
                     if ($script:ApplyStatus -eq 'imported') {
                         $home2=$Arguments[[array]::IndexOf($Arguments,'--home')+1]; $run=Join-Path $home2 (".ctxhop-desktop-recovery\"+$Arguments[[array]::IndexOf($Arguments,'--run')+1])
                         $null=New-Item -ItemType Directory -Path $run -Force
-                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$home2;id=$script:Id}) -Compress),[Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText((Join-Path $run 'journal.json'),(New-RecoveryFixtureJournal $home2 'complete'),[Text.UTF8Encoding]::new($false))
                     }
                     return @{status=$script:ApplyStatus}
                 }
@@ -843,7 +1064,25 @@ try {
     $null=& (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $PSScriptRoot 'Worker.ps1') -RequestFile $request -ResultFile $result
     Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $result)) 'Worker process must write its result file for the GUI'
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert ($answer.ok -eq $false -and $answer.error -match 'Codex Desktop') 'Worker process reports the job error in the result file'
+    Assert ($answer.ok -eq $false -and $answer.journalOpen -eq $true -and $null -eq $answer.vendor) 'the real Worker fails closed before Open while the production Go pin is pending review'
+    # Separate JSON/process transport fixture: copied Worker source and a synthetic vendor, with no pin bypass.
+    $processPackage=Join-Path $testDirectory 'process-package'; $null=[IO.Directory]::CreateDirectory($processPackage)
+    foreach ($file in 'Worker.ps1','ClaudeWorker.ps1','ProjectFiles.ps1','Strings.ps1') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $processPackage }
+    $stub=Join-Path $processPackage 'Vendor.ps1'
+    [IO.File]::WriteAllText($stub,@'
+$request=[IO.File]::ReadAllText($args[2],[Text.Encoding]::UTF8) | ConvertFrom-Json
+$response=[ordered]@{protocolVersion=1;requestId=$request.requestId;op=$request.op;status='ok';reasonCode='';reason=''}
+if ($request.op -ceq 'recover' -and $request.mode -ceq 'list') { $response.records=@() }
+elseif ($request.op -ceq 'open') { $response.status='unsupported'; $response.reasonCode='open_manually'; $response.reason='Synthetic Codex Desktop open is unsupported' }
+else { throw 'Unexpected synthetic vendor operation' }
+[IO.File]::WriteAllText($args[4],($response | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+'@,[Text.UTF8Encoding]::new($true))
+    $command=@('powershell.exe','-NoProfile','-ExecutionPolicy','RemoteSigned','-File','Vendor.ps1')
+    [IO.File]::WriteAllText((Join-Path $processPackage 'impls.json'),(@{'codex-desktop'=$command;'claude-code'=$command} | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    $null=& (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $processPackage 'Worker.ps1') -RequestFile $request -ResultFile $result
+    Assert ($LASTEXITCODE -eq 1) 'synthetic unsupported vendor exits as a Worker failure'
+    $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert ($answer.ok -eq $false -and $answer.error -match 'Synthetic Codex Desktop') 'Worker process reports the synthetic job error in the result file'
     Assert ($answer.vendor.status -eq 'unsupported' -and $answer.vendor.reasonCode -eq 'open_manually' -and $null -eq $answer.vendorOutcome) 'the result file keeps the contract status and reason code for the GUI'
     # Worker가 어떻게 끝나든 벤더 구현·백엔드 같은 자손도 함께 끝나야, 다음 Worker가 작업 mutex만으로 앞 작업의 writer가 없다고 볼 수 있다.
     # Job 객체를 켜기 전에는 복원을 거부하는지도 같은 프로세스에서 본다.
@@ -859,7 +1098,7 @@ $child=[Diagnostics.Process]::Start($start)
 [IO.File]::WriteAllText($PidFile,"$($child.Id) $before")
 Start-Sleep 120
 '@
-    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
+    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
     $start.UseShellExecute=$false; $start.CreateNoWindow=$true
     $probeWorker=[Diagnostics.Process]::Start($start)
     try {
@@ -888,12 +1127,12 @@ Start-Sleep 120
 '@
     function Start-JobProbe {
         if (Test-Path -LiteralPath $fieldsFile) { Remove-Item -LiteralPath $fieldsFile }
-        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
         $start.UseShellExecute=$false; $start.CreateNoWindow=$true
         $process=[Diagnostics.Process]::Start($start)
         for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $fieldsFile); $i++) { Start-Sleep -Milliseconds 250 }
         Start-Sleep -Milliseconds 300
-        return @{process=$process;marker=(Get-Content -LiteralPath $fieldsFile -Raw | ConvertFrom-Json)}
+        return @{process=$process;marker=(Get-Content -LiteralPath $fieldsFile -Raw -Encoding UTF8 | ConvertFrom-Json)}
     }
     # 끝났지만 아직 목록에 남은 프로세스는 살아 있지 않은 것으로 본다(핸들로 종료 여부를 확인).
     function Test-Alive([int]$Id) { try { $process=[Diagnostics.Process]::GetProcessById($Id); try { return -not $process.HasExited } finally { $process.Dispose() } } catch { return $false } }
@@ -942,7 +1181,7 @@ Start-Sleep 120
             recover {
                 if ($script:RecoverStatus) { $e=[InvalidOperationException]::new('중단 뒤 세션 파일이 변경됐습니다.'); $e.Data['backendResult']=[pscustomobject]@{status=$script:RecoverStatus;reason='fixture';token=$null}; throw $e }
                 $journal=Join-Path $Arguments[[array]::IndexOf($Arguments,'--run')+1] 'journal.json'
-                $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json; $record.status='rolled_back'
+                $record=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json; $record.status='rolled_back'
                 [IO.File]::WriteAllText($journal,(ConvertTo-Json -InputObject $record -Compress),[Text.UTF8Encoding]::new($false))
                 return @{status='rolled_back';id=$record.id;members=1}
             }
@@ -957,8 +1196,8 @@ Start-Sleep 120
     function Set-RunState([string]$Op,[string]$State) {
         $run=Join-Path $script:RecoveryRootForCases $Op; $null=New-Item -ItemType Directory -Path $run -Force
         foreach ($name in 'journal.json','journal.resolved.json') { $file=Join-Path $run $name; if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file } }
-        $json=ConvertTo-Json -InputObject ([ordered]@{version=2;status=$State;home=$desktopRoot;id=$script:Id}) -Compress
-        switch ($State) { absent {} unreadable { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),'{bad') } resolved { [IO.File]::WriteAllText((Join-Path $run 'journal.resolved.json'),$json) } default { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),$json) } }
+        $json=New-RecoveryFixtureJournal $desktopRoot $State
+        switch ($State) { absent { [IO.Directory]::Delete($run) } unreadable { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),'{bad') } resolved { [IO.File]::WriteAllText((Join-Path $run 'journal.resolved.json'),$json) } default { [IO.File]::WriteAllText((Join-Path $run 'journal.json'),$json) } }
     }
     function New-JournalCase([string]$Name,[string]$State,[string]$Phase='conversation') {
         # 프로젝트 파일 하나(a.txt: old → new)를 실제 계획대로 쓴 뒤, 벤더 run 폴더를 $State로 둔 복원 기록.
@@ -976,7 +1215,7 @@ Start-Sleep 120
     }
     function Get-Journal { return (Invoke-JobCore @{action='Journal';agent='codex-desktop';home=$desktopRoot}) }
     function Get-Row([string]$Op) { return ,@((Get-Journal).rows | Where-Object { $_.operationId -ceq $Op }) }   # 한 행이어도 배열로 돌려준다
-    function Get-Done([string]$Op) { $file=Join-Path $testDirectory "CtxHopGUI\journal\done\$Op.json"; if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } }
+    function Get-Done([string]$Op) { $file=Join-Path $testDirectory "CtxHopGUI\journal\done\$Op.json"; if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } }
     function Invoke-Rollback([string]$Op) { $r=$null; try { $r=Invoke-JobCore @{action='Rollback';agent='codex-desktop';home=$desktopRoot;operationId=$Op} } catch { $r=[pscustomobject]@{outcome='error';message=$_.Exception.Message} }; return $r }
     # 응답을 잃은 뒤 complete: 목록이 프로젝트를 되돌리지 않고 completed로 끝낸다.
     $c=New-JournalCase 'complete' 'complete'
@@ -1031,13 +1270,13 @@ Start-Sleep 120
     } finally { if (-not $probeRun.process.HasExited) { $probeRun.process.Kill(); $probeRun.process.WaitForExit() }; $probeRun.process.Dispose() }
     for ($i=0; $i -lt 40 -and (Test-Alive $probeRun.marker.child); $i++) { Start-Sleep -Milliseconds 250 }
     $r=Invoke-Rollback $c.op
-    $after=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($c.op).json") -Raw | ConvertFrom-Json
+    $after=Get-Content -LiteralPath (Join-Path $testDirectory "CtxHopGUI\journal\done\$($c.op).json") -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($r.outcome -ceq 'rolled_back' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'old' -and $after.outcome -ceq 'rolled_back') 'after the earlier worker is gone the next worker takes the record over and rolls back'
     # R38-01: 벤더 구현이 끝난 뒤에도 그 자손이 쓰고 있을 수 있다. 자손이 끝난 뒤 새로 읽은 상태로 판단해야 한다.
     $completeJson=Join-Path $caseRoot 'complete-journal.json'
-    [IO.File]::WriteAllText($completeJson,(ConvertTo-Json -InputObject ([ordered]@{version=2;status='complete';home=$desktopRoot;id=$script:Id}) -Compress))
+    [IO.File]::WriteAllText($completeJson,(New-RecoveryFixtureJournal $desktopRoot 'complete'))
     $c=New-JournalCase 'late-writer' 'absent'
-    $late=Start-Helper "Start-Sleep -Seconds 2; Copy-Item -LiteralPath '$completeJson' -Destination '$(Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json")'"
+    $late=Start-Helper "Start-Sleep -Seconds 2; [IO.Directory]::CreateDirectory('$(Join-Path $script:RecoveryRootForCases $c.op)') | Out-Null; Copy-Item -LiteralPath '$completeJson' -Destination '$(Join-Path $script:RecoveryRootForCases "$($c.op)\journal.json")'"
     $outcome=Complete-RestoreMarker $c.marker $false $false
     Assert ($outcome -ceq 'completed' -and (Get-Content -LiteralPath $c.file -Raw) -eq 'new' -and (Get-Done $c.op).outcome -ceq 'completed') "a conversation finished by a late helper is completed, not rolled back: $outcome"
     $late.Dispose()
@@ -1150,7 +1389,9 @@ Start-Sleep 120
     }
     Assert-ProjectTargetsSeparate @($overlap,(Join-Path $testDirectory 'overlap-2')) $desktopRoot
     Remove-Item -LiteralPath $script:RecoveryRootForCases -Recurse -Force
-    Write-Output "PASS: $script:Checks isolated desktop worker assertions; $script:RecoveryCalls real native recovery calls. Engine and bundle calls mocked."
+    Write-Output ("Native recovery commands: "+(ConvertTo-Json -InputObject $script:NativeRecoveryCounts -Compress))
+    Write-Output ("Mock recovery commands: "+(ConvertTo-Json -InputObject $script:MockRecoveryCounts -Compress))
+    Write-Output "PASS: $script:Checks isolated desktop worker assertions; $script:RecoveryCalls native recovery calls; $script:MockRecoveryCalls mocked recovery calls. Engine/bundle calls and retained proof are mocked."
 } finally {
     $env:LOCALAPPDATA=$oldLocal; $env:CODEX_HOME=$oldCodexHome
     $resolved=[IO.Path]::GetFullPath($testDirectory); $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'

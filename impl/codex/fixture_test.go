@@ -389,6 +389,7 @@ func projection(o options, op string, ms []member, complete bool) object {
 			panic(e)
 		}
 	}
+	p["projectionDigest"], _ = selfDigest(p, "projectionDigest")
 	return p
 }
 func TestProjectionAndToken(t *testing.T) {

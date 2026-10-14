@@ -132,6 +132,7 @@ func mockStoreCompleted(t *testing.T, p, observation object, members []member) {
 	p["acquisitionId"] = observation["acquisitionId"]
 	p["storeObservationDigest"] = d
 	p["storeProof"] = wireStoreProof(t, d, members)
+	p["projectionDigest"], _ = selfDigest(p, "projectionDigest")
 }
 func (m *mockEngine) home(home string) *mockHome {
 	h := m.Homes[home]
@@ -168,7 +169,11 @@ func (m *mockEngine) prepare(o options, op string, ms []member) (*session, error
 		case "ctxhop/recovery-plan":
 			plan := object{"schemaVersion": num(1), "profile": recoveryPlanProfile, "operationId": o.Run, "home": o.Home, "approvalManifestSha256": o.ApprovalEvidence.ManifestSHA256, "rollouts": []any{}}
 			response := object{"phase": "recoveryPlan", "inputComplete": false, "binding": clone(s.Binding), "plan": plan}
-			canonical, e := storeCanonicalJSON(response); if e != nil { return nil, e }; plan["planDigest"] = digest(canonical)
+			canonical, e := storeCanonicalJSON(response)
+			if e != nil {
+				return nil, e
+			}
+			plan["planDigest"] = digest(canonical)
 			return response, nil
 		case "ctxhop/complete":
 			if !exact(p, "contractVersion", "requestNonce", "processNonce", "snapshotId", "generation", "projectionDigest", "operation", "storeObservation") {

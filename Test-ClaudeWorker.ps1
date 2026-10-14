@@ -761,7 +761,7 @@ try {
         $fresh=Join-Path $script:CaseRoot 'drive\fresh store'; $null=New-Item -ItemType Directory -Path $fresh
         Set-Store $old; $script:RelocateBehavior='fail'
         Assert-Throws { Invoke-Job (New-MoveJob $fresh) } 'synthetic relocate failure' 'a ctxhop relocate failure is reported'
-        Assert (((Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json).remote.path) -eq $old) 'the connection stays when ctxhop refuses'
+        Assert (((Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json).remote.path) -eq $old) 'the connection stays when ctxhop refuses'
         $script:RelocateBehavior='ignore'
         Assert-Throws { Invoke-Job (New-MoveJob $fresh) } '바뀌지 않았습니다' 'a move that does not reach the settings is reported'
         # 복사본의 해시가 원본과 다르면 제자리로 옮기지 않고 임시 파일도 남기지 않는다.

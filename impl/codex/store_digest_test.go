@@ -56,7 +56,15 @@ func TestStoreDigestPrecisionAndEscapeBoundaries(t *testing.T) {
 	if digest(b) == digest(encoded(v)) {
 		t.Fatal("digest serializer did not preserve raw U+2028/U+2029")
 	}
-	for _, value := range []any{json.Number("9223372036854775808"), json.Number("1.0"), json.Number("1e0"), float64(1), "\xff", object{"\xff": nil}} {
+	// Recovery history positions use u64; the shared canonical serializer must
+	// preserve their exact decimal bytes even above the signed store-count range.
+	for _, number := range []string{"9223372036854775808", "18446744073709551615"} {
+		raw, e := storeCanonicalJSON(json.Number(number))
+		if e != nil || string(raw) != number {
+			t.Fatalf("u64 canonical bytes: %s %v", raw, e)
+		}
+	}
+	for _, value := range []any{json.Number("18446744073709551616"), json.Number("-9223372036854775809"), json.Number("1.0"), json.Number("1e0"), float64(1), "\xff", object{"\xff": nil}} {
 		if _, e := storeCanonicalJSON(value); e == nil {
 			t.Fatal("invalid precision/UTF-8 accepted", value)
 		}

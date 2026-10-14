@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf16"
@@ -98,6 +99,10 @@ type process struct {
 	In, Out, Err     *os.File
 	prepared, closed bool
 	ImageLocks       []*os.File
+	closeMu          sync.Mutex
+	jobDrained       bool
+	pendingFiles     []syscall.Handle
+	closeFault       error
 }
 
 func lockImage(path string) ([]*os.File, error) {
@@ -348,42 +353,93 @@ func (p *process) active() (uint32, error) {
 	return binary.LittleEndian.Uint32(b[40:]), nil
 }
 func (p *process) close() error {
-	if p == nil || p.closed {
+	if p == nil {
 		return nil
 	}
-	p.In.Close()
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
+	if p.closed {
+		return nil
+	}
+	result := p.closeFault
+	// os.File.Close consumes Go's file object even when CloseHandle fails.
+	// Retain the still-owned native handle for an explicit subsequent retry.
+	remaining := p.pendingFiles[:0]
+	for _, h := range p.pendingFiles {
+		if e := syscall.CloseHandle(h); e != nil {
+			result = errors.Join(result, e)
+			remaining = append(remaining, h)
+		}
+	}
+	p.pendingFiles = remaining
+	closeFile := func(slot **os.File) {
+		if *slot == nil {
+			return
+		}
+		h := syscall.Handle((*slot).Fd())
+		if e := (*slot).Close(); e != nil {
+			result = errors.Join(result, e)
+			var flags uint32
+			valid, _, _ := proc("GetHandleInformation").Call(uintptr(h), uintptr(unsafe.Pointer(&flags)))
+			if valid != 0 {
+				p.pendingFiles = append(p.pendingFiles, h)
+			} else {
+				// An invalid value may later be reused by an unrelated handle.
+				// Latch the fault instead of retrying a handle we no longer own.
+				p.closeFault = errors.Join(p.closeFault, e)
+			}
+		}
+		*slot = nil
+	}
+	closeFile(&p.In)
 	deadline := time.Now().Add(10 * time.Second)
 	terminated := false
-	for {
+	for !p.jobDrained {
 		n, e := p.active()
 		if e != nil {
-			return e
+			return errors.Join(result, e)
 		}
 		if n == 0 {
+			p.jobDrained = true
 			break
 		}
 		if time.Now().After(deadline) {
 			if terminated {
-				return fail("job_active", "소유 Job이 비지 않았습니다")
+				return errors.Join(result, fail("job_active", "소유 Job이 비지 않았습니다"))
 			}
 			r, _, e := proc("TerminateJobObject").Call(uintptr(p.job), 1)
 			if r == 0 {
-				return e
+				return errors.Join(result, e)
 			}
 			terminated = true
 			deadline = time.Now().Add(10 * time.Second)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	p.Out.Close()
-	p.Err.Close()
-	syscall.CloseHandle(p.handle)
-	syscall.CloseHandle(p.job)
-	p.closed = true
-	for _, f := range p.ImageLocks {
-		f.Close()
+	closeFile(&p.Out)
+	closeFile(&p.Err)
+	closeHandle := func(slot *syscall.Handle) {
+		if *slot == 0 {
+			return
+		}
+		if e := syscall.CloseHandle(*slot); e != nil {
+			result = errors.Join(result, e)
+		} else {
+			*slot = 0
+		}
 	}
-	return nil
+	closeHandle(&p.handle)
+	for i := range p.ImageLocks {
+		closeFile(&p.ImageLocks[i])
+	}
+	// Keep the empty Job owned until every other handle has closed successfully.
+	if result == nil && len(p.pendingFiles) == 0 {
+		closeHandle(&p.job)
+	}
+	if result == nil && p.job == 0 && p.handle == 0 && len(p.pendingFiles) == 0 {
+		p.closed = true
+	}
+	return result
 }
 func guard(p *process) error {
 	excluded := uint32(0)

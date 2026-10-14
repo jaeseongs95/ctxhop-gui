@@ -15,6 +15,7 @@ var readState = checkDB
 var readPreparedState = checkDBPrepared
 var advanceJournal = advance
 var stageFile = createFile
+var initialJournalWrite = saveJournal
 
 func summary(f *family) object {
 	r := obj(f.Members[0].Data["thread"])
@@ -118,12 +119,18 @@ func importArchive(o options) (result object, retErr error) {
 		return nil, fail("run_exists", "작업 ID를 재사용할 수 없습니다")
 	}
 	createdRun, e := snapshotOpen(run, true)
-	if e != nil { return object{"pending": []string{o.Run}}, e }
+	if e != nil {
+		return object{"pending": []string{o.Run}}, e
+	}
 	createdRunID := snapshotFileID(createdRun.Info)
-	if e = createdRun.File.Close(); e != nil { return object{"pending": []string{o.Run}}, e }
+	if e = createdRun.File.Close(); e != nil {
+		return object{"pending": []string{o.Run}}, e
+	}
 	j := &journal{Version: 4, Impl: "ctxhop-codex", Status: "pending", Phase: "created", Home: o.Home, ID: f.Members[0].ID, Cwd: o.Cwd, ArchiveSHA256: f.ArchiveSHA, Archived: f.Archived, Members: f.Members, EngineVersion: text(preview["engineVersion"]), EngineSHA256: engineSHA256, NormalEngineSHA256: normalEngineSHA256, LoaderContractID: loaderContractID}
-	if e = saveJournal(run, j, true); e != nil {
-		if removeNewEmptyRun(run, createdRunID) == nil { return object{"pending": []string{}}, e }
+	if e = initialJournalWrite(run, j, true); e != nil {
+		if removeNewEmptyRun(run, createdRunID) == nil {
+			return object{"pending": []string{}}, e
+		}
 		return object{"pending": []string{o.Run}}, e
 	}
 	var active *session
@@ -336,7 +343,7 @@ func importArchive(o options) (result object, retErr error) {
 			return nil, e
 		}
 		j.TerminalProof = obj(cloneJSON(active.Projection))
-	if e = active.Close(); e != nil {
+		if e = active.Close(); e != nil {
 			return nil, e
 		}
 		active = nil
@@ -689,8 +696,12 @@ func rollback(o options) (result object, retErr error) {
 	if e != nil {
 		return nil, e
 	}
-	if j.LocalFinalization != nil { return finalizeLocal(o.Home, o.Run) }
-	if e := checkGuard(nil); e != nil { return nil, e }
+	if j.LocalFinalization != nil {
+		return finalizeLocal(o.Home, o.Run)
+	}
+	if e := checkGuard(nil); e != nil {
+		return nil, e
+	}
 	if j.Status == "rolled_back" {
 		return object{"status": "rolled_back", "run": o.Run, "pending": []string{}}, nil
 	}
