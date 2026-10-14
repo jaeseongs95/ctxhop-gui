@@ -39,9 +39,9 @@ foreach ($patch in $provider.patches) {
     $path=Join-Path (Join-Path $receiptRoot 'engine') $patch.path
     if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $patch.sha256) { throw 'provider patch hash mismatch' }
 }
-if ((& $CargoExe --version) -notmatch '^cargo 1\.95\.0 ') { throw 'need cargo 1.95.0' }
+if ((Invoke-EngineBuildNative $CargoExe @('--version')) -notmatch '^cargo 1\.95\.0 ') { throw 'need cargo 1.95.0' }
 $rustc=if ($env:RUSTC) {$env:RUSTC} else {'rustc'}
-if ((& $rustc --version) -notmatch '^rustc 1\.95\.0 ') { throw 'need rustc 1.95.0' }
+if ((Invoke-EngineBuildNative $rustc @('--version')) -notmatch '^rustc 1\.95\.0 ') { throw 'need rustc 1.95.0' }
 
 $src=Join-Path $Out 'source'
 Invoke-EngineBuildNative git @('init','-q',$src)
