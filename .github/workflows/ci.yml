@@ -32,6 +32,20 @@ jobs:
         run: |
           $workspace = Join-Path ([IO.Path]::GetTempPath()) ('ctxhop-prestart-' + [guid]::NewGuid().ToString('N'))
           .\Test-PrestartEngine.ps1 -Mode SelfTest -FixtureWorkspace $workspace
+      - name: Build and CI fixture checks (no vendor engine)
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $workspace = Join-Path $env:RUNNER_TEMP ('ctxhop-build-checks-' + [guid]::NewGuid().ToString('N'))
+          $failed = @()
+          foreach ($shell in 'powershell.exe', 'pwsh.exe') {
+            foreach ($t in 'Test-BuildPreflight', 'Test-EngineBuildPreflight', 'Test-CISuiteArguments', 'Test-CISourceChecks') {
+              & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:GITHUB_WORKSPACE "$t.ps1") -FixtureRoot $workspace
+              "$shell $t exit=$LASTEXITCODE"
+              if ($LASTEXITCODE -ne 0) { $failed += "$shell/$t" }
+            }
+          }
+          if ($failed) { throw "failed: $($failed -join ', ')" }
       - name: Prepare the pinned Rust and MSVC toolchain
         shell: powershell
         run: |
