@@ -18,7 +18,8 @@ jobs:
           go-version: '1.27.1'
           cache: false
       - name: Go fixtures and static checks (no vendor engine)
-        # System TEMP may be an 8.3 alias rejected by the native path guard.
+        # Fixtures put Home under t.TempDir(); Home 8.3 aliases remain rejected.
+        # Pin fixture TEMP; this step does not test the system TEMP spelling.
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
