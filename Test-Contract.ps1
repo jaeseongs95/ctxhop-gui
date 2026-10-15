@@ -3,6 +3,8 @@
 # 1) Worker 쪽 클라이언트(Invoke-VendorOp)를 임시 폴더의 가짜 구현으로, 2) 실제 구현 진입점(CodexDesktop.ps1, ClaudeCode.ps1)을
 # 네이티브 도구를 부르기 전에 끝나는 요청(probe·recover·Codex open·잘못된 요청)으로 확인한다. 사용자 폴더와 네이티브 도구는 쓰지 않는다.
 $ErrorActionPreference='Stop'
+$inheritedJsonDefaults=$PSDefaultParameterValues
+$inheritedDateKind=$inheritedJsonDefaults['ConvertFrom-Json:DateKind']
 . (Join-Path $PSScriptRoot 'Worker.ps1') -LibraryOnly
 $script:Checks=0
 function Assert([bool]$Value,[string]$Message) { $script:Checks++; if (-not $Value) { throw "ASSERT: $Message" } }
@@ -15,6 +17,59 @@ function Throws([scriptblock]$Body,[string]$Pattern) {
 $root=Join-Path ([IO.Path]::GetTempPath()) ('ctxhop-contract-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
 try {
+    $dateJson='{"updatedAt":"2026-09-26T01:00:00Z","other":"2026-09-26T01:00:00+09:00"}' | ConvertFrom-Json
+    Assert ($dateJson.updatedAt -is [string] -and $dateJson.updatedAt -ceq '2026-09-26T01:00:00Z' -and $dateJson.other -is [string] -and $dateJson.other -ceq '2026-09-26T01:00:00+09:00') 'JSON timestamps retain their exact string values'
+    Assert ($inheritedJsonDefaults['ConvertFrom-Json:DateKind'] -ceq $inheritedDateKind) 'loading Worker does not mutate the inherited default-parameter dictionary'
+    # JSON integers are Int32 on Windows PowerShell and Int64 on PowerShell 7.
+    $protocolId=[guid]::NewGuid().ToString()
+    foreach ($version in @([int]1,[long]1)) {
+        $response=[pscustomobject]@{protocolVersion=$version;requestId=$protocolId;op='list';status='ok';sessions=@()}
+        Assert (Test-VendorResponse $response $protocolId 'list') "integer protocol version is accepted: $($version.GetType().Name)"
+    }
+    $responseJson='{"protocolVersion":1,"requestId":"'+$protocolId+'","op":"list","status":"ok","sessions":[]}'
+    Assert (Test-VendorResponse ($responseJson | ConvertFrom-Json) $protocolId 'list') 'JSON integer protocol version is accepted after parsing'
+    $badVersions=@('"1"','true','1.0','1e0','1.5','2','0','-1','2147483648','9223372036854775808','null','[]')
+    foreach ($literal in $badVersions) {
+        $response=($responseJson.Replace('"protocolVersion":1,','"protocolVersion":'+$literal+',')) | ConvertFrom-Json
+        Assert (-not (Test-VendorResponse $response $protocolId 'list')) "non-protocol integer/type is rejected in a response: $literal"
+    }
+    # Exercise the real request parser in the current shell, with no vendor operations.
+    $workerPath=(Join-Path $PSScriptRoot 'Worker.ps1').Replace("'","''")
+    $entryFile=Join-Path $root 'protocol-entry.ps1'
+    [IO.File]::WriteAllText($entryFile,(". '"+$workerPath+"' -LibraryOnly"+[Environment]::NewLine+'Invoke-Impl @{} $args'),[Text.UTF8Encoding]::new($true))
+    $currentShell=Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -ceq 'Core') {'pwsh.exe'} else {'powershell.exe'})
+    $requestIndex=0; $PSNativeCommandUseErrorActionPreference=$false
+    foreach ($literal in @('1')+$badVersions) {
+        $requestFile=Join-Path $root ("protocol-request-$requestIndex.json")
+        $responseFile=Join-Path $root ("protocol-response-$requestIndex.json"); $requestIndex++
+        $requestJson='{"protocolVersion":'+$literal+',"requestId":"'+$protocolId+'","op":"probe","language":"ko"}'
+        [IO.File]::WriteAllText($requestFile,$requestJson,[Text.UTF8Encoding]::new($false))
+        & $currentShell -NoProfile -ExecutionPolicy Bypass -File $entryFile probe --request $requestFile --response $responseFile
+        $entryExit=$LASTEXITCODE
+        if ($literal -ceq '1') {
+            Assert ($entryExit -eq 0 -and [IO.File]::Exists($responseFile)) 'JSON integer protocol request reaches the real implementation entry point'
+            $entryResponse=Get-Content -LiteralPath $responseFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert (Test-VendorResponse $entryResponse $protocolId 'probe') 'the current-shell implementation response is accepted'
+        } else {
+            Assert ($entryExit -eq 2 -and -not [IO.File]::Exists($responseFile)) "invalid protocol request is refused without a response: $literal"
+        }
+    }
+    # A parsed integer folder index must keep the same receipt meaning in both shells.
+    $savedLocal=$env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA=$root
+        $stage=New-DesktopStage; $receipt=Join-Path $stage 'project-receipt.json'
+        $receiptBody=[ordered]@{agent='codex-desktop';sessionId=$protocolId;conversation='fixture';folders=@([ordered]@{index=0;state='ready';role='start';zip=(Join-Path $stage 'project-0.zip');sha256=('a'*64)})}
+        $receiptJson=ConvertTo-Json -InputObject $receiptBody -Depth 5 -Compress
+        [IO.File]::WriteAllText($receipt,$receiptJson,[Text.UTF8Encoding]::new($false))
+        $parsed=Read-ProjectReceipt $receipt 'codex-desktop' $protocolId 'fixture'
+        Assert ($parsed.folders[0].index -eq 0) 'JSON integer folder index is accepted after parsing'
+        foreach ($literal in '"0"','false','0.0','0e0','null','[]') {
+            [IO.File]::WriteAllText($receipt,($receiptJson.Replace('"index":0,','"index":'+$literal+',')),[Text.UTF8Encoding]::new($false))
+            $null=Throws {Read-ProjectReceipt $receipt 'codex-desktop' $protocolId 'fixture'} 'project preview|프로젝트 미리보기'
+        }
+    } finally { $env:LOCALAPPDATA=$savedLocal }
+    Write-Output "JSON integer contract: response, current-shell request and project receipt checks passed on $($PSVersionTable.PSVersion)."
     # 가짜 구현: 요청의 mode대로 정상·비정상 응답을 낸다.
     $fake=@'
 $op=$args[0]; $requestFile=$args[2]; $responseFile=$args[4]

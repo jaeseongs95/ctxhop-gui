@@ -2,6 +2,11 @@
 [CmdletBinding()]
 param([string]$RequestFile, [string]$ResultFile, [switch]$LibraryOnly)
 $ErrorActionPreference='Stop'
+# Keep JSON timestamps as strings, as Windows PowerShell does, without changing inherited defaults.
+if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    $PSDefaultParameterValues=@{}+$PSDefaultParameterValues
+    $PSDefaultParameterValues['ConvertFrom-Json:DateKind']='String'
+}
 $script:VNextLibraryOnly=[bool]$LibraryOnly
 # ClaudeWorker.ps1의 param 블록이 dot-source될 때 이 스코프의 요청·결과 경로를 빈 값으로 다시 묶으므로 보관했다가 되돌린다.
 $script:VNextRequestFile=$RequestFile; $script:VNextResultFile=$ResultFile
@@ -89,7 +94,7 @@ function Test-VendorRow([object]$Row) {
 }
 function Test-VendorResponse([object]$Response,[string]$Id,[string]$Op) {
     # 요청 짝(requestId·op), 프로토콜 판, 그 op에 허용된 status가 맞고, ok면 op별 필드 형식까지 맞아야 쓴다.
-    if ($null -eq $Response -or $Response.protocolVersion -isnot [int] -or $Response.protocolVersion -ne 1 -or $Response.requestId -cne $Id -or $Response.op -cne $Op -or [string]$Response.status -cnotin $script:ContractStatus[$Op]) { return $false }
+    if ($null -eq $Response -or ($Response.protocolVersion -isnot [int] -and $Response.protocolVersion -isnot [long]) -or $Response.protocolVersion -ne 1 -or $Response.requestId -cne $Id -or $Response.op -cne $Op -or [string]$Response.status -cnotin $script:ContractStatus[$Op]) { return $false }
     foreach ($name in 'reasonCode','reason','message') { if ($null -ne $Response.$name -and $Response.$name -isnot [string]) { return $false } }
     if ($Response.status -cne 'ok') { return $true }
     $fields=$script:ContractFields[$Op]
@@ -183,7 +188,7 @@ function Invoke-Impl([hashtable]$Ops,[object[]]$Arguments) {
         if ($Arguments.Count -ne 5 -or $Arguments[1] -cne '--request' -or $Arguments[3] -cne '--response' -or -not $script:ContractStatus[[string]$Arguments[0]] -or (Get-Item -LiteralPath $Arguments[2]).Length -gt $script:ContractMaxBytes) { throw 'usage' }
         $request=[IO.File]::ReadAllText($Arguments[2],[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
         $guid=[guid]::Empty
-        if ($request.protocolVersion -isnot [int] -or $request.protocolVersion -ne 1 -or $request.op -cne $Arguments[0] -or -not [guid]::TryParseExact([string]$request.requestId,'D',[ref]$guid)) { throw 'request' }
+        if (($request.protocolVersion -isnot [int] -and $request.protocolVersion -isnot [long]) -or $request.protocolVersion -ne 1 -or $request.op -cne $Arguments[0] -or -not [guid]::TryParseExact([string]$request.requestId,'D',[ref]$guid)) { throw 'request' }
     } catch { exit 2 }
     Set-Language ([string]$request.language)
     $response=Invoke-ImplOp $Ops $request
@@ -394,7 +399,7 @@ function Read-ProjectReceipt([string]$Path,[string]$Agent,[string]$SessionId,[st
     if ($record.agent -cne $Agent -or $record.sessionId -ne $SessionId -or $record.conversation -cne $Conversation -or $record.folders -isnot [array]) { throw (T 'WkProjectReceiptInvalid') }
     foreach ($folder in $record.folders) {
         if ($folder.state -notin @('ready','needsFolder')) { continue }
-        if ($folder.index -isnot [int] -or $folder.role -notin @('start','extra') -or $folder.zip -ne (Join-Path $stage "project-$($folder.index).zip") -or $folder.sha256 -notmatch '^[a-fA-F0-9]{64}$') { throw (T 'WkProjectReceiptInvalid') }
+        if (($folder.index -isnot [int] -and $folder.index -isnot [long]) -or $folder.role -notin @('start','extra') -or $folder.zip -ne (Join-Path $stage "project-$($folder.index).zip") -or $folder.sha256 -notmatch '^[a-fA-F0-9]{64}$') { throw (T 'WkProjectReceiptInvalid') }
     }
     return $record
 }

@@ -1082,7 +1082,7 @@ try {
     # GUI처럼 Worker.ps1을 별도 프로세스로 실행해 요청·결과 경로가 ClaudeWorker dot-source 뒤에도 남는지 확인한다.
     $request=Join-Path $testDirectory 'request.json'; $result=Join-Path $testDirectory 'result.json'
     @{action='Open';agent='codex-desktop';home=$desktopRoot} | ConvertTo-Json | Set-Content -LiteralPath $request -Encoding UTF8
-    $null=& (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $PSScriptRoot 'Worker.ps1') -RequestFile $request -ResultFile $result
+    $null=& (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $PSScriptRoot 'Worker.ps1') -RequestFile $request -ResultFile $result
     Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $result)) 'Worker process must write its result file for the GUI'
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($answer.ok -eq $false -and $answer.journalOpen -eq $true -and $null -eq $answer.vendor) 'the real Worker fails closed before Open while the production Go pin is pending review'
@@ -1100,7 +1100,7 @@ else { throw 'Unexpected synthetic vendor operation' }
 '@,[Text.UTF8Encoding]::new($true))
     $command=@('powershell.exe','-NoProfile','-ExecutionPolicy','RemoteSigned','-File','Vendor.ps1')
     [IO.File]::WriteAllText((Join-Path $processPackage 'impls.json'),(@{'codex-desktop'=$command;'claude-code'=$command} | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
-    $null=& (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $processPackage 'Worker.ps1') -RequestFile $request -ResultFile $result
+    $null=& (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $processPackage 'Worker.ps1') -RequestFile $request -ResultFile $result
     Assert ($LASTEXITCODE -eq 1) 'synthetic unsupported vendor exits as a Worker failure'
     $answer=Get-Content -LiteralPath $result -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($answer.ok -eq $false -and $answer.error -match 'Synthetic Codex Desktop') 'Worker process reports the synthetic job error in the result file'
@@ -1113,13 +1113,13 @@ param([string]$Package,[string]$PidFile)
 . (Join-Path $Package 'Worker.ps1') -LibraryOnly
 $before=try { Assert-WorkerJob; 'allowed' } catch { 'refused' }
 Enable-WorkerJob
-$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),'-NoProfile -Command Start-Sleep 120')
 $start.UseShellExecute=$false; $start.CreateNoWindow=$true
 $child=[Diagnostics.Process]::Start($start)
 [IO.File]::WriteAllText($PidFile,"$($child.Id) $before")
 Start-Sleep 120
 '@
-    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
+    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$pidFile`"")
     $start.UseShellExecute=$false; $start.CreateNoWindow=$true
     $probeWorker=[Diagnostics.Process]::Start($start)
     try {
@@ -1139,7 +1139,7 @@ Start-Sleep 120
 param([string]$Package,[string]$PidFile)
 . (Join-Path $Package 'Worker.ps1') -LibraryOnly
 Enable-WorkerJob
-$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),'-NoProfile -Command Start-Sleep 120')
+$start=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),'-NoProfile -Command Start-Sleep 120')
 $start.UseShellExecute=$false; $start.CreateNoWindow=$true
 $child=[Diagnostics.Process]::Start($start)
 $fields=Get-WorkerFields; $fields.child=$child.Id
@@ -1148,7 +1148,7 @@ Start-Sleep 120
 '@
     function Start-JobProbe {
         if (Test-Path -LiteralPath $fieldsFile) { Remove-Item -LiteralPath $fieldsFile }
-        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),"-NoProfile -ExecutionPolicy RemoteSigned -File `"$probe`" -Package `"$PSScriptRoot`" -PidFile `"$fieldsFile`"")
         $start.UseShellExecute=$false; $start.CreateNoWindow=$true
         $process=[Diagnostics.Process]::Start($start)
         for ($i=0; $i -lt 240 -and -not (Test-Path -LiteralPath $fieldsFile); $i++) { Start-Sleep -Milliseconds 250 }
@@ -1181,7 +1181,7 @@ Start-Sleep 120
     # 정상 경로: 자손이 스스로 끝나면 alone. 남으면 이 Job 소속만 끝내고(손자 포함) 목록을 다시 받는다.
     Assert ((Get-WorkerFields).workerJob -ceq [CtxHopWorkerJob]::Name -and (Test-WorkerWritersGone ([pscustomobject](Get-WorkerFields)) 1) -eq 'gone') 'the worker itself is never a foreign writer'
     function Start-Helper([string]$Command) {
-        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'powershell.exe'),"-NoProfile -Command $Command")
+        $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),"-NoProfile -Command $Command")
         $start.UseShellExecute=$false; $start.CreateNoWindow=$true
         return [Diagnostics.Process]::Start($start)
     }
@@ -1189,7 +1189,7 @@ Start-Sleep 120
     Assert ((Wait-WorkerJobAlone 30 5) -eq 'alone') 'a helper that ends by itself leaves the worker alone'
     $helper.Dispose()
     $grandFile=Join-Path $testDirectory 'grandchild.txt'
-    $helper=Start-Helper "`$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 120'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$g=[Diagnostics.Process]::Start(`$s); [IO.File]::WriteAllText('$grandFile',[string]`$g.Id); Start-Sleep 120"
+    $helper=Start-Helper "`$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')','-NoProfile -Command Start-Sleep 120'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$g=[Diagnostics.Process]::Start(`$s); [IO.File]::WriteAllText('$grandFile',[string]`$g.Id); Start-Sleep 120"
     for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $grandFile); $i++) { Start-Sleep -Milliseconds 250 }
     $grandchild=[int](Get-Content -LiteralPath $grandFile -Raw)
     Assert ((Wait-WorkerJobAlone 1 10) -eq 'killed' -and -not (Test-Alive $helper.Id) -and -not (Test-Alive $grandchild)) 'helpers left after the wait are ended with their own children'
@@ -1349,7 +1349,7 @@ Start-Sleep 120
     $null=Invoke-Rollback $c.op
     # 끝내는 도중에도 새 자손이 계속 생기면, 목록을 다시 전부 받아 새로 생긴 것까지 끝낸다.
     $spawnFile=Join-Path $caseRoot 'spawned.txt'
-    $spawner=Start-Helper "for (`$i=0; `$i -lt 200; `$i++) { `$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $PSHOME 'powershell.exe')','-NoProfile -Command Start-Sleep 60'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$p=[Diagnostics.Process]::Start(`$s); Add-Content -LiteralPath '$spawnFile' -Value `$p.Id; Start-Sleep -Milliseconds 150 }"
+    $spawner=Start-Helper "for (`$i=0; `$i -lt 200; `$i++) { `$s=[Diagnostics.ProcessStartInfo]::new('$(Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')','-NoProfile -Command Start-Sleep 60'); `$s.UseShellExecute=`$false; `$s.CreateNoWindow=`$true; `$p=[Diagnostics.Process]::Start(`$s); Add-Content -LiteralPath '$spawnFile' -Value `$p.Id; Start-Sleep -Milliseconds 150 }"
     for ($i=0; $i -lt 120 -and -not (Test-Path -LiteralPath $spawnFile); $i++) { Start-Sleep -Milliseconds 250 }
     Start-Sleep -Milliseconds 600
     $result=Wait-WorkerJobAlone 1 20
