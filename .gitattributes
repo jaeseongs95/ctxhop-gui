@@ -1,5 +1,8 @@
 # Patches must keep their exact bytes (LF); git apply fails on converted line endings.
 upstream/patches/*.patch -text
+# Embedded schemas and store-proof seals must retain their exact bytes.
+impl/codex/*.json -text
+engine/store-proof-v2-*.json -text
 # Build tooling, upstream patches and CI stay out of the release package (git archive).
 /build export-ignore
 /upstream export-ignore

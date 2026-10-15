@@ -18,6 +18,10 @@ jobs:
           go-version: '1.27.1'
           cache: false
       - name: Go fixtures and static checks (no vendor engine)
+        # System TEMP may be an 8.3 alias rejected by the native path guard.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         shell: powershell
         run: |
           Push-Location impl/codex
