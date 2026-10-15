@@ -111,14 +111,15 @@ function Export-DesktopSession([object]$Request) {
     Assert-NativeId $Request.nativeId
     $desktopRoot=Get-DesktopHome $Request
     $stage=New-DesktopStage; $archive=Join-Path $stage 'session.archive'
-    try { $export=Invoke-DesktopBackend @('export','--home',$desktopRoot,'--id',$Request.nativeId,'--output',$archive) }
-    catch { $null=Remove-DesktopStage $stage; throw }
-    # The backend owns archive semantics; never infer historyMode or recordCount from the list.
-    Assert-BundleMetadata $export.metadata
-    if ($export.metadata.sessionId -cne $Request.nativeId -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw (T 'WkExportResultInvalid') }
-    $folders=@{sourceCwd=[string]$export.metadata.sourceCwd;cwds=@($export.folders.cwds);edits=@($export.folders.edits)}
-    $folders.sourceStamp=Get-SourceStamp $folders.sourceCwd $folders.cwds $folders.edits
-    return @{stage=$stage;archive=$archive;metadata=$export.metadata;folders=$folders}
+    try {
+        $export=Invoke-DesktopBackend @('export','--home',$desktopRoot,'--id',$Request.nativeId,'--output',$archive)
+        # The backend owns archive semantics; never infer historyMode or recordCount from the list.
+        Assert-BundleMetadata $export.metadata
+        if ($export.metadata.sessionId -cne $Request.nativeId -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw (T 'WkExportResultInvalid') }
+        $folders=@{sourceCwd=[string]$export.metadata.sourceCwd;cwds=@($export.folders.cwds);edits=@($export.folders.edits)}
+        $folders.sourceStamp=Get-SourceStamp $folders.sourceCwd $folders.cwds $folders.edits
+        return @{stage=$stage;archive=$archive;metadata=$export.metadata;folders=$folders}
+    } catch { $null=Remove-DesktopStage $stage; throw }
 }
 function ConvertFrom-DesktopBusy([Management.Automation.ErrorRecord]$ErrorRecord) {
     # 진행 중인 대화(busy)는 실패가 아니라 건너뜀이다. 다른 실패는 그대로 던진다.

@@ -104,7 +104,7 @@ function Invoke-DesktopBackend([string[]]$Arguments) {
         export {
             $file=$Arguments[[array]::IndexOf($Arguments,'--output')+1]
             Assert (-not (Test-Path -LiteralPath $file)) 'export must use new file'
-            [IO.File]::WriteAllText($file,'synthetic archive',[Text.UTF8Encoding]::new($false))
+            if (-not $script:ExportNoArchive) { [IO.File]::WriteAllText($file,'synthetic archive',[Text.UTF8Encoding]::new($false)) }
             if ($script:ExportStatus) {
                 # 내보내는 동안 대화가 바뀌었거나(busy) 다른 이유로 막힌 경우(blocked): 백엔드는 파일을 만든 뒤 멈출 수 있다.
                 $e=[InvalidOperationException]::new('내보내기 실패')
@@ -279,6 +279,27 @@ try {
             if ($withProject -and $status -eq 'busy') { Assert (($script:VendorCalls -join ',') -ceq 'codex-desktop/recover,claude-code/recover,codex-desktop/describe') 'a busy conversation is skipped before backup is called' }
         }
     }
+    # Backend success is not an ownership transfer until export validation succeeds.
+    foreach ($op in 'describe','backup') {
+        foreach ($fault in 'metadata','session-id','missing-archive') {
+            $savedMetadata=$script:Metadata; $beforeCalls=$script:Calls.Count
+            $script:Metadata=$savedMetadata | ConvertTo-Json | ConvertFrom-Json
+            $expected=if ($fault -ceq 'metadata') {'잘못된 백업 메타데이터: title'} else {'Codex 백업 결과의 ID 또는 파일을 확인하지 못했습니다'}
+            try {
+                switch ($fault) {
+                    metadata { $script:Metadata.title=$null }
+                    session-id { $script:Metadata.sessionId='22222222-2222-4222-8222-222222222222' }
+                    missing-archive { $script:ExportNoArchive=$true }
+                }
+                Throws { Invoke-Vendor $job $op @{nativeId=$script:Id} } $expected
+                Assert (-not @(Get-ChildItem -LiteralPath $staging -Force)) "a $fault export response leaves no plaintext staging copy ($op)"
+                Assert (-not @($script:Calls | Select-Object -Skip $beforeCalls | Where-Object { $_.kind -eq 'bundle' -and $_.arguments[0] -eq 'put' })) "a rejected $fault export is never published ($op)"
+            } finally {
+                $script:Metadata=$savedMetadata; $script:ExportNoArchive=$false
+            }
+        }
+    }
+    Write-Output 'Export post-validation cleanup: describe/backup metadata, session ID and missing archive cases passed.'
     $job.Remove('projectBackup')
     $job.action='Preview'; $preview=Invoke-JobCore $job
     Assert ($preview.preview.status -eq 'conflict') 'backend content comparison controls status'
