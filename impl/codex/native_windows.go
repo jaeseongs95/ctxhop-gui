@@ -490,6 +490,24 @@ type dbView struct {
 	Backend          object
 }
 
+// Expand only the private TEMP spelling. This is not an identity/reparse proof:
+// acquireSnapshot still pins and validates the source and every private ancestor.
+func snapshotTempRoot() (string, error) {
+	temp := os.TempDir()
+	if !filepath.IsAbs(temp) {
+		return "", fmt.Errorf("snapshot TEMP must be absolute")
+	}
+	u, e := syscall.UTF16PtrFromString(temp)
+	if e != nil {
+		return "", e
+	}
+	buf := make([]uint16, 32768)
+	n, e := syscall.GetLongPathName(u, &buf[0], uint32(len(buf)))
+	if e != nil || n == 0 || n >= uint32(len(buf)) {
+		return "", fmt.Errorf("snapshot TEMP long name: %v", e)
+	}
+	return syscall.UTF16ToString(buf[:n]), nil
+}
 func checkDB(home, statePath string, members []member, allowMissing bool) (dbView, error) {
 	return checkDBAcquisition(home, statePath, members, allowMissing, false)
 }
@@ -520,7 +538,11 @@ func checkDBAcquisition(home, statePath string, members []member, allowMissing, 
 	if e != nil {
 		return v, fail("engine_db_unknown", "state DB가 없거나 접근할 수 없습니다")
 	}
-	s, e := acquireSnapshot(statePath, filepath.Join(os.TempDir(), "ctxhop-acquisition-"+nonce()), limit, nil, nil)
+	temp, e := snapshotTempRoot()
+	if e != nil {
+		return v, fail("engine_db_unknown", "private snapshot TEMP 경로 오류")
+	}
+	s, e := acquireSnapshot(statePath, filepath.Join(temp, "ctxhop-acquisition-"+nonce()), limit, nil, nil)
 	if e != nil {
 		return v, fail("engine_db_unknown", "원본 raw acquisition 실패")
 	}
